@@ -1,0 +1,200 @@
+"""Alpaca Paper: REST-клиент + AlpacaBroker. ТОЛЬКО paper — боевой хост отвергается при создании клиента.
+Правила жёстко в коде: вход только side=buy, sell только закрывает существующий лонг, размер ≤ cash (плечо 1x), без опционов."""
+import math
+import os
+import time
+
+import requests
+
+from .config import COSTS
+
+PAPER_HOST = "paper-api.alpaca.markets"
+
+
+class AlpacaError(Exception):
+    pass
+
+
+class AlpacaClient:
+    def __init__(self, key=None, secret=None, base=None, session=None):
+        self.base = (base or os.environ.get("ALPACA_BASE_URL", f"https://{PAPER_HOST}/v2")).rstrip("/")
+        if PAPER_HOST not in self.base:
+            raise AlpacaError(f"отказ: base_url не paper ({self.base})")
+        self.h = {"APCA-API-KEY-ID": key or os.environ.get("ALPACA_KEY_ID", ""),
+                  "APCA-API-SECRET-KEY": secret or os.environ.get("ALPACA_SECRET", "")}
+        if not all(self.h.values()):
+            raise AlpacaError("нет ALPACA_KEY_ID/ALPACA_SECRET в .env")
+        self.s = session or requests.Session()
+
+    def _req(self, method, path, **kw):
+        r = self.s.request(method, f"{self.base}{path}", headers=self.h, timeout=20, **kw)
+        if r.status_code >= 400:
+            raise AlpacaError(f"{method} {path} -> {r.status_code}: {r.text[:200]}")
+        return r.json() if r.text else {}
+
+    def account(self):
+        return self._req("GET", "/account")
+
+    def clock(self):
+        return self._req("GET", "/clock")
+
+    def positions(self):
+        return self._req("GET", "/positions")
+
+    def position(self, symbol):
+        """None, если позиции нет."""
+        try:
+            return self._req("GET", f"/positions/{symbol.replace('/', '')}")
+        except AlpacaError as e:
+            if " 404" in str(e):
+                return None
+            raise
+
+    def orders(self, **params):
+        return self._req("GET", "/orders", params=params)
+
+    def order(self, oid):
+        return self._req("GET", f"/orders/{oid}")
+
+    def submit(self, body: dict):
+        if body.get("side") not in ("buy", "sell"):
+            raise AlpacaError("bad side")
+        return self._req("POST", "/orders", json=body)
+
+    def cancel(self, oid):
+        return self._req("DELETE", f"/orders/{oid}")
+
+
+def _sym(alpaca_symbol: str) -> str:
+    return alpaca_symbol.replace("/", "")  # позиции Alpaca приходят как BTCUSD
+
+
+class AlpacaBroker:
+    """Интерфейс как у SimBroker: cash / equity / position / buy / sell. Состояние позиций — в Journal (зеркало) + сверка с Alpaca."""
+    def __init__(self, client: AlpacaClient, journal, assets):
+        self.c, self.j, self.assets = client, journal, {a.name: a for a in assets}
+
+    @property
+    def cash(self):
+        return float(self.c.account()["cash"])
+
+    def equity(self, prices=None):
+        return float(self.c.account()["equity"])
+
+    def position(self, name):
+        return self.j.positions().get(name)
+
+    def _wait_fill(self, oid, timeout=30):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            o = self.c.order(oid)
+            if o["status"] in ("filled", "canceled", "expired", "rejected"):
+                return o
+            time.sleep(1)
+        return self.c.order(oid)
+
+    def buy(self, name, qty, ref_price, stop, take, ts, run_id=None):
+        a = self.assets[name]
+        if self.position(name):
+            raise AlpacaError(f"позиция {name} уже открыта")
+        if qty * ref_price > self.cash:
+            raise AlpacaError("размер больше cash (плечо запрещено)")
+        if a.kind == "stock":
+            # настоящий bracket: вход + стоп + тейк на стороне брокера. Дробные акции в bracket не поддерживаются.
+            o = self.c.submit({"symbol": a.alpaca, "qty": str(int(qty)), "side": "buy", "type": "market",
+                               "time_in_force": "gtc", "order_class": "bracket",
+                               "take_profit": {"limit_price": f"{take:.2f}"}, "stop_loss": {"stop_price": f"{stop:.2f}"}})
+        else:
+            o = self.c.submit({"symbol": a.alpaca, "qty": f"{qty:.6f}", "side": "buy", "type": "market", "time_in_force": "gtc"})
+        o = self._wait_fill(o["id"])
+        if o["status"] != "filled":
+            # рынок закрыт/не исполнился — отменяем, позицию не заводим (bracket-дочерние отменяются вместе с родителем)
+            try:
+                self.c.cancel(o["id"])
+            except AlpacaError:
+                pass
+            raise AlpacaError(f"вход не исполнен: {o['status']}")
+        price, fq = float(o["filled_avg_price"]), float(o["filled_qty"])
+        fee_usd = 0.0
+        if a.kind == "crypto":
+            # Alpaca берёт комиссию крипты в получаемом активе → реальный остаток меньше filled_qty
+            live = self.c.position(a.alpaca)
+            have = float(live["qty_available"]) if live else 0.0
+            fee_usd = max(0.0, (fq - have) * price)
+            fq = have
+        stop_oid = None
+        if a.kind == "crypto":
+            try:  # bracket для крипты запрещён API → отдельный защитный stop_limit (limit на 1% ниже стопа)
+                qty_s = math.floor(fq * 1e6) / 1e6
+                so = self.c.submit({"symbol": a.alpaca, "qty": f"{qty_s:.6f}", "side": "sell", "type": "stop_limit",
+                                    "time_in_force": "gtc", "stop_price": f"{stop:.4f}", "limit_price": f"{stop * 0.99:.4f}"})
+                stop_oid = so["id"]
+            except AlpacaError as e:
+                mo = self._wait_fill(self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(fq * 1e6) / 1e6:.6f}", "side": "sell",
+                                                    "type": "market", "time_in_force": "gtc"})["id"])
+                if mo["status"] == "filled":
+                    raise AlpacaError(f"защитный стоп не встал ({e}) — позиция немедленно закрыта") from e
+                # закрытие не подтверждено: позицию обязательно ведём в журнале, иначе она «потеряется» без стопа
+                self._record_open(name, fq, price, stop, take, fee_usd, ts, run_id, None)
+                raise AlpacaError(f"СТОП НЕ ВСТАЛ и закрытие не подтверждено ({mo['status']}) — проверь позицию {a.alpaca} вручную") from e
+        self._record_open(name, fq, price, stop, take, fee_usd, ts, run_id, stop_oid)
+        return {"price": price, "qty": fq, "fee": fee_usd}
+
+    def _record_open(self, name, qty, price, stop, take, fee_usd, ts, run_id, stop_oid):
+        self.j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES(?,?,?,?,?,?,?,?)",
+                  (name, qty, price, stop, take, fee_usd, run_id, ts))
+        self.j.kv_set(f"stop_oid:{name}", stop_oid)
+        self.j.add_fill(ts, name, "buy", qty, price, fee_usd, "entry", run_id)
+
+    def sell(self, name, ref_price, ts, reason="signal"):
+        """Закрыть существующий лонг (только полностью)."""
+        p = self.position(name)
+        if not p:
+            raise AlpacaError(f"нет позиции {name}")
+        a = self.assets[name]
+        for o in self.c.orders(status="open", symbols=a.alpaca):
+            try:
+                self.c.cancel(o["id"])
+            except AlpacaError:
+                pass
+        time.sleep(1)
+        live = self.c.position(a.alpaca)
+        qty = float(live["qty_available"]) if live else p["qty"]
+        o = self._wait_fill(self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(qty * 1e6) / 1e6:.6f}" if a.kind == "crypto" else str(int(qty)),
+                                           "side": "sell", "type": "market", "time_in_force": "gtc"})["id"])
+        if o["status"] != "filled":
+            raise AlpacaError(f"закрытие не исполнено: {o['status']}")
+        return self._book_close(name, float(o["filled_avg_price"]), ts, reason)
+
+    def _book_close(self, name, price, ts, reason):
+        p = self.position(name)
+        exit_fee = p["qty"] * price * COSTS[self.assets[name].kind].fee  # оценка: комиссия Alpaca крипты в USD при продаже
+        fees = p["fees"] + exit_fee
+        pnl = (price - p["avg"]) * p["qty"] - fees
+        risk = p["qty"] * (p["avg"] - p["stop"])
+        self.j._x("DELETE FROM positions WHERE asset=?", (name,))
+        self.j._x("INSERT INTO trades(asset,entry_ts,exit_ts,entry,exit,qty,fees,pnl,r_mult,run_id,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (name, p["opened_ts"], ts, p["avg"], price, p["qty"], fees, pnl, pnl / risk if risk > 0 else None, p["run_id"], reason))
+        self.j.add_fill(ts, name, "sell", p["qty"], price, exit_fee, reason, p["run_id"])
+        return {"price": price, "pnl": pnl, "reason": reason}
+
+    def sync(self, prices: dict, ts):
+        """Сверка с Alpaca: закрытые стопом/тейком позиции → в журнал; крипто-тейк исполняется здесь. Возвращает список событий."""
+        events = []
+        live = {p["symbol"]: p for p in self.c.positions()}
+        for name, p in list(self.j.positions().items()):
+            a = self.assets[name]
+            if _sym(a.alpaca) not in live:  # позиции нет на брокере → закрылась по стопу/тейку
+                sells, soid = [], self.j.kv_get(f"stop_oid:{name}")
+                if soid:  # крипто: точный защитный ордер
+                    so = self.c.order(soid)
+                    sells = [so] if so.get("status") == "filled" else []
+                if not sells:
+                    sells = [o for o in self.c.orders(status="closed", symbols=a.alpaca, direction="desc", limit=10)
+                             if o["side"] == "sell" and o["status"] == "filled"]
+                px = float(sells[0]["filled_avg_price"]) if sells else min(prices.get(name, p["stop"]), p["stop"])  # без данных — консервативно
+                reason = "take" if px >= p["avg"] and p["take"] and px >= p["take"] * 0.998 else "stop"
+                events.append((name, self._book_close(name, px, ts, reason)))
+            elif a.kind == "crypto" and p["take"] and prices.get(name, 0) >= p["take"]:
+                events.append((name, self.sell(name, prices[name], ts, "take")))
+        return events

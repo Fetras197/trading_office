@@ -1,0 +1,151 @@
+"""Рыночные данные. Только публичные keyless-эндпоинты, всё best-effort кроме свечей."""
+import time
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
+
+import pandas as pd
+import requests
+
+BINANCE = "https://data-api.binance.vision/api/v3/klines"
+YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+HL = "https://api.hyperliquid.xyz/info"
+UA = {"User-Agent": "Mozilla/5.0"}
+_IV_MS = {"1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+
+
+def _get(url, **kw):
+    for i in range(3):
+        try:
+            r = requests.get(url, headers=UA, timeout=20, **kw)
+            r.raise_for_status()
+            return r
+        except requests.RequestException:
+            if i == 2:
+                raise
+            time.sleep(1.5 * (i + 1))
+
+
+def crypto_candles(symbol: str, interval: str = "1h", start_ms: int | None = None,
+                   end_ms: int | None = None, limit: int = 500) -> pd.DataFrame:
+    """Свечи Binance. Без start_ms — последние `limit`. С start_ms — пагинация до end_ms."""
+    rows, cur = [], start_ms
+    while True:
+        p = {"symbol": symbol, "interval": interval, "limit": 1000 if start_ms else limit}
+        if cur is not None:
+            p["startTime"] = cur
+        if end_ms:
+            p["endTime"] = end_ms
+        batch = _get(BINANCE, params=p).json()
+        rows += batch
+        if not start_ms or len(batch) < 1000:
+            break
+        cur = batch[-1][0] + _IV_MS[interval]
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume", "ct", "qv", "n", "tb", "tq", "i"])
+    return _norm(df, "ts", "ms")
+
+
+def stock_candles(ticker: str, interval: str = "1h", rng: str = "60d") -> pd.DataFrame:
+    j = _get(YAHOO.format(ticker), params={"range": rng, "interval": interval}).json()
+    res = j["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
+    df = pd.DataFrame({"ts": res["timestamp"], **{k: q[k] for k in ("open", "high", "low", "close", "volume")}})
+    return _norm(df.dropna(), "ts", "s")
+
+
+def _norm(df: pd.DataFrame, col: str, unit: str) -> pd.DataFrame:
+    df = df.copy()
+    df.index = pd.to_datetime(df[col].astype("int64"), unit=unit, utc=True)
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    return df[~df.index.duplicated()].sort_index()
+
+
+def candles(asset, interval: str = "1h", **kw) -> pd.DataFrame:
+    if asset.kind == "crypto":
+        return crypto_candles(asset.ticker, interval, **kw)
+    return stock_candles(asset.ticker, interval, kw.get("rng", "60d"))
+
+
+def market_open(df: pd.DataFrame, now: pd.Timestamp | None = None) -> bool:
+    """Акции: рынок открыт, если сейчас будний день 9:30-16:00 NY и последняя свеча свежая (отсекает праздники)."""
+    now = now or pd.Timestamp.now(tz="UTC")
+    ny = now.tz_convert("America/New_York")
+    if ny.weekday() >= 5 or not (9.5 <= ny.hour + ny.minute / 60 < 16):
+        return False
+    return (now - df.index[-1]) < pd.Timedelta(hours=2)
+
+
+def funding_history(coin: str, start_ms: int, end_ms: int | None = None) -> pd.DataFrame:
+    """Hyperliquid funding (почасовой). Колонки: funding, premium."""
+    rows, cur = [], start_ms
+    while True:
+        body = {"type": "fundingHistory", "coin": coin, "startTime": cur}
+        if end_ms:
+            body["endTime"] = end_ms
+        batch = requests.post(HL, json=body, timeout=20).json()
+        if not batch:
+            break
+        rows += batch
+        if len(batch) < 500:
+            break
+        cur = batch[-1]["time"] + 1
+    if not rows:
+        return pd.DataFrame(columns=["funding", "premium"])
+    df = pd.DataFrame(rows)
+    df.index = pd.to_datetime(df["time"], unit="ms", utc=True)
+    return df[["fundingRate", "premium"]].astype(float).rename(columns={"fundingRate": "funding"})
+
+
+def derivs_now(coin: str) -> dict:
+    """Текущие funding / OI / premium с Hyperliquid."""
+    try:
+        meta, ctxs = requests.post(HL, json={"type": "metaAndAssetCtxs"}, timeout=20).json()
+        i = [u["name"] for u in meta["universe"]].index(coin)
+        c = ctxs[i]
+        return {"funding_hourly": float(c["funding"]), "open_interest": float(c["openInterest"]),
+                "premium": float(c["premium"]), "mark": float(c["markPx"]),
+                "day_volume_usd": float(c["dayNtlVlm"])}
+    except Exception as e:  # noqa: BLE001 — best-effort
+        return {"error": f"unavailable: {e}"}
+
+
+def news(query: str, n: int = 8) -> list[dict]:
+    """Google News RSS, best-effort."""
+    try:
+        r = _get(f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en")
+        items = ET.fromstring(r.content).findall(".//item")[:n]
+        return [{"title": i.findtext("title"), "published": i.findtext("pubDate")} for i in items]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def fundamentals(asset) -> dict:
+    try:
+        if asset.kind == "crypto":
+            j = _get(f"https://api.coingecko.com/api/v3/coins/{asset.cg_id}",
+                     params={"localization": "false", "tickers": "false", "community_data": "false",
+                             "developer_data": "false"}).json()["market_data"]
+            return {"market_cap_usd": j["market_cap"]["usd"], "circulating_supply": j["circulating_supply"],
+                    "max_supply": j["max_supply"], "ath_change_pct": j["ath_change_percentage"]["usd"],
+                    "change_30d_pct": j["price_change_percentage_30d"]}
+        import yfinance as yf  # опционально
+        info = yf.Ticker(asset.ticker).info
+        keys = ["marketCap", "trailingPE", "forwardPE", "priceToBook", "profitMargins", "revenueGrowth",
+                "debtToEquity", "returnOnEquity", "freeCashflow", "recommendationMean"]
+        return {k: info.get(k) for k in keys}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"unavailable: {type(e).__name__}"}
+
+
+def bundle(asset, candles_df: pd.DataFrame | None = None) -> dict:
+    """Пакет данных для живого цикла. Агентам уходит как JSON."""
+    from . import indicators as ind
+    df = candles_df if candles_df is not None else candles(asset, "1h")
+    d4 = df.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+    b = {"asset": asset.name, "kind": asset.kind, "as_of": str(df.index[-1]),
+         "indicators_1h": ind.snapshot(df), "indicators_4h": ind.snapshot(d4),
+         "last_candles_1h": df.tail(12).round(4).reset_index().astype({"ts": str}).to_dict("records")}
+    b["news"] = news(f"{asset.name} {'crypto' if asset.kind == 'crypto' else 'stock'}")
+    b["fundamentals"] = fundamentals(asset)
+    if asset.kind == "crypto":
+        b["derivatives"] = derivs_now(asset.hl_coin)
+    return b
