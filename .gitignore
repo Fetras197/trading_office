@@ -18,3 +18,10 @@ results/
 *.pid
 *.lock
 cookies.txt
+vendor/
+.venv/
+.supervisor.pid
+.lab.pid
+.user_stopped
+.supervisor.lock
+logs/

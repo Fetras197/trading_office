@@ -1,13 +1,8 @@
-# trading_office — мультиагентная торговая «фирма» (paper only)
+# trading_office — «Торговый зал» (Alpaca **paper only**)
 
-11 ролей-субагентов (`.claude/agents/`) → RiskGate в коде → Alpaca Paper. Подробности: `PLAN.md`, `DECISIONS.md`, `reports/`.
+Мульти-агентная фирма на готовых компонентах (TradingAgents, ai-hedge-fund, wshobson/quantitative-trading, financial-services/equity-research,
+TA-Lib, Riskfolio-Lib, PyPortfolioOpt, vectorbt, alpaca-py). Карта, команды и результаты приёмки — `reports/FINAL.md`.
+Решения без вопросов — `DECISIONS.md`. Компоненты и статус установки — `reports/components.md`.
 
-```
-python -m office once [--auto] [--only BTC,AAPL]   # один цикл
-python -m office run --interval 4 [--auto]         # цикл каждые N часов
-python -m office watch                             # без LLM: сверка стопов/тейков (cron)
-python -m office status | stop | resume | accuracy
-python -m office.backtest --months 6               # reports/backtest.md
-python -m pytest -q tests
-```
-Управление в Termux: `./trading_office.sh start|stop|status|once|watch|halt|resume|log`. Секреты — в `.env` (см. `.env.example`).
+Запуск — только из Termux: `./office.sh start|stop|status|halt|resume|watchdog|once SYMBOL [--dry-run]|log`.
+Секреты — `.env` (в .gitignore); образец — `.env.example`. Тесты: `.venv/bin/python -m pytest`.

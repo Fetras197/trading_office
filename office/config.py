@@ -21,24 +21,37 @@ def load_env(path: Path = ROOT / ".env") -> None:
 
 @dataclass(frozen=True)
 class Asset:
-    name: str          # BTC (ключ в журнале)
+    name: str          # = символ Alpaca: "BTC/USD" | "AAPL" (ключ в журнале; вид актива виден из имени)
     kind: str          # crypto | stock
     ticker: str        # источник свечей: BTCUSDT (Binance) | AAPL (Yahoo)
-    alpaca: str        # символ Alpaca: BTC/USD | AAPL
+    alpaca: str        # символ Alpaca
     hl_coin: str = ""  # Hyperliquid coin для деривативов
     cg_id: str = ""    # CoinGecko id
 
 
-ASSETS = [
-    Asset("BTC", "crypto", "BTCUSDT", "BTC/USD", "BTC", "bitcoin"),
-    Asset("ETH", "crypto", "ETHUSDT", "ETH/USD", "ETH", "ethereum"),
-    Asset("SOL", "crypto", "SOLUSDT", "SOL/USD", "SOL", "solana"),
-    Asset("AAPL", "stock", "AAPL", "AAPL"),
-    Asset("MSFT", "stock", "MSFT", "MSFT"),
-    Asset("NVDA", "stock", "NVDA", "NVDA"),
-    Asset("SPY", "stock", "SPY", "SPY"),
-]
-BY_NAME = {a.name: a for a in ASSETS}
+_CG = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
+
+
+def make_asset(symbol: str) -> Asset:
+    """Любой символ Alpaca -> Asset (универсум скринера динамический)."""
+    symbol = symbol.upper().replace("-", "/")
+    if "/" in symbol:
+        base = symbol.split("/")[0]
+        return Asset(symbol, "crypto", base + "USDT", symbol, base, _CG.get(base, ""))
+    return Asset(symbol, "stock", symbol, symbol)
+
+
+CRYPTO_CORE = ["BTC/USD", "ETH/USD", "SOL/USD"]            # цикл каждый час
+STOCK_CORE = ["SPY", "NVDA", "AAPL", "MSFT"]               # цикл в часы биржи
+ASSETS = [make_asset(s) for s in CRYPTO_CORE + STOCK_CORE]
+
+
+class _ByName(dict):
+    def __missing__(self, k):
+        return make_asset(k)
+
+
+BY_NAME = _ByName({a.name: a for a in ASSETS})
 
 
 @dataclass(frozen=True)
@@ -64,8 +77,8 @@ COSTS = {"crypto": Costs(fee=0.0025), "stock": Costs(fee=0.0)}  # Alpaca: кри
 
 START_CASH = 100_000.0  # только для бэктеста (как на paper-счёте)
 
-# Кто отвечает за роль: аналитики — Gemini, остальные — Claude
-ROLE_BACKEND = {"tech_analyst": "gemini", "fundamental_analyst": "gemini", "news_sentiment": "gemini",
-                "onchain_derivs": "gemini"}  # остальные — claude
-ROLE_MODELS = {"executor": "haiku", "journal": "haiku"}  # модели Claude по ролям; остальные Claude-роли — DEFAULT_CLAUDE_MODEL
+# Кто отвечает за роль: аналитики — Gemini, остальные — Claude (claude -p)
+ANALYST_ROLES = ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller")
+ROLE_BACKEND = {r: "gemini" for r in ANALYST_ROLES}
+ROLE_MODELS = {"executor": "haiku"}  # остальные Claude-роли — DEFAULT_CLAUDE_MODEL
 DEFAULT_CLAUDE_MODEL = "sonnet"

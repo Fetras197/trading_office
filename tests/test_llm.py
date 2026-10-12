@@ -64,8 +64,20 @@ def test_router_analysts_gemini_rest_claude():
         def __init__(self, n):
             self.n = n
 
-        def ask(self, role, p):
+        def ask(self, role, p, system=None):
             return self.n
     r = RoleRouter(claude=B("claude"), gemini=B("gemini"))
-    assert [r.ask(x, {}) for x in ("tech_analyst", "fundamental_analyst", "news_sentiment", "onchain_derivs")] == ["gemini"] * 4
-    assert [r.ask(x, {}) for x in ("bull_researcher", "bear_researcher", "trader", "risk_manager", "portfolio_manager", "executor", "journal")] == ["claude"] * 7
+    assert [r.ask(x, {}) for x in ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller")] == ["gemini"] * 7
+    assert [r.ask(x, {}) for x in ("trader", "risk_manager", "portfolio_manager", "executor")] == ["claude"] * 4
+
+
+def test_gemini_429_all_models_is_unavailable_not_crash(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+    from office.llm import LLMUnavailable
+
+    class S:
+        def post(self, *a, **k):
+            return type("R", (), {"status_code": 429, "text": "RESOURCE_EXHAUSTED PerDay", "json": lambda s: {}})()
+    with pytest.raises(LLMUnavailable):
+        GeminiBackend(session=S(), min_interval=0).ask("market", {}, system="x")

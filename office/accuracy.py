@@ -1,6 +1,6 @@
-"""Точность по ролям. Исход мнения — triple-barrier по свечам ПОСЛЕ мнения:
-верхний барьер +B, нижний −B, B = ATR_1h·√H (≈ дневная σ), горизонт H часов (по умолч. 24).
-buy верен, если первым достигнут верх; sell — если низ; hold — если за H барьеры не задеты. abstain/n/a не оцениваются."""
+"""Точность ролей по шине board.db. Исход мнения — triple-barrier по 1h-свечам ПОСЛЕ отчёта:
+верх +B, низ −B, B = ATR_1h·√H, горизонт H=24ч. buy верен, если первым достигнут верх; sell — низ; hold — если барьеры не задеты.
+abstain не оценивается. Оцениваются роли с направленным мнением (аналитики, bull, bear, trader)."""
 import math
 
 import pandas as pd
@@ -9,7 +9,7 @@ H_BARS = 24
 
 
 def barrier_outcome(after: pd.DataFrame, p0: float, atr: float, h: int = H_BARS) -> int | None:
-    """+1 верх первым, −1 низ первым, 0 тайм-аут. None — данных ещё недостаточно (горизонт не наступил)."""
+    """+1 верх первым, −1 низ первым, 0 тайм-аут. None — горизонт ещё не наступил."""
     if not atr or atr <= 0:
         return None
     b = atr * math.sqrt(h)
@@ -17,7 +17,7 @@ def barrier_outcome(after: pd.DataFrame, p0: float, atr: float, h: int = H_BARS)
     for _, r in win.iterrows():
         up, dn = r["high"] >= p0 + b, r["low"] <= p0 - b
         if up and dn:
-            return -1  # консервативно: оба в одной свече — считаем худший для лонга исход
+            return -1  # оба в одной свече — худший для лонга исход
         if up:
             return 1
         if dn:
@@ -25,29 +25,31 @@ def barrier_outcome(after: pd.DataFrame, p0: float, atr: float, h: int = H_BARS)
     return 0 if len(win) >= h else None
 
 
-def settle(journal, candles_for, h: int = H_BARS) -> int:
-    """candles_for(asset_name) -> DataFrame 1h. Проставляет outcomes для созревших мнений. Возвращает число новых."""
-    rows = journal.q("""SELECT o.id oid, o.asset, o.stance, o.ts, r.price, r.atr FROM opinions o JOIN runs r ON r.id=o.run_id
-                        LEFT JOIN outcomes x ON x.opinion_id=o.id WHERE x.opinion_id IS NULL AND o.stance IN ('buy','sell','hold')""")
+def settle(board, journal, candles_for, h: int = H_BARS) -> int:
+    """candles_for(asset)->DataFrame 1h. Проставляет outcomes для созревших отчётов. Возвращает число новых."""
+    runs = {r["mode"]: r for r in journal.q("SELECT mode, price, atr FROM runs")}  # runs.mode хранит cycle_id
+    rows = board.q("""SELECT r.id, r.cycle_id, r.asset, r.ts, r.data FROM reports r LEFT JOIN outcomes x ON x.report_id=r.id WHERE x.report_id IS NULL""")
+    import json
     cache, n = {}, 0
     for r in rows:
-        df = cache.setdefault(r["asset"], candles_for(r["asset"]))
-        after = df[df.index > pd.Timestamp(r["ts"])]
-        lab = barrier_outcome(after, r["price"], r["atr"], h)
+        d = json.loads(r["data"] or "{}")
+        stance = d.get("stance") or d.get("action")
+        run = runs.get(r["cycle_id"])
+        if stance not in ("buy", "sell", "hold") or not run:
+            continue
+        try:
+            df = cache.setdefault(r["asset"], candles_for(r["asset"]))
+        except Exception:  # noqa: BLE001
+            continue
+        lab = barrier_outcome(df[df.index > pd.Timestamp(r["ts"])], run["price"], run["atr"], h)
         if lab is None:
             continue
-        correct = int((r["stance"] == "buy" and lab == 1) or (r["stance"] == "sell" and lab == -1) or (r["stance"] == "hold" and lab == 0))
-        journal._x("INSERT INTO outcomes(opinion_id,label,correct) VALUES(?,?,?)", (r["oid"], lab, correct))
+        correct = int((stance == "buy" and lab == 1) or (stance == "sell" and lab == -1) or (stance == "hold" and lab == 0))
+        board.x("INSERT INTO outcomes(report_id,label,correct) VALUES(?,?,?)", (r["id"], lab, correct))
         n += 1
     return n
 
 
-def role_accuracy(journal, shadow=None) -> list[dict]:
-    """Таблица по ролям: n, доля верных, отдельно по directional (buy/sell) мнениям."""
-    sh = "" if shadow is None else f"AND o.shadow={int(shadow)}"
-    return journal.q(f"""SELECT o.role, COUNT(*) n, ROUND(AVG(x.correct),3) accuracy,
-        SUM(o.stance IN ('buy','sell')) n_dir,
-        ROUND(AVG(CASE WHEN o.stance IN ('buy','sell') THEN x.correct END),3) accuracy_dir,
-        ROUND(1.0*SUM(CASE WHEN o.stance IN ('buy','sell') THEN x.correct END)
-              / NULLIF(SUM(CASE WHEN o.stance IN ('buy','sell') AND x.label!=0 THEN 1 END),0),3) hit_rate_dir
-        FROM opinions o JOIN outcomes x ON x.opinion_id=o.id WHERE 1=1 {sh} GROUP BY o.role ORDER BY o.role""")
+def role_accuracy(board) -> list[dict]:
+    return board.q("""SELECT r.role, COUNT(*) n, ROUND(AVG(x.correct),3) accuracy FROM reports r JOIN outcomes x ON x.report_id=r.id
+                      GROUP BY r.role ORDER BY r.role""")

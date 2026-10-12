@@ -1,0 +1,1 @@
+*/10 * * * * /data/data/com.termux/files/home/projects/trading_office/office.sh watchdog

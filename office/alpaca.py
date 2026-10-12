@@ -6,7 +6,7 @@ import time
 
 import requests
 
-from .config import COSTS
+from .config import BY_NAME, COSTS
 
 PAPER_HOST = "paper-api.alpaca.markets"
 
@@ -18,16 +18,30 @@ class AlpacaError(Exception):
 class AlpacaClient:
     def __init__(self, key=None, secret=None, base=None, session=None):
         self.base = (base or os.environ.get("ALPACA_BASE_URL", f"https://{PAPER_HOST}/v2")).rstrip("/")
+        if os.environ.get("ALPACA_PAPER", "true").lower() != "true":
+            raise AlpacaError("отказ: ALPACA_PAPER != true (только paper)")
         if PAPER_HOST not in self.base:
             raise AlpacaError(f"отказ: base_url не paper ({self.base})")
-        self.h = {"APCA-API-KEY-ID": key or os.environ.get("ALPACA_KEY_ID", ""),
-                  "APCA-API-SECRET-KEY": secret or os.environ.get("ALPACA_SECRET", "")}
+        self.h = {"APCA-API-KEY-ID": key or os.environ.get("ALPACA_API_KEY") or os.environ.get("ALPACA_KEY_ID", ""),
+                  "APCA-API-SECRET-KEY": secret or os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("ALPACA_SECRET", "")}
         if not all(self.h.values()):
-            raise AlpacaError("нет ALPACA_KEY_ID/ALPACA_SECRET в .env")
+            raise AlpacaError("нет ALPACA_API_KEY/ALPACA_SECRET_KEY в .env")
         self.s = session or requests.Session()
 
     def _req(self, method, path, **kw):
-        r = self.s.request(method, f"{self.base}{path}", headers=self.h, timeout=20, **kw)
+        # GET ретраится (нестабильная сеть Android); POST/DELETE — нет: повторная отправка ордера опаснее ошибки
+        for i in range(3 if method == "GET" else 1):
+            try:
+                r = self.s.request(method, f"{self.base}{path}", headers=self.h, timeout=20, **kw)
+            except requests.RequestException as e:
+                if i == 2 or method != "GET":
+                    raise AlpacaError(f"{method} {path}: сеть {type(e).__name__}") from e
+                time.sleep(2 * (i + 1))
+                continue
+            if r.status_code >= 500 and method == "GET" and i < 2:
+                time.sleep(2 * (i + 1))
+                continue
+            break
         if r.status_code >= 400:
             raise AlpacaError(f"{method} {path} -> {r.status_code}: {r.text[:200]}")
         return r.json() if r.text else {}
@@ -71,8 +85,8 @@ def _sym(alpaca_symbol: str) -> str:
 
 class AlpacaBroker:
     """Интерфейс как у SimBroker: cash / equity / position / buy / sell. Состояние позиций — в Journal (зеркало) + сверка с Alpaca."""
-    def __init__(self, client: AlpacaClient, journal, assets):
-        self.c, self.j, self.assets = client, journal, {a.name: a for a in assets}
+    def __init__(self, client: AlpacaClient, journal, assets=None):
+        self.c, self.j, self.assets, self.last_order_id = client, journal, BY_NAME, None
 
     @property
     def cash(self):
@@ -107,12 +121,16 @@ class AlpacaBroker:
         else:
             o = self.c.submit({"symbol": a.alpaca, "qty": f"{qty:.6f}", "side": "buy", "type": "market", "time_in_force": "gtc"})
         o = self._wait_fill(o["id"])
+        self.last_order_id = o["id"]
         if o["status"] != "filled":
             # рынок закрыт/не исполнился — отменяем, позицию не заводим (bracket-дочерние отменяются вместе с родителем)
             try:
                 self.c.cancel(o["id"])
             except AlpacaError:
                 pass
+            o = self.c.order(o["id"])  # за время отмены ордер мог исполниться
+            if float(o.get("filled_qty") or 0) > 0:
+                raise AlpacaError(f"вход исполнен ({o['status']}, filled_qty={o['filled_qty']}) в момент отмены — проверь позицию {a.alpaca} вручную")
             raise AlpacaError(f"вход не исполнен: {o['status']}")
         price, fq = float(o["filled_avg_price"]), float(o["filled_qty"])
         fee_usd = 0.0
@@ -162,6 +180,7 @@ class AlpacaBroker:
         qty = float(live["qty_available"]) if live else p["qty"]
         o = self._wait_fill(self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(qty * 1e6) / 1e6:.6f}" if a.kind == "crypto" else str(int(qty)),
                                            "side": "sell", "type": "market", "time_in_force": "gtc"})["id"])
+        self.last_order_id = o["id"]
         if o["status"] != "filled":
             raise AlpacaError(f"закрытие не исполнено: {o['status']}")
         return self._book_close(name, float(o["filled_avg_price"]), ts, reason)

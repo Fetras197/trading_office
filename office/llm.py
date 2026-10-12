@@ -1,6 +1,7 @@
 """LLM-бэкенды. Системный промпт роли = тело файла .claude/agents/<role>.md. Ответ — один JSON-объект."""
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -13,6 +14,10 @@ from .config import AGENTS_DIR, DEFAULT_CLAUDE_MODEL, ROLE_BACKEND, ROLE_MODELS
 
 class LLMError(Exception):
     pass
+
+
+class LLMUnavailable(LLMError):
+    """Лимит/квота исчерпаны или сервис недоступен: роль пропускается (abstain), цикл не падает."""
 
 
 def load_agent(role: str) -> str:
@@ -44,26 +49,33 @@ class ClaudeBackend:
         self.model, self.timeout = model, timeout
         self.cwd = tempfile.mkdtemp(prefix="to_llm_")  # нейтральная папка: не подхватываем CLAUDE.md проектов
 
-    def ask(self, role: str, payload: dict) -> dict:
-        cmd = ["claude", "-p", _prompt(payload), "--system-prompt", load_agent(role), "--tools", "",
-               "--output-format", "json", "--no-session-persistence", "--disable-slash-commands",
-               "--setting-sources", "", "--strict-mcp-config"]  # без хуков/MCP/CLAUDE.md: 19с и $0.001 вместо 83с и $0.06
-        model = self.model or ROLE_MODELS.get(role, DEFAULT_CLAUDE_MODEL)
-        cmd += ["--model", model]
+    def text(self, system: str | None, prompt: str, model: str = "") -> str:
+        cmd = ["claude", "-p", prompt, "--tools", "", "--output-format", "json", "--no-session-persistence",
+               "--disable-slash-commands", "--setting-sources", "", "--strict-mcp-config",  # без хуков/MCP/CLAUDE.md: 19с и $0.001 вместо 83с и $0.06
+               "--model", model or DEFAULT_CLAUDE_MODEL]
+        if system:
+            cmd += ["--system-prompt", system]
         with _Limited.sem:
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout, cwd=self.cwd)
             except subprocess.TimeoutExpired as ex:
                 raise LLMError("таймаут claude") from ex
-        if r.returncode != 0:
-            raise LLMError(f"claude rc={r.returncode}: {r.stderr[:200]}")
         try:
             outer = json.loads(r.stdout)
         except json.JSONDecodeError as ex:
+            if r.returncode != 0:
+                raise LLMError(f"claude rc={r.returncode}: {r.stderr[:200]}") from ex
             raise LLMError(f"не JSON от claude: {r.stdout[:120]!r}") from ex
-        if outer.get("is_error"):
-            raise LLMError(f"claude error: {str(outer.get('result'))[:200]}")
-        return parse_json(outer.get("result", ""))
+        if outer.get("is_error") or r.returncode != 0:
+            msg = str(outer.get("result"))[:200]
+            if re.search(r"limit|quota|usage|credit|overloaded|rate", msg, re.I):
+                raise LLMUnavailable(f"claude лимит: {msg}")
+            raise LLMError(f"claude error: {msg}")
+        return outer.get("result", "")
+
+    def ask(self, role: str, payload: dict, system: str | None = None) -> dict:
+        model = self.model or ROLE_MODELS.get(role, DEFAULT_CLAUDE_MODEL)
+        return parse_json(self.text(system or load_agent(role), _prompt(payload), model))
 
 
 class GeminiBackend:
@@ -85,11 +97,11 @@ class GeminiBackend:
                 time.sleep(wait)
             self._last[0] = time.monotonic()
 
-    def ask(self, role: str, payload: dict) -> dict:
+    def ask(self, role: str, payload: dict, system: str | None = None) -> dict:
         key = os.environ.get("GEMINI_API_KEY")
         if not key:
             raise LLMError("нет GEMINI_API_KEY")
-        body = {"systemInstruction": {"parts": [{"text": load_agent(role)}]},
+        body = {"systemInstruction": {"parts": [{"text": system or load_agent(role)}]},
                 "contents": [{"role": "user", "parts": [{"text": _prompt(payload)}]}],
                 "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
         r = None
@@ -107,7 +119,8 @@ class GeminiBackend:
             if r.status_code == 200:
                 break
         if r.status_code != 200:
-            raise LLMError(f"gemini {r.status_code}: {r.text[:150]}")
+            err = LLMUnavailable if r.status_code in (429, 503) else LLMError
+            raise err(f"gemini {r.status_code}: {r.text[:150]}")
         try:
             return parse_json(r.json()["candidates"][0]["content"]["parts"][0]["text"])
         except (KeyError, IndexError, ValueError) as ex:
@@ -119,8 +132,8 @@ class RoleRouter:
     def __init__(self, claude=None, gemini=None):
         self.claude, self.gemini = claude or ClaudeBackend(), gemini or GeminiBackend()
 
-    def ask(self, role, payload):
-        return (self.gemini if ROLE_BACKEND.get(role) == "gemini" else self.claude).ask(role, payload)
+    def ask(self, role, payload, system=None):
+        return (self.gemini if ROLE_BACKEND.get(role) == "gemini" else self.claude).ask(role, payload, system=system)
 
 
 class FakeBackend:
@@ -128,7 +141,7 @@ class FakeBackend:
     def __init__(self, handler):
         self.handler, self.calls = handler, []
 
-    def ask(self, role, payload):
+    def ask(self, role, payload, system=None):
         self.calls.append(role)
         return self.handler(role, payload)
 
