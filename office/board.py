@@ -6,8 +6,11 @@ import json
 import sqlite3
 import threading
 
-ANALYSTS = ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller", "lab")
+ANALYSTS = ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller", "lab", "smartmoney")
+# Исследовательский отдел (v3): глобальные отчёты (asset='*' или тикер), ссылок на других не требуют; зал цитирует их из любого цикла
+RESEARCH = ("macro", "calendar", "newsdesk", "cryptodesk", "sectors", "portfolio_an", "picture", "regime", "postmortem", "factcheck")
 STANCES = ("agree", "dispute")
+PICTURE_MAX_AGE_H = 6.0   # «Картина дня» старше — не считается актуальной, ссылка на неё отклоняется
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY, cycle_id TEXT, role TEXT, asset TEXT, ts TEXT, verdict TEXT,
@@ -15,6 +18,10 @@ CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY, cycle_id TEXT, role T
 CREATE TABLE IF NOT EXISTS rejected(id INTEGER PRIMARY KEY, cycle_id TEXT, role TEXT, asset TEXT, ts TEXT, reason TEXT, payload TEXT);
 CREATE TABLE IF NOT EXISTS outcomes(report_id INTEGER PRIMARY KEY, label INT, correct INT);
 CREATE INDEX IF NOT EXISTS ix_rep_cycle ON reports(cycle_id, asset);
+CREATE INDEX IF NOT EXISTS ix_rep_role ON reports(role, id);
+CREATE TABLE IF NOT EXISTS events(key TEXT PRIMARY KEY, ts TEXT, until TEXT, title TEXT, ccy TEXT, impact TEXT, kind TEXT, assets TEXT, src TEXT, data TEXT, seen TEXT);
+CREATE TABLE IF NOT EXISTS memory(id INTEGER PRIMARY KEY, ts TEXT, kind TEXT, asset TEXT, tags TEXT, text TEXT, data TEXT);
+CREATE INDEX IF NOT EXISTS ix_mem ON memory(kind, asset, id);
 CREATE TABLE IF NOT EXISTS candidates(ts TEXT, symbol TEXT, score REAL, rank INT, data TEXT);
 CREATE TABLE IF NOT EXISTS strategies(id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, name TEXT, params TEXT, approved INT,
   oos_sharpe REAL, bh_sharpe REAL, oos_dd REAL, bh_dd REAL, trades INT, data TEXT);
@@ -55,6 +62,22 @@ class Board:
         r = self.q("SELECT * FROM reports WHERE id=?", (rid,))
         return _row(r[0]) if r else None
 
+    def latest(self, role: str, asset: str = "*", max_age_h: float | None = None) -> dict | None:
+        """Последний отчёт роли по активу ('*' — глобальный). max_age_h — отбросить устаревший."""
+        r = self.q("SELECT * FROM reports WHERE role=? AND asset=? ORDER BY id DESC LIMIT 1", (role, asset))
+        if not r:
+            return None
+        rep = _row(r[0])
+        if max_age_h is not None and age_h(rep["ts"]) > max_age_h:
+            return None
+        return rep
+
+    def global_reports(self) -> list[dict]:
+        """Последний отчёт каждой исследовательской роли по каждому активу — доступны для ссылок из любого цикла."""
+        marks = ",".join("?" * len(RESEARCH))
+        rows = self.q(f"SELECT * FROM reports WHERE id IN (SELECT MAX(id) FROM reports WHERE role IN ({marks}) GROUP BY role, asset)", RESEARCH)
+        return [_row(r) for r in rows]
+
     def cycle_reports(self, cycle_id: str, asset: str) -> list[dict]:
         return [_row(r) for r in self.q("SELECT * FROM reports WHERE cycle_id=? AND asset=? ORDER BY id", (cycle_id, asset))]
 
@@ -81,14 +104,17 @@ class Board:
             ok = False
         if not ok:
             raise RejectedReport(f"{role}: уверенность вне 0..1")
-        if role in ANALYSTS:
+        if role in ANALYSTS or role in RESEARCH:
             return
         if not refs:
             raise RejectedReport(f"{role}: нет ссылок на отчёты предыдущих ролей")
-        known = {r["id"]: r for r in self.cycle_reports(cycle_id, asset)}
+        known = {r["id"]: r for r in self.global_reports()}
+        known.update({r["id"]: r for r in self.cycle_reports(cycle_id, asset)})
         for rid in refs:
             if rid not in known:
                 raise RejectedReport(f"{role}: ссылка на несуществующий/чужой отчёт {rid}")
+            if known[rid]["role"] == "picture" and age_h(known[rid]["ts"]) > PICTURE_MAX_AGE_H:
+                raise RejectedReport(f"{role}: «Картина дня» #{rid} устарела (> {PICTURE_MAX_AGE_H:g} ч) — нужна актуальная")
             if str(rid) not in stances and rid not in stances:
                 raise RejectedReport(f"{role}: нет явной позиции (agree/dispute) по отчёту {rid}")
         for k, v in stances.items():
@@ -99,6 +125,12 @@ class Board:
             group = ANALYSTS if need == "analyst" else (need,)
             if not cited & set(group):
                 raise RejectedReport(f"{role}: обязательна ссылка на отчёт роли {need}")
+
+
+def age_h(ts: str) -> float:
+    t = dt.datetime.fromisoformat(ts)
+    t = t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - t).total_seconds() / 3600
 
 
 def _row(r: dict) -> dict:

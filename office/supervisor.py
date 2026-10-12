@@ -4,10 +4,12 @@
   6 ч:    сводка в Telegram.
 Лаборатория — отдельный фоновый процесс (`python -m office lab`). STOP-файл = новые решения не принимаются."""
 import concurrent.futures as cf
+import datetime as dt
 import fcntl
+import threading
 import time
 
-from . import accuracy, config, data, lab, report, screener
+from . import accuracy, config, data, events, lab, report, research, scheduler, screener
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
@@ -26,11 +28,58 @@ class Supervisor:
         self.client = client or AlpacaClient()
         self.broker = AlpacaBroker(self.client, self.j)
         self.notify = notify
-        self.hall = hall or Hall(self.board, self.j, self.broker, RoleRouter(), ClaudeBackend(), notify=notify,
-                                 lab=lambda s: self._lab(s))
-        self.next = {"screen": 0.0, "cycle": 0.0, "summary": time.time() + SUMMARY_S}
+        self.router = RoleRouter()
         self.candidates: list[str] = []
         self.stock_open = False
+        self.research = research.Research(self.board, self.j, self.client, self.router, self.scope, notify=notify)
+        self.research.on_urgent = self.urgent
+        self.hall = hall or Hall(self.board, self.j, self.broker, self.router, ClaudeBackend(), notify=notify,
+                                 lab=lambda s: self._lab(s), picture=self.research.ensure_picture)
+        self.next = {"screen": 0.0, "cycle": 0.0, "summary": time.time() + SUMMARY_S}
+        self.sched = scheduler.Scheduler(self.j, self.jobs())
+
+    def scope(self) -> dict:
+        return {"held": list(self.j.positions()), "candidates": list(self.candidates)}
+
+    def jobs(self) -> list:
+        """Исследовательский отдел: порядок в списке = порядок первичного наполнения при самом первом запуске."""
+        R, J = self.research, scheduler.Job
+        return [J("events", R.run_events, every=3600),
+                J("macro", R.run_macro, at=["07:00"], catchup_h=8),
+                J("macro_pre_event", self.pre_event_macro, every=300),
+                J("news", R.run_news, every=3600),
+                J("crypto", R.run_crypto, every=3600),
+                J("sectors", R.run_sectors, at=["07:10"], catchup_h=8),
+                J("portfolio", R.run_portfolio, at=["07:20"], catchup_h=8),
+                J("picture", R.run_picture, at=["03:30", "07:30", "11:30", "15:30", "19:30", "23:30"], catchup_h=3)]
+
+    def pre_event_macro(self):
+        """За час до важного события USD: обновить макро-анализ и картину дня (1 раз на событие)."""
+        now = dt.datetime.now(dt.timezone.utc)
+        for e in events.upcoming(self.board, 1, now, high_only=True):
+            if e["assets"] == "all" and now <= events._dt(e["ts"]) and self.j.kv_get(f"pre:{e['key']}") is None:
+                self.j.kv_set(f"pre:{e['key']}", now.isoformat())
+                self.research.run_macro()
+                self.research.run_picture()
+                return
+
+    def urgent(self, asset: str):
+        """Срочная новость: внеочередной цикл зала по активу (не чаще раза в 30 минут)."""
+        if asset not in self.scope()["held"] + self.candidates + list(config.CRYPTO_CORE) or config.STOP_FILE.exists():
+            return
+        k, now = f"urgent_run:{asset}", time.time()
+        if now - (self.j.kv_get(k) or 0) < 1800:
+            return
+        self.j.kv_set(k, now)
+        self._handle(self._run_asset(asset))
+
+    def research_loop(self):
+        while True:
+            try:
+                self.sched.run_due()
+            except Exception as e:  # noqa: BLE001
+                print(f"{utcnow()} исследовательский отдел: {type(e).__name__}: {e}", flush=True)
+            time.sleep(20)
 
     def _lab(self, symbol):
         try:
@@ -52,6 +101,7 @@ class Supervisor:
             t = self.j.q("SELECT entry, qty FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
             cost = t[0]["entry"] * t[0]["qty"] if t else 0
             self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"]))
+            self.sched.trigger("portfolio")
         eq = self.broker.equity()
         self.j.snap_equity(utcnow(), eq)
         if self.j.kv_get("start_equity") is None:
@@ -79,11 +129,7 @@ class Supervisor:
         with cf.ThreadPoolExecutor(2) as ex:
             for r in ex.map(self._run_asset, self.targets()):
                 res.append(r)
-                print(f"{utcnow()} {r.asset}: {r.status} {r.detail}", flush=True)
-                if r.status in ("opened", "closed"):
-                    self.notify(report.trade_message(self.board, r))
-                elif r.status == "error":
-                    self.notify(report.service("asset_fail", r.asset))
+                self._handle(r)
         try:
             accuracy.settle(self.board, self.j, lambda n: data.candles(config.BY_NAME[n], "1h", **({"limit": 500} if "/" in n else {"rng": "60d"})))
         except Exception:  # noqa: BLE001
@@ -98,6 +144,14 @@ class Supervisor:
             except Exception:  # noqa: BLE001 — сравнение не критично
                 out[k] = 0.0
         return out
+
+    def _handle(self, r):
+        print(f"{utcnow()} {r.asset}: {r.status} {r.detail}", flush=True)
+        if r.status in ("opened", "closed"):
+            self.notify(report.trade_message(self.board, r))
+            self.sched.trigger("portfolio")   # 1.6: портфельный аналитик после каждой сделки
+        elif r.status == "error":
+            self.notify(report.service("asset_fail", r.asset))
 
     def _run_asset(self, symbol):
         if config.restart_requested():  # перезапуск ждёт: новые активы в цикл не берём
@@ -137,6 +191,7 @@ class Supervisor:
         except OSError:
             raise SystemExit("supervisor уже запущен")
         self.notify(report.service("start"))
+        threading.Thread(target=self.research_loop, name="research", daemon=True).start()
         while True:
             self.tick()
             time.sleep(30)

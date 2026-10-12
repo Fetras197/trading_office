@@ -13,8 +13,8 @@ from types import SimpleNamespace
 from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
 from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
 
-from . import agents, data, portfolio
-from .board import RejectedReport
+from . import agents, data, events, portfolio
+from .board import PICTURE_MAX_AGE_H, RejectedReport
 from . import config
 from .config import COSTS, Limits, make_asset
 from .llm import LLMError, LLMUnavailable
@@ -78,8 +78,9 @@ def _refs(raw: dict, role: str) -> tuple[list[int], dict]:
 
 
 class Hall:
-    def __init__(self, board, journal, broker, router, claude, lab=None, notify=None, limits: Limits = Limits(), auto_trade=True):
+    def __init__(self, board, journal, broker, router, claude, lab=None, notify=None, limits: Limits = Limits(), auto_trade=True, picture=None):
         self.board, self.j, self.broker, self.router, self.claude = board, journal, broker, router, claude
+        self.picture = picture or (lambda: board.latest('picture', max_age_h=PICTURE_MAX_AGE_H))  # актуальная «Картина дня» (обязательна для ссылок)
         self.lab, self.notify, self.gate, self.auto_trade = lab, notify or (lambda t: None), RiskGate(limits), auto_trade
         self.exec_lock = threading.Lock()
 
@@ -156,16 +157,36 @@ class Hall:
                 out.append({"id": rid, "role": "lab", **sig})
         return out
 
+    def _research_ctx(self, asset) -> dict:
+        """Свежие выводы исследовательского отдела по активу: новости, деривативы, события ближайших 6 часов."""
+        out = {}
+        nd = self.board.latest("newsdesk", max_age_h=3)
+        if nd and asset.name in nd["data"].get("assets", {}):
+            out["news_desk"] = nd["data"]["assets"][asset.name]
+        cd = self.board.latest("cryptodesk", max_age_h=3)
+        if cd and asset.kind == "crypto":
+            out["crypto_desk"] = {"market": cd["data"].get("market"), "asset": cd["data"].get("assets", {}).get(asset.hl_coin)}
+        up = events.upcoming(self.board, 6)
+        if up:
+            out["events_next_6h"] = [{"when_utc": e["ts"], "what": events.title_ru(e), "impact": e["impact"]} for e in up][:5]
+        return out
+
+    @staticmethod
+    def _pic_line(pic):
+        d = pic["data"]
+        return (f"[#{pic['id']} picture] regime={d.get('regime')} size_mult={d.get('size_mult')} (conf {pic['confidence']:.2f}): {d.get('summary', '')} "
+                f"Risks: {'; '.join(d.get('main_risks', []))}. Forbidden today: {'; '.join(d.get('forbidden', []))}")
+
     @staticmethod
     def _tagged(reports):
         return "\n".join(f"[#{r['id']} {r['role']}] {r['stance']} (conf {r['confidence']:.2f}): {r['rationale']}" for r in reports)
 
     # ---------- дебаты ----------
-    def _debate(self, cid, asset, analysts, b):
+    def _debate(self, cid, asset, analysts, b, pic):
         live = [r for r in analysts if r["stance"] != "abstain"]
         by = lambda *roles: self._tagged([r for r in live if r["role"] in roles]) or "(no report)"  # noqa: E731
         state = {"company_of_interest": asset.alpaca, "asset_type": asset.kind,
-                 "market_report": by("market", "quant", "lab"), "sentiment_report": by(*INVESTORS) if asset.kind == "stock" else by("quant"),
+                 "market_report": by("market", "quant", "lab") + "\n" + self._pic_line(pic), "sentiment_report": by(*INVESTORS) if asset.kind == "stock" else by("quant"),
                  "news_report": by("news"), "fundamentals_report": by("fundamentals"),
                  "investment_debate_state": {"history": "", "bull_history": "", "bear_history": "", "current_response": "", "count": 0}}
         duck = DebateLLM(self.claude)
@@ -176,12 +197,12 @@ class Hall:
         for rnd in range(1, ROUNDS + 1):
             for role in ("bull", "bear"):
                 other = "bear" if role == "bull" else "bull"
-                must = ["analyst"] + ([other] if other in last else [])
-                allowed = ids + ([last[other]] if other in last else []) + ([last[role]] if role in last else [])
+                must = ["analyst", "picture"] + ([other] if other in last else [])
+                allowed = ids + [pic["id"]] + ([last[other]] if other in last else []) + ([last[role]] if role in last else [])
 
                 def call(fb=None, role=role, must=must, allowed=allowed, other=other):
                     duck.allowed, duck.must, duck.last, duck.feedback = allowed, ", ".join(must), None, fb
-                    duck.must_ids = [last[other]] if other in last else []
+                    duck.must_ids = [pic["id"]] + ([last[other]] if other in last else [])
                     st = {**state, "investment_debate_state": dict(state["investment_debate_state"])}
                     new = nodes[role](st)["investment_debate_state"]
                     text = new["current_response"].split(":", 1)[1].strip()
@@ -228,6 +249,17 @@ class Hall:
             if why:
                 self.j.set_summary(run_id, f"skip: {why}")
                 return Result(asset.name, "hold", f"{why}: новый вход невозможен", cid)
+        pic = self.picture()
+        if not pic:
+            raise Skip("нет актуальной «Картины дня» — без неё зал не работает")
+        pd_ = pic["data"]
+        if not acct["position"]:  # запреты исследовательского отдела: до LLM-вызовов (экономия бюджета)
+            why = (f"событие: {events.blocked(self.board, asset.name, asset.kind)}" if events.blocked(self.board, asset.name, asset.kind) else
+                   "картина дня: новые входы запрещены" if pd_.get("no_new_entries") else
+                   "картина дня: актив в списке запретов" if asset.name in (pd_.get("avoid_assets") or []) else "")
+            if why:
+                self.j.set_summary(run_id, f"skip: {why}")
+                return Result(asset.name, "hold", why, cid)
         analysts = self._analysts(cid, asset, b)
         live = [r for r in analysts if r["stance"] != "abstain"]
         if len(live) < 2:
@@ -236,19 +268,23 @@ class Hall:
             self.j.set_summary(run_id, "short-circuit: нет directional мнения >=0.5")
             return Result(asset.name, "hold", "short-circuit: нет directional мнения >=0.5", cid)
 
-        last, texts = self._debate(cid, asset, analysts, b)
+        last, texts = self._debate(cid, asset, analysts, b, pic)
         reports = [{"id": r["id"], "role": r["role"], "stance": r["stance"], "confidence": r["confidence"], "rationale": r["rationale"]} for r in live]
         reports += [{"id": last[k], "role": k, "stance": "-", "confidence": 0.0, "rationale": texts[k][:500]} for k in ("bull", "bear")]
-        tp = {"asset": asset.name, "price": price, "atr14": atr, "account": acct, "position": acct["position"], "reports": reports}
+        reports.append({"id": pic["id"], "role": "picture", "stance": pd_.get("regime", "neutral"), "confidence": pic["confidence"],
+                        "rationale": f"{pd_.get('summary', '')} Risks: {'; '.join(pd_.get('main_risks', []))}. Forbidden today: {'; '.join(pd_.get('forbidden', []))}"})
+        tp = {"asset": asset.name, "price": price, "atr14": atr, "account": acct, "position": acct["position"], "reports": reports,
+              "day_picture": {"regime": pd_.get("regime"), "size_mult": pd_.get("size_mult"), "priority_assets": pd_.get("priority_assets"), "expectation": pd_.get("expectation")},
+              "research": self._research_ctx(asset)}
 
         def trader(fb=None):
-            raw = self._ask_json("trader", tp, "bull and bear", fb)
+            raw = self._ask_json("trader", tp, "bull, bear and picture (the Picture of the Day)", fb)
             a = str(raw.get("action", "")).lower()
             if a not in ("buy", "sell", "hold"):
                 raise LLMError(f"trader: action {a!r}")
             refs, st = _refs(raw, "trader")
             return (f"{a}: {str(raw.get('rationale', ''))[:400]}", float(raw["confidence"]), refs, st, {**raw, "action": a}, raw)
-        tid, t = self._chain_call(cid, "trader", asset.name, trader, ("bull", "bear"))
+        tid, t = self._chain_call(cid, "trader", asset.name, trader, ("bull", "bear", "picture"))
         action = str(t["action"]).lower()
         if action == "hold" or (action == "sell" and not acct["position"]):
             self.j.set_summary(run_id, f"trader: {action}")
@@ -300,7 +336,7 @@ class Hall:
             why = "risk_manager: reject" if str(rm["verdict"]).lower() == "reject" else "portfolio_manager: reject"
             self.j.add_decision(run_id, ts, asset.name, "buy", entry, stop, take, None, "rejected", why)
             return Result(asset.name, "rejected", why, cid)
-        mult = min(1.0, max(0.0, float(pmr.get("size_mult", 1.0) or 0)))
+        mult = min(1.0, max(0.0, float(pmr.get("size_mult", 1.0) or 0)), float(pd_.get("size_mult", 1.0)))  # картина дня может только уменьшить
         if str(rm["verdict"]).lower() == "reduce":
             mult = min(mult, min(1.0, max(0.0, float(rm.get("size_mult", 1.0) or 0))))
         # --- RiskGate (код) + исполнение: под локом и со свежим состоянием счёта (лимиты не гонятся между параллельными активами) ---

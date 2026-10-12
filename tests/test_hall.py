@@ -82,8 +82,13 @@ def env(monkeypatch):
     monkeypatch.setattr(hall, "utcnow", lambda: "2026-10-12T10:00:00+00:00")
 
 
-def mk(router=None, claude=None, **kw):
+PIC = {"regime": "neutral", "summary": "тест", "size_mult": 1.0, "main_risks": [], "forbidden": [], "no_new_entries": False, "avoid_assets": []}
+
+
+def mk(router=None, claude=None, pic=True, **kw):
     b, j, br = Board(), Journal(), FakeBroker()
+    if pic:  # «Картина дня» обязательна: без неё зал отклоняет работу
+        b.publish("R-pic", "picture", "*", "neutral: тест", 0.8, data={**PIC, **(pic if isinstance(pic, dict) else {})})
     return Hall(b, j, br, router or FakeRouter(), claude or FakeClaude(), **kw), b, br
 
 
@@ -162,3 +167,57 @@ def test_limits_exhausted_skips_llm_spend(env):
     r = h.run_asset("BTC/USD")
     assert r.status == "hold" and "лимит позиций" in r.detail and not br.bought
     assert b.cycle_reports(r.cycle_id, "BTC/USD") == []  # аналитики не вызывались
+
+
+# ---------- v3: «Картина дня» и календарь ----------
+def test_no_picture_means_skip(env):
+    h, b, br = mk(pic=False)
+    r = h.run_asset("BTC/USD")
+    assert r.status == "skipped" and "Картин" in r.detail and not br.bought
+
+
+def test_picture_no_new_entries_and_avoid_block_before_llm(env):
+    c = FakeClaude()
+    h, b, br = mk(claude=c, pic={"no_new_entries": True})
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "картина дня" in r.detail and c.calls == []
+    h, b, br = mk(claude=c, pic={"avoid_assets": ["BTC/USD"]})
+    assert h.run_asset("BTC/USD").status == "hold" and c.calls == []
+
+
+def test_event_blackout_blocks_new_entries(env):
+    import datetime as dt
+    h, b, br = mk()
+    now = dt.datetime.now(dt.timezone.utc)
+    b.x("INSERT INTO events(key,ts,title,ccy,impact,kind,assets,src) VALUES('k',?,?,?,?,?,?,?)", ((now + dt.timedelta(minutes=10)).isoformat(timespec="minutes"), "FOMC Statement", "USD", "High", "macro", "all", "t"))
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "решение ФРС" in r.detail and not br.bought
+
+
+def test_trader_without_picture_citation_is_rejected(env):
+    class NoPic(FakeClaude):
+        def ask(self, role, payload, system=None):
+            out = super().ask(role, payload, system)
+            if role == "trader":
+                pid = next(r["id"] for r in payload["reports"] if r["role"] == "picture")
+                out["refs"] = [i for i in out["refs"] if i != pid]
+            return out
+    h, b, br = mk(claude=NoPic())
+    r = h.run_asset("BTC/USD")
+    assert r.status == "skipped" and not br.bought
+    assert any("picture" in x["reason"] for x in b.q("SELECT reason FROM rejected"))
+
+
+def test_stale_picture_cannot_be_cited(env):
+    h, b, br = mk()
+    b.x("UPDATE reports SET ts='2020-01-01T00:00:00+00:00' WHERE role='picture'")
+    r = h.run_asset("BTC/USD")
+    assert r.status == "skipped" and not br.bought
+
+
+def test_picture_size_mult_only_reduces(env):
+    h1, _, br1 = mk()
+    h1.run_asset("BTC/USD")
+    h2, _, br2 = mk(pic={"size_mult": 0.5})
+    h2.run_asset("BTC/USD")
+    assert br1.bought and br2.bought and br2.bought[0][1] < br1.bought[0][1]  # размер меньше (PM-кап в первом прогоне мог уже ограничить)

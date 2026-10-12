@@ -81,7 +81,9 @@ START_CASH = 100_000.0  # только для бэктеста (как на pape
 
 # Кто отвечает за роль: аналитики — Gemini, остальные — Claude (claude -p)
 ANALYST_ROLES = ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller")
-ROLE_BACKEND = {r: "gemini" for r in ANALYST_ROLES}
+# сбор данных/новости/проверка фактов/вычитка — Gemini; решения (картина дня, разборы сделок, ответы на вопросы) — Claude
+GEMINI_EXTRA = ("macro", "newsdesk", "cryptodesk", "sectors", "portfolio_an", "factcheck", "proofread", "smartmoney_an")
+ROLE_BACKEND = {r: "gemini" for r in ANALYST_ROLES + GEMINI_EXTRA}
 ROLE_MODELS = {"executor": "haiku"}  # остальные Claude-роли — DEFAULT_CLAUDE_MODEL
 DEFAULT_CLAUDE_MODEL = "sonnet"
 
