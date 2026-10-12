@@ -134,3 +134,4 @@ def test_proofread_accepts_only_safe_edits():
     pr._CACHE.clear()
     assert pr.proofread(src, B("📊 Сводка\nЗа сутки проверено 3 стратегии, still нет")) == src          # новая латиница -> отклонено
     assert pr.sanitize("risk_manager одобрил (#12)") == "Риск-менеджер одобрил"
+    assert pr.sanitize("Открыта позиция ONDO/USD, SPY вырос") == "Открыта позиция ONDO, S&P 500 вырос"

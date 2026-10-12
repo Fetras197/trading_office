@@ -9,7 +9,7 @@ import fcntl
 import threading
 import time
 
-from . import accuracy, config, data, events, lab, labtrial, manage, report, research, review, scheduler, screener, shadow, smartmoney, weights
+from . import accuracy, config, data, events, memory, tgbot, views, lab, labtrial, manage, report, research, review, scheduler, screener, shadow, smartmoney, weights
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
@@ -56,11 +56,68 @@ class Supervisor:
                 J("manage", self.manager.run, every=300),
                 J("smartmoney", smartmoney.refresh, every=1800),
                 J("regime", R.run_regime, every=1800),
+                J("summary", self.summary, every=SUMMARY_S),
+                J("briefing", self.briefing, at=["08:00"], catchup_h=3, bootstrap=False),
+                J("evening", self.evening, at=["21:00"], catchup_h=3, bootstrap=False),
+                J("weekly", self.weekly, at=["20:00"], weekday=6, catchup_h=6, bootstrap=False),
                 J("labtrial", lambda: labtrial.promote(self.board), every=3600),
                 J("shadow", self.shadow.step, every=3600),
                 J("review", self.run_review, every=1800),
                 J("weights", lambda: weights.propose(self.board), at=["06:50"], catchup_h=12),
                 J("picture", R.run_picture, at=["03:30", "07:30", "11:30", "15:30", "19:30", "23:30"], catchup_h=3)]
+
+    # ---------- сообщения по расписанию и по запросу (этап 4) ----------
+    def _local_midnight_utc(self) -> str:
+        m = config.localnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        return m.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+
+    def report_text(self) -> str:
+        """Полная сводка по запросу /отчёт: сводка + теневые портфели."""
+        view, now = self.client.account_view(), utcnow()
+        text = report.summary_message(view, self.bench(), self.j.entries_on(now[:10]), report.lab_line(lab.stats(self.board)), title="Полный отчёт")
+        return text + "\n\n" + views.shadow_text(self.shadow.summary())
+
+    def briefing(self):
+        """08:00 — утренний брифинг: картина дня, события, план."""
+        pic = self.research.ensure_picture()
+        rg = self.board.latest("regime", max_age_h=6)
+        self.notify(views.briefing_text(pic, rg["data"] if rg else None, events.upcoming(self.board, 24), self.client.account_view(), self.j.positions(), self.candidates))
+
+    def evening(self):
+        """21:00 — вечерний отчёт: итоги дня, теневые портфели (доходность и просадка), уроки, завтрашний календарь."""
+        since = self._local_midnight_utc()
+        trades = self.j.q("SELECT asset, pnl, exit_reason FROM trades WHERE exit_ts>=? AND exit_reason!='partial' ORDER BY id", (since,))
+        opened = self.j.q("SELECT COUNT(*) n FROM fills WHERE side='buy' AND ts>=?", (since,))[0]["n"]
+        lessons = [r["text"] for r in memory.recall(self.board, "lesson", days=1, limit=3)]
+        self.notify(views.evening_text(self.client.account_view(), self.bench(), trades, opened, self.shadow.summary(), lessons, events.upcoming(self.board, 24), lab.stats(self.board)))
+
+    def weekly(self):
+        """Воскресенье 20:00 — недельное собрание. Предложения (веса/отключение ролей) применяются только после «да» (tgbot.decide)."""
+        since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat(timespec="seconds")
+        weights.propose(self.board)
+        props = weights.pending(self.board)
+        self.j.kv_set("meeting_props", [p["id"] for p in props])
+        trades = self.j.q("SELECT asset, pnl FROM trades WHERE exit_ts>=? AND exit_reason!='partial'", (since,))
+        lessons = [r["text"] for r in memory.recall(self.board, "lesson", days=7, limit=5)]
+        acc = [{"role": r, "n": v["n"], "accuracy": v["acc"]} for r, v in weights.stats(self.board).items()]
+        insight = ""
+        try:
+            insight = str(self.router.ask("weekly", {"week_shadow": self.shadow.summary(since), "closed_trades": trades, "open_positions": [report.pos_name(p["symbol"]) + f" {p['plpc']:+.1%}" for p in self.client.account_view()["positions"]], "lessons": lessons, "proposals": [p["text"] for p in props]},
+                                          system="You are the head of a paper-trading firm. In 3 short sentences in Russian (plain words, no English, up to 70 words) sum up the week: how we did vs the S&P 500 and bitcoin, what we learned. "
+                                                 "Use only the input data. Output ONE JSON: {\"insight\": \"...\"}").get("insight", ""))[:600]
+        except Exception:  # noqa: BLE001 — итоги недели не должны зависеть от лимитов
+            pass
+        self.notify(views.weekly_text(self.shadow.summary(since), trades, lessons, acc, props, lab.stats(self.board), insight))
+
+    def close_position(self, name: str) -> dict:
+        """Ручное закрытие по команде владельца (/закрыть) — под тем же замком исполнения, что и зал."""
+        with self.hall.exec_lock:
+            p = self.j.positions()[name]
+            px = float(self.client.price(config.BY_NAME[name].alpaca))
+            r = self.broker.sell(name, px, utcnow(), "manual")
+        self.sched.trigger("portfolio")
+        self.sched.trigger("review")
+        return {**r, "pnl_pct": r["pnl"] / (p["avg"] * p["qty"]) if p["avg"] * p["qty"] else 0.0}
 
     def run_review(self):
         """Разбор закрытых сделок (2.2) — Claude; не больше 3 за проход."""
@@ -177,6 +234,9 @@ class Supervisor:
     def summary(self):
         view, now = self.client.account_view(), utcnow()
         text = report.summary_message(view, self.bench(), self.j.entries_on(now[:10]), report.lab_line(lab.stats(self.board)))
+        cmp_ = views.compare_line(self.shadow.summary())
+        if cmp_:
+            text += "\n" + cmp_
         acc = accuracy.role_accuracy(self.board)
         if acc:
             text += "\nТочность оценок: " + ", ".join(f"{report.ACC_RU[a['role']]} {a['accuracy'] * 100:.0f}%".replace(".", ",") for a in acc if a["role"] in report.ACC_RU)
@@ -186,14 +246,14 @@ class Supervisor:
     def tick(self, now=None):
         now = now or time.time()
         config.reexec_if_requested("supervisor")
-        for name, fn, every in (("screen", self._screen_and_watch, SCREEN_S), ("cycle", self.cycle, CYCLE_S), ("summary", self.summary, SUMMARY_S)):
+        for name, fn, every in (("screen", self._screen_and_watch, SCREEN_S), ("cycle", self.cycle, CYCLE_S)):
             if now >= self.next[name]:
                 self.next[name] = now + every
                 try:
                     fn()
                 except Exception as e:  # noqa: BLE001 — упавшая задача не валит supervisor
                     print(f"{utcnow()} {name} упал: {type(e).__name__}: {e}", flush=True)
-                    self.notify(report.service("task_fail", detail={"screen": "скринер и сверка с брокером", "cycle": "цикл торгового зала", "summary": "сводка"}[name]))
+                    self.notify(report.service("task_fail", detail={"screen": "скринер и сверка с брокером", "cycle": "цикл торгового зала"}[name]))
 
     def _screen_and_watch(self):
         self.watch()
@@ -207,6 +267,7 @@ class Supervisor:
             raise SystemExit("supervisor уже запущен")
         self.notify(report.service("start"))
         threading.Thread(target=self.research_loop, name="research", daemon=True).start()
+        threading.Thread(target=tgbot.TgBot(self).run, name="tgbot", daemon=True).start()
         while True:
             self.tick()
             time.sleep(30)

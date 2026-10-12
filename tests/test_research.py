@@ -186,7 +186,7 @@ def test_supervisor_wiring_without_running_anything():
         def price(self, s): return 1.0
     s = Supervisor(board=Board(), journal=Journal(), client=C(), hall=object(), notify=lambda t: None)
     names = [j.name for j in s.sched.jobs]
-    assert set(names) == {"events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "labtrial", "regime", "shadow", "review", "weights", "picture"}
+    assert set(names) == {"events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "labtrial", "summary", "briefing", "evening", "weekly", "regime", "shadow", "review", "weights", "picture"}
     assert names.index("events") < names.index("macro") < names.index("picture")   # порядок первичного наполнения: картина дня — последняя
     assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []}
 
@@ -199,3 +199,10 @@ def test_polymarket_parsing_sorted_and_closed_markets_dropped(monkeypatch):
     monkeypatch.setattr(sources, "_get_json", lambda url, **kw: ev)
     out = sources.polymarket(("fed decision",), per_query=3)
     assert len(out) == 1 and [m["yes"] for m in out[0]["markets"]] == [0.835, 0.165] and out[0]["ends"] == "2026-10-29"
+
+
+def test_non_bootstrap_job_waits_for_its_time_after_first_sight():
+    ran = []
+    s = scheduler.Scheduler(Journal(), [scheduler.Job("b", lambda: ran.append(1), at=["08:00"], catchup_h=3, bootstrap=False)], log=lambda *a: None)
+    assert s.run_due(at(15, 0)) == []                 # впервые увидели днём — утренний брифинг не запускаем
+    assert s.run_due(at(7, 59, 13)) == [] and s.run_due(at(8, 1, 13)) == ["b"]

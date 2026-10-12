@@ -1,6 +1,7 @@
 """Уведомления в Telegram — только по-русски, для человека, не программиста: без кодов ролей, id, английских слов и обрывков.
 Три вида: сделка (покупка), закрытие (стоп-лосс / тейк-профит / решение трейдера), сводка раз в 6 часов + служебные сообщения.
 Причины («почему купили») пишутся одной короткой фразой на роль: Gemini → Claude → запасная фраза; ответ проверяется на латиницу."""
+import datetime as dt
 import re
 import subprocess
 
@@ -51,6 +52,10 @@ def pct(x: float, d: int = 1) -> str:
 def pos_name(sym: str) -> str:
     """Символ позиции Alpaca (ONDOUSD / AAPL) -> короткое имя."""
     return sym[:-3] if sym.endswith("USD") and len(sym) > 5 else sym
+
+
+def utcnow_day() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d')
 
 
 def name(asset: str) -> str:
@@ -131,6 +136,8 @@ def close_message(asset: str, pnl: float, pnl_pct: float, reason: str) -> str:
         head = f"🔴 Продажа {name(asset)} — сработал стоп-лосс"
     elif reason == "take":
         head = f"🟢 Продажа {name(asset)} — взят тейк-профит"
+    elif reason == "manual":
+        head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — по вашей команде"
     else:
         head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — по решению трейдера"
     return f"{head}\nРезультат: {signed(pnl)} $ ({pct(pnl_pct)})"

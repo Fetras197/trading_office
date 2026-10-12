@@ -11,10 +11,10 @@ from . import sources
 PRE_MIN, POST_MIN = 30, 30
 TITLES_RU = [  # порядок важен: более длинные шаблоны раньше
     (r"FOMC Press Conference", "пресс-конференция ФРС"), (r"FOMC Statement", "решение ФРС по ставке"), (r"Federal Funds Rate", "решение ФРС по ставке"),
-    (r"FOMC Meeting Minutes", "протокол заседания ФРС"), (r"Core CPI", "базовая инфляция (CPI)"), (r"\bCPI\b", "инфляция (CPI)"), (r"Core PPI", "базовые цены производителей"),
-    (r"\bPPI\b", "цены производителей"), (r"Non-Farm Employment Change", "занятость в США (Non-Farm)"), (r"Unemployment Rate", "уровень безработицы"),
-    (r"Unemployment Claims", "заявки на пособие по безработице"), (r"Core Retail Sales|Retail Sales", "розничные продажи"), (r"GDP", "ВВП"), (r"ISM", "деловая активность (ISM)"),
-    (r"Core PCE", "базовая инфляция (PCE)"), (r"PCE", "инфляция (PCE)"), (r"Powell", "выступление главы ФРС"), (r"FOMC Member", "выступление члена ФРС"),
+    (r"FOMC Meeting Minutes", "протокол заседания ФРС"), (r"Core CPI", "базовая инфляция (цены для потребителей)"), (r"\bCPI\b", "инфляция (цены для потребителей)"), (r"Core PPI", "базовые цены производителей"),
+    (r"\bPPI\b", "цены производителей"), (r"Non-Farm Employment Change", "занятость в США (вне сельского хозяйства)"), (r"Unemployment Rate", "уровень безработицы"),
+    (r"Unemployment Claims", "заявки на пособие по безработице"), (r"Core Retail Sales|Retail Sales", "розничные продажи"), (r"GDP", "ВВП"), (r"ISM", "деловая активность в промышленности"),
+    (r"Core PCE", "базовая инфляция (расходы потребителей)"), (r"PCE", "инфляция (расходы потребителей)"), (r"Powell", "выступление главы ФРС"), (r"FOMC Member", "выступление члена ФРС"),
     (r"Fed Chair", "выступление главы ФРС"), (r"Treasury Currency Report", "отчёт Минфина США")]
 
 

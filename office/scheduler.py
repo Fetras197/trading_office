@@ -48,7 +48,11 @@ class Scheduler:
         if job.every:
             return last is None or (now - last).total_seconds() >= job.every
         if last is None:
-            return job.bootstrap
+            if not job.bootstrap:   # не догонять прошлое: считаем, что до первого наблюдения задание «уже отработало»
+                self.kv.kv_set(f"job:{job.name}:last", now.isoformat())
+                last = now
+            else:
+                return True
         for back in (0, 1):
             day = (now - dt.timedelta(days=back)).date()
             for hhmm in job.at:

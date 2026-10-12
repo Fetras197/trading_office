@@ -30,7 +30,7 @@ def test_medium_and_foreign_events_do_not_block_but_earnings_block_only_own_stoc
 
 
 def test_title_ru_and_upcoming():
-    assert events.title_ru({"kind": "macro", "title": "Core CPI m/m", "ccy": "USD"}) == "базовая инфляция (CPI)"
+    assert events.title_ru({"kind": "macro", "title": "Core CPI m/m", "ccy": "USD"}) == "базовая инфляция (цены для потребителей)"
     assert events.title_ru({"kind": "macro", "title": "Something odd", "ccy": "EUR"}) == "событие (EUR)"
     b = Board()
     now = dt.datetime(2026, 10, 12, 6, 0, tzinfo=UTC)

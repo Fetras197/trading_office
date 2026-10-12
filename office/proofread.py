@@ -22,6 +22,8 @@ def sanitize(text: str) -> str:
     for k, v in ROLE_WORDS.items():
         text = re.sub(rf"\b{k}\b", v, text, flags=re.I)
     text = re.sub(r"\s*\(?#\d+\)?", "", text)
+    text = re.sub(r"\b([A-Z0-9]{2,6})/USD\b", r"\1", text)      # «ONDO/USD» -> «ONDO»
+    text = re.sub(r"\bSPY\b", "S&P 500", text)
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
