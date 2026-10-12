@@ -135,3 +135,19 @@ def test_proofread_accepts_only_safe_edits():
     assert pr.proofread(src, B("📊 Сводка\nЗа сутки проверено 3 стратегии, still нет")) == src          # новая латиница -> отклонено
     assert pr.sanitize("risk_manager одобрил (#12)") == "Риск-менеджер одобрил"
     assert pr.sanitize("Открыта позиция ONDO/USD, SPY вырос") == "Открыта позиция ONDO, S&P 500 вырос"
+
+
+def test_proofread_never_flips_meaning():
+    from office import proofread as pr
+
+    class B:
+        def __init__(self, out): self.out = out
+        def ask(self, role, payload, system=None): return {"text": self.out}
+    for src, bad in (("Сегодня нельзя:\n• не покупать перед ФРС", "Сегодня нельзя:\n• покупать перед ФРС"),                 # потеряно «не»
+                     ("🔴 Продажа ONDO — по таймеру\nРезультат: −8 $", "🔴 Медвежья сделка ONDO — по таймеру\nРезультат: −8 $"),      # подмена ключевого слова
+                     ("Риск-менеджер уменьшил размер позиции из-за высокой изменчивости", "Менеджер по рискам полностью переписал текст другими словами")):
+        pr._CACHE.clear()
+        assert pr.proofread(src, B(bad)) == src
+    pr._CACHE.clear()
+    ok = "Все еще нет покупок, ждем решения"
+    assert pr.proofread(ok, B("Всё ещё нет покупок, ждём решения")) == "Всё ещё нет покупок, ждём решения"

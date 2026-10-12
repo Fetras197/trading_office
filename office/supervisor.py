@@ -9,7 +9,7 @@ import fcntl
 import threading
 import time
 
-from . import accuracy, config, data, events, memory, tgbot, views, lab, labtrial, manage, report, research, review, scheduler, screener, shadow, smartmoney, weights
+from . import accuracy, config, data, events, it, realmoney, memory, tgbot, views, lab, labtrial, manage, report, research, review, scheduler, screener, shadow, smartmoney, weights
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
@@ -36,6 +36,7 @@ class Supervisor:
         self.hall = hall or Hall(self.board, self.j, self.broker, self.router, ClaudeBackend(), notify=notify,
                                  lab=lambda s: self._lab(s), picture=self.research.ensure_picture, smart=smartmoney.signal_for)
         self.next = {"screen": 0.0, "cycle": 0.0, "summary": time.time() + SUMMARY_S}
+        self.it = it.ITDept(self.j, notify)
         self.manager = manage.Manager(self.broker, self.j, self.client, notify)
         self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"], lab_fn=lambda: lab.shadow_signals(self.board))
         self.sched = scheduler.Scheduler(self.j, self.jobs())
@@ -49,10 +50,12 @@ class Supervisor:
         return [J("events", R.run_events, every=3600),
                 J("macro", R.run_macro, at=["07:00"], catchup_h=8),
                 J("macro_pre_event", self.pre_event_macro, every=300),
-                J("news", R.run_news, every=3600),
-                J("crypto", R.run_crypto, every=3600),
-                J("sectors", R.run_sectors, at=["07:10"], catchup_h=8),
-                J("portfolio", R.run_portfolio, at=["07:20"], catchup_h=8),
+                J("news", self._eco(R.run_news), every=3600),
+                J("crypto", self._eco(R.run_crypto), every=3600),
+                J("sectors", self._eco(R.run_sectors), at=["07:10"], catchup_h=8),
+                J("portfolio", self._eco(R.run_portfolio), at=["07:20"], catchup_h=8),
+                J("it", self.it.check, every=300),
+                J("realmoney", lambda: realmoney.check(self.board, self.j, self.notify, self.j), every=21600),
                 J("manage", self.manager.run, every=300),
                 J("smartmoney", smartmoney.refresh, every=1800),
                 J("regime", R.run_regime, every=1800),
@@ -107,7 +110,7 @@ class Supervisor:
                                                  "Use only the input data. Output ONE JSON: {\"insight\": \"...\"}").get("insight", ""))[:600]
         except Exception:  # noqa: BLE001 — итоги недели не должны зависеть от лимитов
             pass
-        self.notify(views.weekly_text(self.shadow.summary(since), trades, lessons, acc, props, lab.stats(self.board), insight))
+        self.notify(views.weekly_text(self.shadow.summary(since), trades, lessons, acc, props, lab.stats(self.board), insight, realmoney.progress_line(realmoney.progress(self.board, self.j))))
 
     def close_position(self, name: str) -> dict:
         """Ручное закрытие по команде владельца (/закрыть) — под тем же замком исполнения, что и зал."""
@@ -122,6 +125,10 @@ class Supervisor:
     def run_review(self):
         """Разбор закрытых сделок (2.2) — Claude; не больше 3 за проход."""
         review.run(self.board, self.j, self.router, lambda n: data.candles(config.BY_NAME[n], "1h", **({"limit": 500} if "/" in n else {"rng": "60d"})))
+
+    def _eco(self, fn):
+        """В режиме экономии задания на Gemini пропускаются (их данные устаревают, зал работает по уже готовым отчётам)."""
+        return lambda: None if self.it.economy else fn()
 
     def pre_event_macro(self):
         """За час до важного события USD: обновить макро-анализ и картину дня (1 раз на событие)."""
@@ -191,7 +198,8 @@ class Supervisor:
         for s in held + core + self.candidates:
             if s not in out and (self.stock_open or "/" in s):  # акции вне часов биржи не торгуем
                 out.append(s)
-        return out[:MAX_ASSETS]
+        econ = getattr(self, "it", None) and self.it.economy      # режим экономии лимитов (5.1): меньше активов
+        return out[:it.ECON_ASSETS if econ else MAX_ASSETS]
 
     def cycle(self):
         if config.STOP_FILE.exists():
@@ -248,7 +256,8 @@ class Supervisor:
         config.reexec_if_requested("supervisor")
         for name, fn, every in (("screen", self._screen_and_watch, SCREEN_S), ("cycle", self.cycle, CYCLE_S)):
             if now >= self.next[name]:
-                self.next[name] = now + every
+                econ = getattr(self, "it", None) and self.it.economy and name == "cycle"
+                self.next[name] = now + every * (it.ECON_CYCLE_MULT if econ else 1)
                 try:
                     fn()
                 except Exception as e:  # noqa: BLE001 — упавшая задача не валит supervisor
@@ -265,10 +274,12 @@ class Supervisor:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise SystemExit("supervisor уже запущен")
+        self.it.on_start()
         self.notify(report.service("start"))
         threading.Thread(target=self.research_loop, name="research", daemon=True).start()
         threading.Thread(target=tgbot.TgBot(self).run, name="tgbot", daemon=True).start()
         while True:
+            self.it.heartbeat()
             self.tick()
             time.sleep(30)
 

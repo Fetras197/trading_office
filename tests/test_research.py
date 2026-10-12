@@ -186,7 +186,7 @@ def test_supervisor_wiring_without_running_anything():
         def price(self, s): return 1.0
     s = Supervisor(board=Board(), journal=Journal(), client=C(), hall=object(), notify=lambda t: None)
     names = [j.name for j in s.sched.jobs]
-    assert set(names) == {"events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "labtrial", "summary", "briefing", "evening", "weekly", "regime", "shadow", "review", "weights", "picture"}
+    assert set(names) == {"events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "labtrial", "it", "realmoney", "summary", "briefing", "evening", "weekly", "regime", "shadow", "review", "weights", "picture"}
     assert names.index("events") < names.index("macro") < names.index("picture")   # порядок первичного наполнения: картина дня — последняя
     assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []}
 

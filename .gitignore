@@ -26,3 +26,4 @@ vendor/
 .supervisor.lock
 logs/
 RESTART
+NO_LAB

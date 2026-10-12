@@ -67,7 +67,7 @@ def positions_text(view: dict, jpos: dict) -> str:
     return "\n".join(lines)
 
 
-def status_text(view: dict, paused: bool, reg: dict | None, pic: dict | None, labst: dict, trades_today: int, bench: dict) -> str:
+def status_text(view: dict, paused: bool, reg: dict | None, pic: dict | None, labst: dict, trades_today: int, bench: dict, real: str = "") -> str:
     day = view["equity"] / view["last_equity"] - 1 if view["last_equity"] else 0.0
     parts = [f"{t} — {regime.RU[reg[k]['regime']]}" for k, t in (("crypto", "крипта"), ("stock", "акции")) if reg and reg.get(k)]
     lines = ["📋 Состояние офиса", "Работа: на паузе (новые покупки запрещены, позиции под защитой)" if paused else "Работа: идёт, торговля разрешена",
@@ -79,6 +79,8 @@ def status_text(view: dict, paused: bool, reg: dict | None, pic: dict | None, la
     if pic:
         lines.append(f"Картина дня: {REGIME_RU.get(pic['data'].get('regime'), 'нейтральный')} (обновлена в {_tz_hhmm(pic['ts'])})")
     lines.append(f"Лаборатория: на испытании {labst.get('trial', 0)}, подтверждено вживую {labst.get('live', 0)}")
+    if real:
+        lines.append(real)
     return "\n".join(lines)
 
 
@@ -122,7 +124,7 @@ def evening_text(view, bench, trades_today: list[dict], opened_today: int, shado
     return "\n".join(lines)
 
 
-def weekly_text(week_rows, trades: list[dict], lessons: list[str], acc: list[dict], props: list[dict], labst, insight: str = "") -> str:
+def weekly_text(week_rows, trades: list[dict], lessons: list[str], acc: list[dict], props: list[dict], labst, insight: str = "", real: str = "") -> str:
     lines = ["📅 Еженедельное собрание офиса"]
     if insight:
         lines += [insight, ""]
@@ -136,6 +138,8 @@ def weekly_text(week_rows, trades: list[dict], lessons: list[str], acc: list[dic
     if ok:
         lines += ["", "Точность ролей (мнения, подтвердившиеся ходом цены):"] + [f"• {ROLES_ALL[a['role']]}: {num(a['accuracy'] * 100)}% на {a['n']} {plural(a['n'], 'оценке', 'оценках', 'оценках')}" for a in ok]
     lines.append(f"Лаборатория: на испытании {labst.get('trial', 0)}, подтверждено вживую {labst.get('live', 0)}, не прошли испытание {labst.get('failed', 0)}")
+    if real:
+        lines.append(real)
     if props:
         lines += ["", "Предложения (меняются только с вашего согласия):"] + [f"{i}) {p['text']}" for i, p in enumerate(props, 1)]
         lines.append("Ответьте «да» — применить все, «да 1» — только первое, «нет» — отклонить.")

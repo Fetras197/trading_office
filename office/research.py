@@ -7,7 +7,7 @@ import hashlib
 import math
 import threading
 
-from . import config, data, events, memory, portfolio, regime, sources
+from . import config, data, events, memory, portfolio, regime, report, sources
 from .board import PICTURE_MAX_AGE_H, age_h
 from .llm import LLMError, LLMUnavailable
 
@@ -223,7 +223,7 @@ class Research:
             h = hashlib.sha1(f"{k}|{a['headline'] or a['note']}".encode()).hexdigest()[:12]
             if self.j.kv_get(f"urgent:{h}") is None:
                 self.j.kv_set(f"urgent:{h}", self._now().isoformat())
-                self.notify(f"⚡ Срочная новость по {k.split('/')[0]}: {a['note']}")
+                self.notify(report.urgent_message(k, a["note"]))
                 self.on_urgent(k)
         return rid
 
@@ -362,7 +362,7 @@ class Research:
         for k, t in (("crypto", "крипторынке"), ("stock", "рынке акций")):
             now_r, was = (snap.get(k) or {}).get("regime"), ((prev or {}).get("data", {}).get(k) or {}).get("regime")
             if now_r == "panic" and was != "panic":
-                self.notify(f"🚨 Паника на {t}: {'; '.join(snap[k]['why'])}. Новые покупки запрещены, пока режим не сменится.")
+                self.notify(report.panic_message(t, snap[k]["why"]))
         return rid
 
     # ---------- 1.7 картина дня ----------

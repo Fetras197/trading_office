@@ -23,7 +23,7 @@ launch() {  # имя команда nice
 start() {
   command -v termux-wake-lock >/dev/null && termux-wake-lock  # без wakelock Android усыпляет процессы
   rm -f "$DIR/.user_stopped"; mkdir -p "$DIR/logs"
-  launch supervisor supervise 5; launch lab lab 15
+  launch supervisor supervise 5; [ -e "$DIR/NO_LAB" ] || launch lab lab 15   # NO_LAB: лабораторию не запускать (экономия памяти)
   sleep 3; status
 }
 
@@ -42,7 +42,13 @@ case "$1" in
   reload) touch "$DIR/RESTART"; echo "RESTART: процессы перезапустят себя сами (между задачами)" ;;
   halt) touch "$DIR/STOP"; echo "HALT: новые решения запрещены; позиции под защитными стопами" ;;
   resume) rm -f "$DIR/STOP"; echo "RESUME" ;;
-  watchdog) [ -e "$DIR/.user_stopped" ] && exit 0; alive supervisor supervise && alive lab lab || { echo "$(date -Is) watchdog: перезапуск" >>"$DIR/logs/watchdog.log"; start >/dev/null 2>&1; } ;;
+  watchdog) [ -e "$DIR/.user_stopped" ] && exit 0
+        mkdir -p "$DIR/logs"; termux-battery-status > "$DIR/logs/health.json.tmp" 2>/dev/null && mv "$DIR/logs/health.json.tmp" "$DIR/logs/health.json"   # запасной источник заряда для IT-отдела
+        if ! { alive supervisor supervise && { [ -e "$DIR/NO_LAB" ] || alive lab lab; }; }; then
+          echo "$(date -Is) watchdog: перезапуск" >>"$DIR/logs/watchdog.log"
+          alive supervisor supervise || /data/data/com.termux/files/home/.local/bin/tgnotify "⚠️ Торговый офис не отвечал и был перезапущен сторожем. Позиции всё это время под защитными стопами брокера." >/dev/null 2>&1
+          start >/dev/null 2>&1
+        fi ;;
   once) shift; $PD bash -c "$IN 0 .venv/bin/python -m office once $*" ;;
   log) tail -n "${2:-60}" "$DIR/logs/${3:-supervisor}.log" ;;
   *) echo "usage: $0 start|stop|restart|reload|status|halt|resume|watchdog|once SYMBOL [--dry-run]|log [N] [supervisor|lab]"; exit 1 ;;

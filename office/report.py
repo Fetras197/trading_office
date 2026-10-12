@@ -187,6 +187,14 @@ def manage_message(kind: str, asset: str, **k) -> str:
     return f"{'🟢' if k['pnl'] >= 0 else '🔴'} Продажа {n} — цена стояла 48 часов\nРезультат: {signed(k['pnl'])} $ ({pct(k['pnl_pct'])})"
 
 
+def urgent_message(asset: str, note: str) -> str:
+    return f"⚡ Срочная новость по {name(asset)}: {note}"
+
+
+def panic_message(market: str, why: list[str]) -> str:
+    return f"🚨 Паника на {market}: {'; '.join(why)}. Новые покупки запрещены, пока режим не сменится."
+
+
 def notify(text: str, proof: bool = True) -> None:
     """Вычитка (Gemini) -> Bot API (telegram.py читает тот же конфиг, что tgnotify); при сбое — сам tgnotify."""
     if proof:

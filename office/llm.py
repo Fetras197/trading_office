@@ -16,6 +16,29 @@ class LLMError(Exception):
     pass
 
 
+_EVENTS: dict[str, list] = {"claude": [], "gemini": []}   # (время, ok) — для режима экономии (it.py)
+_EV_LOCK = threading.Lock()
+
+
+def mark(backend: str, ok: bool) -> None:
+    with _EV_LOCK:
+        ev = _EVENTS[backend]
+        ev.append((time.time(), ok))
+        del ev[:-200]
+
+
+def pressure(window_s: float = 1800, now: float | None = None) -> dict[str, bool]:
+    """Лимит почти исчерпан: за последние 30 минут не меньше 3 отказов по лимитам и отказов больше, чем успехов."""
+    now = now or time.time()
+    out = {}
+    with _EV_LOCK:
+        for b, ev in _EVENTS.items():
+            recent = [ok for t, ok in ev if now - t <= window_s]
+            fails = recent.count(False)
+            out[b] = fails >= 3 and fails > recent.count(True)
+    return out
+
+
 class LLMUnavailable(LLMError):
     """Лимит/квота исчерпаны или сервис недоступен: роль пропускается (abstain), цикл не падает."""
 
@@ -69,8 +92,10 @@ class ClaudeBackend:
         if outer.get("is_error") or r.returncode != 0:
             msg = str(outer.get("result"))[:200]
             if re.search(r"limit|quota|usage|credit|overloaded|rate", msg, re.I):
+                mark("claude", False)
                 raise LLMUnavailable(f"claude лимит: {msg}")
             raise LLMError(f"claude error: {msg}")
+        mark("claude", True)
         return outer.get("result", "")
 
     def ask(self, role: str, payload: dict, system: str | None = None) -> dict:
@@ -120,7 +145,10 @@ class GeminiBackend:
                 break
         if r.status_code != 200:
             err = LLMUnavailable if r.status_code in (429, 503) else LLMError
+            if err is LLMUnavailable:
+                mark("gemini", False)
             raise err(f"gemini {r.status_code}: {r.text[:150]}")
+        mark("gemini", True)
         try:
             return parse_json(r.json()["candidates"][0]["content"]["parts"][0]["text"])
         except (KeyError, IndexError, ValueError) as ex:

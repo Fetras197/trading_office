@@ -6,7 +6,7 @@ import time
 
 import requests
 
-from . import config, qa, report, telegram, views, weights
+from . import config, qa, realmoney, report, telegram, views, weights
 from .alpaca import AlpacaError
 
 HELP = ("Команды: /статус — состояние офиса, /позиции — открытые позиции, /картина — «Картина дня», /отчёт — полная сводка, /пауза — запретить новые покупки, "
@@ -49,7 +49,7 @@ class TgBot:
         pic = s.board.latest("picture", max_age_h=12)
         rg = s.board.latest("regime", max_age_h=6)
         from . import lab
-        self.send(views.status_text(view, config.STOP_FILE.exists(), rg["data"] if rg else None, pic, lab.stats(s.board), s.j.entries_on(report.utcnow_day()), s.bench()))
+        self.send(views.status_text(view, config.STOP_FILE.exists(), rg["data"] if rg else None, pic, lab.stats(s.board), s.j.entries_on(report.utcnow_day()), s.bench(), realmoney.progress_line(realmoney.progress(s.board, s.j))))
 
     def cmd_positions(self, arg):
         self.send(views.positions_text(self.sup.client.account_view(), self.sup.j.positions()))
