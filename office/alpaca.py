@@ -64,6 +64,43 @@ class AlpacaClient:
                 return None
             raise
 
+    DATA = "https://data.alpaca.markets"
+
+    def day_change(self, symbol: str) -> float:
+        """Изменение цены к вчерашнему закрытию по снапшоту Alpaca (тот же источник, что у счёта). Крипта: BTC/USD, акции: SPY."""
+        if "/" in symbol:
+            url, p = f"{self.DATA}/v1beta3/crypto/us/snapshots", {"symbols": symbol}
+            snap = self._data(url, p)["snapshots"][symbol]
+        else:
+            snap = self._data(f"{self.DATA}/v2/stocks/snapshots", {"symbols": symbol, "feed": "iex"})[symbol]
+        px = float((snap.get("latestTrade") or {}).get("p") or snap["dailyBar"]["c"])
+        prev = float(snap["prevDailyBar"]["c"])
+        return px / prev - 1
+
+    def _data(self, url, params):
+        for i in range(3):
+            try:
+                r = self.s.get(url, headers=self.h, params=params, timeout=20)
+            except requests.RequestException as e:
+                if i == 2:
+                    raise AlpacaError(f"data {url}: сеть {type(e).__name__}") from e
+                time.sleep(2 * (i + 1))
+                continue
+            if r.status_code >= 500 and i < 2:
+                time.sleep(2 * (i + 1))
+                continue
+            break
+        if r.status_code >= 400:
+            raise AlpacaError(f"data {url} -> {r.status_code}: {r.text[:150]}")
+        return r.json()
+
+    def account_view(self) -> dict:
+        """Цифры результата ровно как у брокера: equity, cash, last_equity (закрытие прошлого дня), позиции с unrealized_pl."""
+        a = self.account()
+        pos = [{"symbol": p["symbol"], "qty": float(p["qty"]), "avg": float(p["avg_entry_price"]), "price": float(p["current_price"]),
+                "value": float(p["market_value"]), "pl": float(p["unrealized_pl"]), "plpc": float(p["unrealized_plpc"])} for p in self.positions()]
+        return {"equity": float(a["equity"]), "cash": float(a["cash"]), "last_equity": float(a.get("last_equity") or a["equity"]), "positions": pos}
+
     def orders(self, **params):
         return self._req("GET", "/orders", params=params)
 

@@ -7,6 +7,8 @@ ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = ROOT / ".claude" / "agents"
 DB_PATH = Path(os.environ.get("TO_DB", ROOT / "office.db"))
 STOP_FILE = ROOT / "STOP"
+RESTART_FILE = ROOT / "RESTART"
+TZ_NAME = os.environ.get("OFFICE_TZ", "Europe/Minsk")  # часовой пояс владельца: расписание и время в сообщениях
 
 
 def load_env(path: Path = ROOT / ".env") -> None:
@@ -82,3 +84,26 @@ ANALYST_ROLES = ("market", "news", "fundamentals", "quant", "buffett", "munger",
 ROLE_BACKEND = {r: "gemini" for r in ANALYST_ROLES}
 ROLE_MODELS = {"executor": "haiku"}  # остальные Claude-роли — DEFAULT_CLAUDE_MODEL
 DEFAULT_CLAUDE_MODEL = "sonnet"
+
+
+def localnow():
+    """Текущее время в часовом поясе владельца (проект живёт в proot с другим системным поясом)."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    return dt.datetime.now(ZoneInfo(TZ_NAME))
+
+
+def restart_requested() -> bool:
+    return RESTART_FILE.exists()
+
+
+def reexec_if_requested(note: str = "") -> None:
+    """Самоперезапуск без Termux: файл RESTART -> os.execv тем же интерпретатором с теми же аргументами (PID не меняется,
+    поэтому office.sh status/alive продолжают работать). Вызывать только между задачами."""
+    if not RESTART_FILE.exists():
+        return
+    import os
+    import sys
+    RESTART_FILE.unlink(missing_ok=True)
+    print(f"RESTART: перезапуск процесса {note}", flush=True)
+    os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])

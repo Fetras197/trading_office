@@ -1,11 +1,10 @@
 """Уведомления в Telegram — только по-русски, для человека, не программиста: без кодов ролей, id, английских слов и обрывков.
 Три вида: сделка (покупка), закрытие (стоп-лосс / тейк-профит / решение трейдера), сводка раз в 6 часов + служебные сообщения.
 Причины («почему купили») пишутся одной короткой фразой на роль: Gemini → Claude → запасная фраза; ответ проверяется на латиницу."""
-import datetime as dt
 import re
 import subprocess
 
-from . import telegram
+from . import config, proofread, telegram
 from .llm import ClaudeBackend, GeminiBackend, LLMError
 
 ROLE_RU = {"market": "Технический анализ", "news": "Новости", "fundamentals": "Фундаментальный анализ", "quant": "Квант-аналитик",
@@ -47,6 +46,11 @@ def price(x: float) -> str:
 
 def pct(x: float, d: int = 1) -> str:
     return f"{signed(x * 100, d)}%"
+
+
+def pos_name(sym: str) -> str:
+    """Символ позиции Alpaca (ONDOUSD / AAPL) -> короткое имя."""
+    return sym[:-3] if sym.endswith("USD") and len(sym) > 5 else sym
 
 
 def name(asset: str) -> str:
@@ -148,11 +152,13 @@ def lab_line(st: dict, appr: list[dict]) -> str:
     return s + f"рабочих: {ok} ({names})"
 
 
-def summary_message(equity: float, day_start: float, bench: dict, positions: list[tuple[str, float]], trades_today: int, lab_text: str, now=None) -> str:
-    now = now or dt.datetime.now().astimezone()
-    pos = ", ".join(f"{name(a)} {pct(p)}" for a, p in positions) or "нет"
-    day = equity / day_start - 1 if day_start else 0.0
-    return "\n".join([f"📊 Сводка офиса на {now:%H:%M}", f"Счёт: {usd(equity)} ({pct(day, 2)} за день)",
+def summary_message(view: dict, bench: dict, trades_today: int, lab_text: str, now=None, title: str = "Сводка офиса") -> str:
+    """Все цифры счёта — из Alpaca (view = AlpacaClient.account_view()): equity, cash, last_equity, unrealized_pl по позициям."""
+    now = now or config.localnow()
+    eq, last = view["equity"], view["last_equity"]
+    pos = ", ".join(f"{pos_name(p['symbol'])} {pct(p['plpc'])} ({signed(p['pl'])} $)" for p in view["positions"]) or "нет"
+    day = eq / last - 1 if last else 0.0
+    return "\n".join([f"📊 {title} на {now:%H:%M}", f"Счёт: {usd(eq)} ({pct(day, 2)} за день)", f"Свободные деньги: {usd(view['cash'])}",
                       f"Для сравнения: S&P 500 {pct(bench.get('SPY', 0))}, Биткоин {pct(bench.get('BTC', 0))}",
                       f"Открытые позиции: {pos}", f"Сделок за день: {trades_today}", lab_text])
 
@@ -166,8 +172,10 @@ def service(kind: str, asset: str = "", detail: str = "") -> str:
             "halt_daily": "⛔ Дневной стоп достигнут: новые покупки заблокированы до следующих суток."}[kind]
 
 
-def notify(text: str) -> None:
-    """Через Bot API (telegram.py читает тот же конфиг, что tgnotify); при сбое — сам tgnotify."""
+def notify(text: str, proof: bool = True) -> None:
+    """Вычитка (Gemini) -> Bot API (telegram.py читает тот же конфиг, что tgnotify); при сбое — сам tgnotify."""
+    if proof:
+        text = proofread.proofread(text)
     if not telegram.notify(text):
         subprocess.run(["tgnotify", text[:3800]], capture_output=True, timeout=20, check=False)
 

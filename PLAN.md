@@ -1,53 +1,35 @@
-# PLAN v2: «Торговый зал» (paper only) — на готовых компонентах
+# PLAN — Офис v3 (ТЗ в TASK_v3.md)
 
-Старый план/финал: reports/archive/. Старый код: переиспользуем `journal`, `risk`, `broker`/`alpaca` (executor), `telegram`, `llm`; остальное заменяется.
+Принципы: офис работает → не ломать; каждый этап = код + тесты (pytest) + самоперезагрузка + gitsave + «Этап N готов» в Telegram.
+Hard-лимиты (paper, cash 1x, без шортов, ≤2% риска, дневной стоп −5%, ≤5 входов/сутки, ≤3 позиции) — только в коде RiskGate, v3 их не трогает; новые модули могут лишь УМЕНЬШАТЬ размер/запрещать вход.
 
-## Цель
-Мульти-агентный зал: шина `board.db`, аналитики → bull/bear (2 раунда) → trader → risk → PM → executor (Alpaca paper). Скринер без LLM каждые 15 мин по всей вселенной, зал — только по top-5 + открытым позициям. Лаборатория (vectorbt walk-forward) даёт approved-стратегии как ещё одного аналитика. Работа 24/7 через `office.sh` из Termux.
+## Архитектурные решения
+1. **Рестарт.** Из proot-сессии нельзя запускать `proot-distro` (office.sh restart). Решение: файл-флаг `RESTART` + `os.execv` в supervisor и lab (PID не меняется, `office.sh alive` продолжает работать). Первый раз (старый код не знает флага) нужен один ручной `./office.sh restart` в Termux.
+2. **Шина.** Исследовательские отчёты — те же `board.reports`, asset=`*` (глобальные) или тикер; роли `macro, calendar, newsdesk, cryptodesk, sectors, portfolio_an, picture, smartmoney, postmortem, factcheck`. `board.RESEARCH`-роли не требуют refs. Валидация ссылок расширяется: «известные» отчёты = отчёты цикла + актуальные глобальные. `must_cite=("picture",)` для bull/bear/trader; картина старше 6 ч → ссылка отклоняется.
+3. **Картина дня** строится Claude из отчётов отдела; при недоступности Claude — механическая картина из кода (низкая уверенность), чтобы зал не вставал.
+4. **Календарь**: faireconomy JSON (macro, impact High/Medium) + yfinance calendar (отчёты компаний по держимым/кандидатам) + FOMC-даты. Гейт `calendar.blocked(asset, now)` ±30 мин High → hold до LLM.
+5. **Макро-данные**: yfinance (DXY, VIX, ^TNX/^FVX/^IRX), FRED если доступен, Polymarket gamma API. Режим «риск включён/выключен» — правила в коде + интерпретация Gemini.
+6. **Режим рынка** (код): trend/sideways/high_vol/panic по BTC (крипта) и SPY+VIX (акции); множитель размера (panic 0, high_vol 0.5, sideways 0.75, trend 1) — только уменьшение; подсказка стратегии в промпты.
+7. **Сопровождение позиций** (`manage.py`, тик 15 мин): стоп только подтягивается; безубыток на +1R; частичная фиксация ½ на +3%; выход по времени (48 ч диапазон <1.5 ATR). Для акций стоп/тейк — bracket у брокера: подтяжка = replace order leg; для крипто — перестановка stop_limit. Журнал позиции обновляется.
+8. **Теневые портфели** (`shadow.py`): 5 бумажных портфелей, вычисляются из board.db (мнения ролей) и цен; офис = Alpaca equity. Ежедневный снимок equity/просадка.
+9. **Разбор сделок**: для каждой строки `trades` без разбора — Claude получает тезис (отчёты цикла входа), ход цены, итог → урок в таблицу `memory`; в зал подтягиваются уроки по активу/типу.
+10. **Вес голоса**: точность и калибровка роли по `outcomes` (triple-barrier), min 10 оценённых мнений; предложенные веса применяются только после «да» (п.4.3), по умолчанию 1.0.
+11. **Проверка фактов**: батч-вызов Gemini «контролёр» на каждый актив (аналитики) и один на цепочку (бык/медведь/трейдер) сверяет числа с фактами (свежая цена Alpaca, индикаторы, заголовки); несовпадение → переделка с обратной связью, затем abstain/пропуск.
+12. **Умные деньги**: Hyperliquid leaderboard (потоковый разбор 39 МБ, ijson, топ по прибыли за месяц) + clearinghouseState топ-N → чистое смещение лонг/шорт по монетам и зоны ликвидаций по liquidationPx; голос `smartmoney` только для крипты. Кэш 30 мин.
+13. **Лаборатория**: таблица `lab_trial` (стратегия, старт, статус trial/live/failed); поправка на множественное тестирование (p-значение Sharpe по OOS-доходностям → Benjamini–Hochberg по всем тестам за 30 дней, q=0.10) как ДОПОЛНИТЕЛЬНЫЙ фильтр поверх неизменённых критериев; 14 дней forward-теста в `shadow` по сигналам стратегии; голос в зале — только live. Режимы: метрики по режимам рынка в `data` стратегии.
+14. **Telegram-вход**: поток getUpdates в supervisor; принимаются только от TG_CHAT; команды /статус /пауза /продолжить /закрыть /отчёт /позиции /картина; свободный текст → Claude по board.db (контекст по активу).
+15. **Язык**: единый `tg.send()` — все исходящие проходят вычитку Gemini (проверка: цифры не изменились, нет латиницы кроме тикеров, длина ±30%); при сбое Gemini — исходный русский шаблон.
+16. **Расписание** (часовой пояс Europe/Minsk, OFFICE_TZ): 07:00 макро, 07:30 картина, 08:00 брифинг, 6-ч сводка, 21:00 вечерний, воскр. 20:00 собрание; новости/крипто — раз в час; секторы и портфельный — раз в день, портфельный ещё после сделки.
+17. **IT-отдел**: heartbeat supervisor; supervisor следит за lab (перезапуск), `office.sh watchdog` пишет батарею/сеть в `logs/health.json` (termux-battery-status доступен только в Termux); экономия при LLMUnavailable-серии (MAX_ASSETS 4, цикл 2 ч). Алерты с антиспамом.
+18. **Реал-критерии**: ежедневная проверка (30 дн, ≥20 сделок, офис > S&P500 и BTC, просадка <10%) → одно сообщение с цифрами; торговлю не включаем.
 
-## Компоненты (не писать своё)
-| Роль | Компонент | Фоллбек |
-|---|---|---|
-| bull/bear, дебаты | TradingAgents `create_bull_researcher/create_bear_researcher` (prompts, 2 раунда), LLM = duck-типизированный адаптер `claude -p` | собственные промпты |
-| Trader | TradingAgents trader/research_manager prompts | свой JSON-промпт |
-| Инвесторы | ai-hedge-fund Buffett/Munger/Druckenmiller (prompts+скоринг на данных) | промпты-персонажи в Gemini |
-| Market/TA | TA-Lib + TradingView MCP (tradingview-mcp-server) | pandas-ta-подобный `indicators.py` (есть) |
-| Sentiment | FinBERT (ProsusAI/finbert) + yfinance news | Gemini-sentiment |
-| Fundamentals | financial-services plugin (equity-research) промпт/скилл + yfinance | Gemini |
-| Quant | wshobson quant-analyst (промпт из плагина) | Gemini |
-| Risk | wshobson risk-manager + Riskfolio-Lib CVaR | PyPortfolioOpt CVaR |
-| PM | PyPortfolioOpt (распределение) | равные веса |
-| Лаборатория | vectorbt | собственный векторный бэктест на pandas |
-| Исполнение | alpaca-py (`broker.py`, paper-only guard) | REST (есть) |
-
-## Архитектура (office/)
-- `board.py` — SQLite `board.db`: `reports(id, cycle_id, role, asset, ts, verdict, confidence, refs JSON, data JSON)`. `publish()` валидирует: после аналитиков refs обязателен (≥1 id отчёта предыдущих ролей из этого cycle_id/asset, существующий в БД) и в тексте должна быть явная позиция `stance_on_refs` (agree/dispute по каждой ссылке). Иначе `RejectedReport` → пропуск актива.
-- `llm.py` — `ClaudeCLI` (`claude -p`, без хуков/MCP), `GeminiREST` (цепочка моделей), `invoke(prompt).content`; исчерпание лимитов → `LLMUnavailable` → роль `abstain`, цикл не падает (если нет ни одного валидного trader-ответа → пропуск).
-- `analysts/` — market (TA-Lib+TradingView), news (FinBERT), fundamentals, quant, investors, lab (approved strategies). Gemini.
-- `hall.py` — цепочка цикла по активу; 2 раунда bull/bear; trader → risk → PM → RiskGate (код) → executor.
-- `risk.py` (есть) + `limits.py` — жёсткие лимиты в коде: paper-only, cash 1x, no short/options, ≤2% риска на сделку со стопом, дневной стоп −5%, ≤5 входов/сутки, ≤3 позиции, невалидный ответ → пропуск.
-- `screener.py` — без LLM, каждые 15 мин: все крипто-пары Alpaca (USD) + S&P500 + NASDAQ-100 (списки с Wikipedia, кэш), метрики TA-Lib (моментум ROC/RSI, объём vs SMA20, пробой N-дневного high/low, сигналы approved-стратегий) → score → top-5 в `candidates`.
-- `lab/` — vectorbt: перебор (SMA-cross, RSI mean-rev, Donchian breakout, MACD) × параметры; walk-forward train 4 мес / test 2 мес; approved ⇔ OOS Sharpe > buy&hold, OOS maxDD лучше buy&hold, ≥30 сделок OOS. Результаты в `strategies` таблицу board.db; approved → аналитик `lab` голосует по текущему сигналу.
-- `supervisor.py` — циклы: крипта BTC/ETH/SOL каждый час; акции SPY/NVDA/AAPL/MSFT в часы NYSE (Alpaca clock); скринер 15 мин; лаборатория в фоне (отдельный процесс, nice); + top-5 скринера и открытые позиции. STOP-файл / `halt`.
-- `report.py` — Telegram через `tgnotify`: на каждую сделку цепочка «кто что сказал и на кого сослался»; сводка раз в 6 ч (PnL vs SPY/BTC, позиции, точность ролей, находки лаборатории).
-- `office.sh start|stop|status|halt|resume` — Termux → `proot-distro login ubuntu -- ...`; строка crontab watchdog.
-
-## Этапы
-1. Установка компонентов + проверка запуском → `reports/components.md`, фоллбеки в DECISIONS.md.
-2. board.db + цепочка + правило ссылок.
-3. Лимиты (перенос и расширение + тесты).
-4. Скринер + лаборатория.
-5. supervisor, office.sh, crontab.
-6. Telegram.
-7. Приёмка: pytest, живой цикл BTC (+ID ордера Alpaca), Gemini-ревью, gitsave, FINAL.md.
+## Этапы и тесты
+0 Доводка (Alpaca-цифры, MCP, futbin, хук) — тесты: summary из Alpaca-моков.
+1 Отдел (research.py, calendar.py, picture) — тесты: парсеры, гейт календаря, отклонение без картины.
+2 Счёт и обучение (shadow.py, review.py, weights.py, factcheck.py).
+3 Режим/позиции/умные деньги/Polymarket/лаборатория (regime.py, manage.py, smartmoney.py, labtrial).
+4 Управление (tgbot.py, schedule, weekly).
+5 Надёжность (it.py, realmoney.py). Финал: reports/FINAL_v3.md, тестовые сообщения.
 
 ## Риски
-- Android/proot: torch+transformers (FinBERT) и numba (vectorbt) на aarch64 могут не встать / не хватить RAM (1.7 ГБ свободно) → фоллбеки таблицы.
-- Плагины/MCP через `claude plugin` и `uvx` в proot могут не работать (ранее `uvx alpaca-mcp-server` не запускался) → фиксируем причину, берём фоллбек (alpaca-py).
-- Gemini free-tier лимиты; `claude -p` лимиты → abstain/пропуск.
-- Ключи были присланы в чате → только `.env` (в .gitignore), рекомендовать перевыпуск.
-- Живой цикл и демон нельзя запускать из сессии Claude Code (демон — только Termux); для приёмки — один разовый цикл `python -m office once BTC/USD`.
-- Полный цикл на top-5 × (≈15 LLM-вызовов) укладывается в час только при ограничении параллелизма; ставим лимит на цикл (макс. активов/час).
-
-## Приёмка
-pytest зелёный; ruff чист; живой BTC-цикл с ответами всех ролей (или честно помеченным abstain у исчерпавших лимит) и paper-ордер с id; board.db содержит цепочку со ссылками; отклонение отчёта без ссылок покрыто тестом; Gemini-ревью; gitsave; FINAL.md.
+Лимиты Gemini free-tier (батчинг, кэш, режим экономии); память Android (потоковый JSON, nice); конфликт getUpdates с другим процессом на том же токене (проверить, при конфликте — только отправка + опрос с обработкой 409); ложные ответы Gemini по календарю (источник — JSON, LLM только интерпретирует).

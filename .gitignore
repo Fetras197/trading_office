@@ -25,3 +25,4 @@ vendor/
 .user_stopped
 .supervisor.lock
 logs/
+RESTART

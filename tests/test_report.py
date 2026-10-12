@@ -63,10 +63,34 @@ def test_trade_message_template_and_no_latin(monkeypatch):
 
 def test_summary_template():
     import datetime as dt
-    m = norm(report.summary_message(100450, 100000, {"SPY": 0.002, "BTC": -0.003}, [("ONDO/USD", 0.012)], 1, "Лаборатория: проверено 28 стратегий, рабочих пока нет",
-                               now=dt.datetime(2026, 10, 12, 12, 0)))
-    assert m == ("📊 Сводка офиса на 12:00\nСчёт: 100 450 $ (+0,45% за день)\nДля сравнения: S&P 500 +0,2%, Биткоин −0,3%\n"
-                 "Открытые позиции: ONDO +1,2%\nСделок за день: 1\nЛаборатория: проверено 28 стратегий, рабочих пока нет")
+    view = {"equity": 100450.0, "cash": 84000.5, "last_equity": 100000.0,
+            "positions": [{"symbol": "ONDOUSD", "plpc": 0.012, "pl": 180.0}, {"symbol": "AAPL", "plpc": -0.004, "pl": -35.0}]}
+    m = norm(report.summary_message(view, {"SPY": 0.002, "BTC": -0.003}, 1, "Лаборатория: проверено 28 стратегий, рабочих пока нет", now=dt.datetime(2026, 10, 12, 12, 0)))
+    assert m == ("📊 Сводка офиса на 12:00\nСчёт: 100 450 $ (+0,45% за день)\nСвободные деньги: 84 000 $\nДля сравнения: S&P 500 +0,2%, Биткоин −0,3%\n"
+                 "Открытые позиции: ONDO +1,2% (+180 $), AAPL −0,4% (−35 $)\nСделок за день: 1\nЛаборатория: проверено 28 стратегий, рабочих пока нет")
+
+
+def test_alpaca_account_view_and_day_change():
+    from office.alpaca import AlpacaClient
+
+    class R:
+        def __init__(s, j, code=200): s._j, s.status_code, s.text = j, code, "x"
+        def json(s): return s._j
+
+    class S:
+        def request(s, method, url, **kw):
+            if url.endswith("/account"):
+                return R({"equity": "100450.1", "cash": "84000", "last_equity": "100000"})
+            return R([{"symbol": "ONDOUSD", "qty": "100", "avg_entry_price": "0.5", "current_price": "0.51", "market_value": "51", "unrealized_pl": "1", "unrealized_plpc": "0.02"}])
+
+        def get(s, url, **kw):
+            if "crypto" in url:
+                return R({"snapshots": {"BTC/USD": {"latestTrade": {"p": 101}, "prevDailyBar": {"c": 100}, "dailyBar": {"c": 101}}}})
+            return R({"SPY": {"latestTrade": {"p": 99}, "prevDailyBar": {"c": 100}, "dailyBar": {"c": 99}}})
+    c = AlpacaClient(key="k", secret="s", session=S())
+    v = c.account_view()
+    assert v["equity"] == 100450.1 and v["last_equity"] == 100000 and v["positions"][0]["pl"] == 1
+    assert abs(c.day_change("BTC/USD") - 0.01) < 1e-9 and abs(c.day_change("SPY") + 0.01) < 1e-9
 
 
 def test_lab_line():
@@ -95,3 +119,18 @@ def test_crypto_fundamentals_resolved_by_symbol_not_cg_id(monkeypatch):
     assert "error" not in f and seen["params"]["symbols"] == "ondo" and f["market_cap_rank"] == 45
     monkeypatch.setattr(data, "_get", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
     assert data.fundamentals(config.make_asset("ONDO/USD")) == f  # кэш спасает при сбое источника
+
+
+def test_proofread_accepts_only_safe_edits():
+    from office import proofread as pr
+
+    class B:
+        def __init__(self, out): self.out = out
+        def ask(self, role, payload, system=None): return {"text": self.out}
+    src = "📊 Сводка\nЗа сутки проверено 3 стратегий, все ещё нет"
+    assert pr.proofread(src, B("📊 Сводка\nЗа сутки проверено 3 стратегии, всё ещё нет")) == "📊 Сводка\nЗа сутки проверено 3 стратегии, всё ещё нет"
+    pr._CACHE.clear()
+    assert pr.proofread(src, B("📊 Сводка\nЗа сутки проверено 4 стратегии, всё ещё нет")) == src        # цифра изменена -> отклонено
+    pr._CACHE.clear()
+    assert pr.proofread(src, B("📊 Сводка\nЗа сутки проверено 3 стратегии, still нет")) == src          # новая латиница -> отклонено
+    assert pr.sanitize("risk_manager одобрил (#12)") == "Риск-менеджер одобрил"

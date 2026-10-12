@@ -10,7 +10,7 @@ import time
 from . import accuracy, config, data, lab, report, screener
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
-from .hall import Hall, utcnow
+from .hall import Hall, Result, utcnow
 from .journal import Journal
 from .llm import ClaudeBackend, RoleRouter
 
@@ -77,7 +77,7 @@ class Supervisor:
             return
         res = []
         with cf.ThreadPoolExecutor(2) as ex:
-            for r in ex.map(self.hall.run_asset, self.targets()):
+            for r in ex.map(self._run_asset, self.targets()):
                 res.append(r)
                 print(f"{utcnow()} {r.asset}: {r.status} {r.detail}", flush=True)
                 if r.status in ("opened", "closed"):
@@ -90,27 +90,24 @@ class Supervisor:
             pass
         return res
 
+    def bench(self) -> dict:
+        out = {}
+        for k, sym in (("SPY", "SPY"), ("BTC", "BTC/USD")):
+            try:
+                out[k] = self.client.day_change(sym)
+            except Exception:  # noqa: BLE001 — сравнение не критично
+                out[k] = 0.0
+        return out
+
+    def _run_asset(self, symbol):
+        if config.restart_requested():  # перезапуск ждёт: новые активы в цикл не берём
+            return Result(symbol, "skipped", "ожидается перезапуск", "")
+        return self.hall.run_asset(symbol)
+
     def summary(self):
-        def day_change(sym):
-            try:
-                a = config.make_asset(sym)
-                d = data.candles(a, "1d", **({"limit": 5} if a.kind == "crypto" else {"rng": "10d"}))["close"]
-                return float(d.iloc[-1] / d.iloc[-2] - 1)
-            except Exception:  # noqa: BLE001
-                return 0.0
-        eq, now = self.broker.equity(), utcnow()
-        day_start = self.j.kv_get(f"day_start:{now[:10]}") or eq
-        positions = []
-        for n, p in self.j.positions().items():
-            try:
-                a = config.BY_NAME[n]
-                px = float(data.candles(a, "1h", **({"limit": 5} if a.kind == "crypto" else {"rng": "5d"}))["close"].iloc[-1])
-                positions.append((n, px / p["avg"] - 1))
-            except Exception:  # noqa: BLE001
-                pass
+        view, now = self.client.account_view(), utcnow()
         appr = self.board.q("SELECT symbol, name, tf FROM strategies WHERE approved=1 AND ts>=datetime('now','-1 day') ORDER BY oos_sharpe DESC LIMIT 3")
-        text = report.summary_message(eq, day_start, {"SPY": day_change("SPY"), "BTC": day_change("BTC/USD")}, positions,
-                                      self.j.entries_on(now[:10]), report.lab_line(lab.stats(self.board), appr))
+        text = report.summary_message(view, self.bench(), self.j.entries_on(now[:10]), report.lab_line(lab.stats(self.board), appr))
         acc = accuracy.role_accuracy(self.board)
         if acc:
             text += "\nТочность оценок: " + ", ".join(f"{report.ACC_RU[a['role']]} {a['accuracy'] * 100:.0f}%".replace(".", ",") for a in acc if a["role"] in report.ACC_RU)
@@ -119,6 +116,7 @@ class Supervisor:
     # --- главный цикл ---
     def tick(self, now=None):
         now = now or time.time()
+        config.reexec_if_requested("supervisor")
         for name, fn, every in (("screen", self._screen_and_watch, SCREEN_S), ("cycle", self.cycle, CYCLE_S), ("summary", self.summary, SUMMARY_S)):
             if now >= self.next[name]:
                 self.next[name] = now + every
@@ -162,6 +160,7 @@ def lab_loop(sleep_s: int = 5):
             order += qc[:1] + qs[:2]
             qc, qs = qc[1:], qs[2:]
         for s in order[:60]:
+            config.reexec_if_requested("lab")
             try:
                 lab.test_symbol(board, s)
             except Exception as e:  # noqa: BLE001

@@ -39,10 +39,11 @@ case "$1" in
         $PD pkill -f "python -m office" 2>/dev/null; echo "остановлено" ;;
   status) status ;;
   restart) "$0" stop; sleep 3; "$0" start ;;
+  reload) touch "$DIR/RESTART"; echo "RESTART: процессы перезапустят себя сами (между задачами)" ;;
   halt) touch "$DIR/STOP"; echo "HALT: новые решения запрещены; позиции под защитными стопами" ;;
   resume) rm -f "$DIR/STOP"; echo "RESUME" ;;
   watchdog) [ -e "$DIR/.user_stopped" ] && exit 0; alive supervisor supervise && alive lab lab || { echo "$(date -Is) watchdog: перезапуск" >>"$DIR/logs/watchdog.log"; start >/dev/null 2>&1; } ;;
   once) shift; $PD bash -c "$IN 0 .venv/bin/python -m office once $*" ;;
   log) tail -n "${2:-60}" "$DIR/logs/${3:-supervisor}.log" ;;
-  *) echo "usage: $0 start|stop|restart|status|halt|resume|watchdog|once SYMBOL [--dry-run]|log [N] [supervisor|lab]"; exit 1 ;;
+  *) echo "usage: $0 start|stop|restart|reload|status|halt|resume|watchdog|once SYMBOL [--dry-run]|log [N] [supervisor|lab]"; exit 1 ;;
 esac
