@@ -1,49 +1,56 @@
-# FINAL — trading_office (2026-10-12)
+# FINAL — «Торговый зал» trading_office v2 (2026-10-12)
 
-Статус: **собрано и протестировано на моках + частично вживую; в Termux не запускалось** (запуск только вами). 69 тестов зелёные, ruff чист.
+Статус: **собрано, протестировано, один полный живой цикл завершился paper-ордером Alpaca. Демон в Termux не запускался — только вы** (`./office.sh start`). Старый v1 — `reports/archive/`.
 
-## Что есть
-- 11 субагентов `.claude/agents/*.md` (tech, fundamental, news_sentiment, onchain_derivs, bull, bear, trader, risk_manager, portfolio_manager, executor, journal).
-- Пайплайн: данные (Binance public / Yahoo / Hyperliquid / Google News / CoinGecko) → 4 аналитика (Gemini) → bull/bear → trader → risk_manager → PM → RiskGate (код) → executor-проверка → [кнопки Telegram] → Alpaca Paper.
-- Роли: аналитики — Gemini (REST, цепочка моделей), остальные — Claude (`claude -p`, sonnet; executor/journal — haiku).
-- Журнал SQLite `office.db`: runs, opinions (каждая роль), decisions, fills, positions, trades, equity, outcomes. Точность по ролям — triple-barrier (±ATR·√24, 24ч) + shadow rule-based базлайн в каждом цикле.
-- Бэктест: `reports/backtest.md`. Решения: `DECISIONS.md`. Ресерч: `reports/research.md`.
-
-## Жёсткие правила (в коде, с тестами)
-paper-only (клиент отвергает не-paper хост) · размер ≤ cash (1x) · long-only, sell только закрывает лонг, опционов нет · риск до стопа ≤2% эквити **с комиссией и проскальзыванием** · нотионал ≤25% · ≤3 позиции · ≤5 входов/сутки (UTC) · дневной стоп −5% · стоп обязателен (акции — bracket, крипта — market + защитный stop_limit; не встал → немедленное закрытие) · ошибка/невалидный ответ агента → пропуск цикла по активу · файл `STOP` = kill-switch.
-
-## Что проверено вживую (не на моках)
-- Alpaca Paper: счёт ACTIVE, $100k, запросы account/clock/positions/orders. **Crypto bracket/OTO отклоняются API** (проверено) → схема из DECISIONS #3. Ордера на исполнение вживую НЕ отправлялись (кроме лимитного теста с ценой далеко от рынка, отменён).
-- Gemini: реальные вызовы; `gemini-3.5-flash` упёрся в дневную free-квоту → цепочка моделей. Claude: реальные вызовы всех 6 Claude-ролей, схемы валидны.
-- Полный dry-run BTC (без ордеров): 4 аналитика → short-circuit hold (43с). Путь bull→trader живой, risk/PM/executor — живой на канонических входах.
-- **Не проверялось вживую:** исполнение ордеров через AlpacaBroker (только моки), Telegram-кнопки (нет кредов в proot), alpaca-mcp-server (`uvx` в proot не запускается; конфиг в `.mcp.json`).
-
-## Бэктест 6 мес. (rule-based базлайн, не LLM-фирма) — **убыточный**
-Базовые правила (EMA/MACD/RSI + funding): −16.2% при 180 сделках, винрейт 34%, PF 0.67, просадка −16.4%; стресс (slip 0.2%) −25.1%. Buy&hold за тот же период: SPY +14.6% (DD −4.5%), BTC +14.0% (DD −29.4%). Направленные сигналы tech/derivs — на уровне монетки (hit-rate 49.5% / 42.9%). Вывод: у тривиальных правил **нет** edge; стопы 2×ATR_1h слишком часто выбивают (117 stop против 61 take). Параметры я не подгонял под результат (это было бы переобучением на тех же данных). Что LLM-слой добавит — неизвестно: измерять только на живом paper-журнале (`python -m office accuracy`, сравнение с `rule:*` shadow-мнениями). **Не включайте `--auto` на реальные деньги и не считайте бэктест доказательством прибыльности.**
-
-## Gemini-ревью
-`relay-review` упал по таймауту (gemini CLI, 600с). Заменил прямым ревью через Gemini REST (`gemini-3.5-flash-lite`, 7 модулей): 9 замечаний. Принято и исправлено: (6) комиссия крипты в получаемом активе → реальный qty берётся с брокера, PnL с комиссиями; (9) стоп не встал + закрытие не подтверждено → позиция остаётся в журнале + тревога в Telegram; (1) точный stop-ордер при сверке; (4) любая ошибка на этапе агентов → пропуск; (2, частично) file-lock против параллельных циклов. Отклонено: гонки внутри цикла (шаги последовательны), «пересчёт риска после floor» (floor только уменьшает), валидация цен (уже есть), часовые пояса (всё UTC).
-
-## Известные ограничения
-Gemini free-tier: ~170 запросов/сутки при `--interval 4` могут не поместиться → при исчерпании цепочки цикл по активу пропускается (безопасно, но молча теряются решения). Нужен платный ключ или `--interval 8`. Ключи были присланы в чате → **перевыпустите после тестов**. alpaca-mcp-server подключён только для ручной работы.
-
-## Команды для Termux
-```bash
-cd ~/projects/trading_office
-pkg install python-pandas -y; pip install requests pytest      # один раз (pandas/numpy в Termux ставятся через pkg)
-python3 -m pytest -q tests                                       # sanity: 69 passed
-
-./trading_office.sh once --only BTC                              # один цикл по BTC (кнопки Telegram; без кредов: добавьте --auto)
-./trading_office.sh once --auto                                  # один цикл по всем, без кнопок
-termux-wake-lock; INTERVAL=4 ./trading_office.sh start           # демон раз в 4ч (с кнопками); AUTO=1 INTERVAL=4 ./trading_office.sh start — без кнопок
-./trading_office.sh status                                       # процесс + счёт + позиции + последние решения + точность ролей
-./trading_office.sh log 100                                      # хвост office.log
-./trading_office.sh halt                                         # kill-switch (STOP): новых решений нет, стопы на брокере остаются
-./trading_office.sh resume                                       # снять STOP
-./trading_office.sh stop                                         # остановить демон
-
-crontab -e   # (pkg install cronie; crond) — сверка стопов/тейков без LLM каждые 15 мин + утренний статус:
-*/15 * * * * cd ~/projects/trading_office && ./trading_office.sh watch >> watch.log 2>&1
-python3 -m office.backtest --months 6                            # перегенерировать reports/backtest.md (~10 мин)
+## Карта офиса
 ```
-Для Telegram-кнопок положите в `.env` `TG_TOKEN`/`TG_CHAT` (лучше отдельный бот); иначе возьмётся конфиг tgnotify.
+скринер (без LLM, 15 мин)  ──►  top-5 кандидатов (board.candidates)
+ TA-Lib: ROC20/RSI/объём vs SMA20/пробой 20д/сигнал lab        │
+ все крипто-пары Alpaca (36) + S&P500∪NDX (518)                ▼
+supervisor (1 ч): BTC/ETH/SOL · SPY/NVDA/AAPL/MSFT в часы биржи · top-5 · открытые позиции   (≤10 активов, 2 параллельно)
+   │
+   ▼  по каждому активу — цепочка, каждый отчёт на шине board.db {id, role, asset, ts, вывод, уверенность 0-1, ссылки_на, данные}
+ Аналитики (Gemini):  market (TA-Lib + TradingView) · news (заголовки, FinBERT-стиль) · fundamentals (equity-research) · quant (wshobson)
+                      · buffett / munger / druckenmiller (ai-hedge-fund, акции) · lab (approved-стратегии, голос без LLM)
+   ▼  Bull ⇄ Bear ×2 раунда (промпты TradingAgents; Claude)  — обязаны цитировать аналитиков и оппонента
+   ▼  Trader (Claude) ► Risk (Claude + wshobson risk-manager + Riskfolio-Lib CVaR) ► PM (Claude + PyPortfolioOpt)
+   ▼  RiskGate (КОД: лимиты) ► Executor-проверка (Claude haiku) ► Alpaca PAPER (market + защитный stop / bracket для акций)
+   ▼  Telegram: сделка с цепочкой «кто что сказал, на кого сослался (✓ согласен / ✗ оспорил)»; сводка раз в 6 ч
+Лаборатория (фон, nice): vectorbt walk-forward → board.strategies → approved становятся аналитиком 'lab'
+```
+Правило ссылок — `office/board.py`: после аналитиков нужен ≥1 существующий отчёт того же цикла/актива + явный agree/dispute по каждой ссылке + обязательные роли (bear→bull, trader→bull+bear, risk→trader, PM→trader+risk, executor→PM); иначе `RejectedReport` (в `rejected`), одна попытка с текстом причины, затем пропуск актива. В живых циклах правило сработало 3 раза (bear/trader не процитировали оппонента) — отчёты отклонены, повтор прошёл.
+
+## Жёсткие лимиты (код, тесты `test_risk.py`, `test_alpaca.py`, `test_hall.py`, `test_supervisor.py`)
+paper-only (`ALPACA_PAPER!=true` или не-paper хост → отказ) · cash 1x (размер ≤ cash) · только long, sell лишь закрывает существующий лонг, опционов нет · риск до стопа с комиссией и проскальзыванием ≤2% эквити, стоп обязателен · нотионал ≤25% · дневной стоп −5% (блок входов) · ≤5 входов/сутки (UTC) · ≤3 позиции · невалидный ответ/лимиты LLM/нет ссылок → пропуск актива · файл `STOP` (`halt`) блокирует новые решения. Лимиты исчерпаны → цикл актива прерывается до трат на LLM. Исполнение под общим локом со свежим состоянием счёта.
+
+## Команды (Termux)
+```
+cd ~/projects/trading_office
+./office.sh start      # supervisor + лаборатория (wake-lock, proot ubuntu, --no-kill-on-exit)
+./office.sh status     # процессы, HALT, equity, позиции, кандидаты, число approved
+./office.sh halt       # новые решения запрещены (позиции под защитными стопами);  ./office.sh resume — снять
+./office.sh stop       # остановить (watchdog не поднимет)
+./office.sh once BTC/USD [--dry-run]   # один полный цикл
+./office.sh log 80 [supervisor|lab]
+crontab -e  →  */10 * * * * /data/data/com.termux/files/home/projects/trading_office/office.sh watchdog   (строка в reports/crontab.txt; нужен запущенный `crond`)
+```
+Для 24/7 в Android: отключить оптимизацию батареи для Termux, держать `termux-wake-lock` (start берёт сам), `crond` запущен.
+Прочее: `python -m office screen|summary|accuracy|status` (внутри proot, venv `.venv`), тесты `.venv/bin/python -m pytest`.
+
+## Приёмка
+- **pytest: 60 passed**, ruff F/E9 чист.
+- **Живой полный цикл с ордером — ONDO/USD (естественный вход, не подстановка).** Скринер отдал ONDO в top-5; все роли ответили живьём: 4 аналитика (fundamentals — честный abstain, HTTPError CoinGecko для альта), bull/bear ×2, trader buy 0.55, risk_manager *reduce*, PM approve, RiskGate, executor ok. Ордер Alpaca paper: **market buy `43748db5-eb4f-4e3a-8768-a9cf7332c589`**, filled 29049.61 @ 0.51697; защитный stop_limit `c9bdd130-111b-4bb1-8d21-8496b54117e6` (stop 0.5033 / limit 0.4983), take 0.5417 исполняет бот. Цепочка отчётов #273–#284 в `board.db`, текст — `reports/acceptance_chain_ONDO.md`. Позиция осталась открытой, пока supervisor не запущен — она под биржевым стопом; тейк и учёт закрытия подхватит `watch` после `./office.sh start`.
+- **BTC: ответы всех ролей живые (≥6 циклов, цепочка до trader включительно), но trader каждый раз сказал hold** (отрицательный 20д-моментум quant, перекупленность) — ордера на BTC нет. Это не подгонялось (DECISIONS #29).
+- Сквозная проверка акций: `once NVDA --dry-run` — все 7 аналитиков, включая Buffett/Munger/Druckenmiller, и дебаты ответили живьём (ордер не отправлялся: биржа закрыта).
+- Скринер: 36 крипто-пар + 518 акций, скан ≈31 с. Лаборатория, 1-й прогон (BTC/ETH/SOL/SPY/NVDA/AAPL/MSFT × 4 семейства): **0 из 28 approved** — OOS не лучше buy&hold; AAPL rsi_revert близко (Sharpe 1.60 vs 1.54, просадка лучше, но 20 сделок < 30). Лаборатория пока не голосует в зале.
+- Gemini-ревью: `relay-review` не запускал (он правит код параллельно с идущими живыми циклами); сделал прямое ревью через Gemini REST (`gemini-3.1-flash-lite`, 8 файлов, 12 пунктов; `reports/gemini_review_raw.md`). Принято и исправлено: (5) вход мог исполниться в момент отмены → теперь пересчитывается статус и поднимается явная тревога с ручной проверкой позиции; (9) при исчерпанных лимитах цикл актива прерывается до вызовов LLM. Отклонено как неверное прочтение кода: (1) look-ahead в walk-forward — параметры выбираются только на train-срезе, сигналы каузальны (тест `test_signals_are_causal`); (2) acct уже читается внутри лока; (4) аналитики — первый слой по ТЗ; (6) Journal и Board — разные файлы БД; (3,7,8,10,11,12) — не воспроизводятся/вне ТЗ.
+
+## Известные ограничения и что делать вам
+- **Ключи были присланы в чат → перевыпустить** (Alpaca paper, Gemini); новые — в `.env` (алиасы `ALPACA_API_KEY/ALPACA_SECRET_KEY`) и в `claude mcp` (alpaca).
+- Gemini free-tier: при 503/429 аналитик → abstain (<2 живых → актив пропущен). Для 24/7 лучше платный ключ.
+- Claude `-p`: ≈4.5 мин на актив; 10 активов × 2 параллельно ≈ 25 мин из 60. Если лимиты Claude кончатся — циклы пропускаются, процесс живёт.
+- Альткойны без CoinGecko-id → fundamentals abstain (не критично, голос просто не учитывается).
+- Trader осторожен: за первые ~30 циклов 1 вход. Это поведение, а не баг; оценивать только по накопленной точности ролей (`python -m office accuracy`, сводка 6 ч) и PnL vs SPY/BTC.
+- FinBERT/torch не ставились (OOM) — сентимент по заголовкам через Gemini.
+- MCP (alpaca, yfinance, coingecko, tradingview, плагины) — для ручной работы в Claude Code; торговый путь их не использует (DECISIONS #22). При обновлении плагина financial-analysis платные коннекторы включатся снова — отключить.
+- Старый v1-бэктест (убыточный базлайн) и код — `reports/archive/`.

@@ -1,5 +1,5 @@
 """Проверка компонентов запуском -> reports/components.md. Запуск: .venv/bin/python scripts/check_components.py"""
-import json, os, subprocess, sys, time
+import os, subprocess, sys, time
 from importlib import metadata
 from pathlib import Path
 
@@ -56,8 +56,12 @@ def claude():
     assert r.returncode == 0, r.stderr[:80]; return r.stdout.strip()[:30]
 def gemini():
     import requests
-    r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent",
-        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]}, json={"contents": [{"parts": [{"text": "say ok"}]}]}, timeout=40)
+    for i in range(3):  # 503 «high demand» бывает разово
+        r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent",
+            headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]}, json={"contents": [{"parts": [{"text": "say ok"}]}]}, timeout=40)
+        if r.status_code != 503:
+            break
+        time.sleep(10)
     r.raise_for_status(); return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()[:20]
 def mcp():
     out = subprocess.run(["claude", "mcp", "list"], capture_output=True, text=True, timeout=200, cwd=str(ROOT), env={**os.environ, "PATH": os.environ["PATH"] + ":/root/.local/bin"}).stdout
@@ -81,4 +85,4 @@ check("Claude plugins", plugins)
 check("MCP (claude mcp list)", mcp)
 rows.append(("transformers/FinBERT", "-", "SKIP", "решение владельца: torch не ставится (OOM) → сентимент Gemini/Claude по заголовкам, DECISIONS #16"))
 md = "# Компоненты (" + time.strftime("%Y-%m-%d %H:%M") + ")\n\n| Компонент | Версия | Статус | Проверка |\n|---|---|---|---|\n" + "\n".join(f"| {a} | {b} | {c} | {d} |" for a, b, c, d in rows) + "\n"
-(ROOT / "reports/components.md").write_text(md); print(md)
+(ROOT / "reports/components.md").write_text(md + (ROOT / "scripts/components_notes.md").read_text()); print(md)

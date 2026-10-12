@@ -33,7 +33,7 @@ class FakeClaude:
         ids = json.loads(re.search(r"Use only ids from: (\[.*?\])", prompt).group(1))
         must = re.search(r"MUST cite these report ids explicitly: (\[.*?\])", prompt)
         cite = sorted(set(ids) | set(json.loads(must.group(1)) if must else []))
-        return f"argument\nREFS_JSON: " + json.dumps({"agree": cite[:-1], "dispute": cite[-1:], "confidence": 0.7, "stance": "buy"})
+        return "argument\nREFS_JSON: " + json.dumps({"agree": cite[:-1], "dispute": cite[-1:], "confidence": 0.7, "stance": "buy"})
 
     def ask(self, role, payload, system=None):
         self.calls.append(role)
