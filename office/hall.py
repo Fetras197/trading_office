@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
 from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
 
-from . import agents, data, events, portfolio
+from . import agents, data, events, factcheck, portfolio, review, weights
 from .board import PICTURE_MAX_AGE_H, RejectedReport
 from . import config
 from .config import COSTS, Limits, make_asset
@@ -45,10 +45,12 @@ class DebateLLM:
     """Утка под TradingAgents: node вызывает llm.invoke(prompt).content. Добавляет правило цитирования и парсит REFS_JSON."""
     def __init__(self, claude):
         self.claude, self.allowed, self.must, self.last, self.feedback, self.must_ids = claude, [], "", None, None, []
+        self.lessons: list[str] = []
 
     def invoke(self, prompt):
         extra = f"\nYou MUST cite these report ids explicitly: {self.must_ids}." if self.must_ids else ""
         extra += f"\nYour previous reply was rejected: {self.feedback}. Fix it." if self.feedback else ""
+        extra += "\nLessons from our past closed trades (use if the situation is similar): " + " | ".join(self.lessons) if self.lessons else ""
         text = self.claude.text(None, prompt + agents.REFS_TEXT % (self.allowed, self.must) + extra, "")
         m = re.search(r"REFS_JSON:\s*(\{.*\})\s*$", text.strip(), re.S)
         if not m:
@@ -144,6 +146,7 @@ class Hall:
             return role, n
         with cf.ThreadPoolExecutor(3) as ex:
             res = list(ex.map(one, list(payloads)))
+        res = self._verify_analysts(cid, asset, res, payloads, b)
         out = []
         for role, n in res:
             rid = self.board.publish(cid, role, asset.name, f"{n['stance']}: {n['rationale']}", n["confidence"],
@@ -177,12 +180,57 @@ class Hall:
         return (f"[#{pic['id']} picture] regime={d.get('regime')} size_mult={d.get('size_mult')} (conf {pic['confidence']:.2f}): {d.get('summary', '')} "
                 f"Risks: {'; '.join(d.get('main_risks', []))}. Forbidden today: {'; '.join(d.get('forbidden', []))}")
 
+    # ---------- проверка фактов (2.4) ----------
+    def _facts(self, b):
+        return factcheck.facts_for(b)
+
+    def _fc(self, claims, facts) -> dict:
+        """Провалившиеся проверки. Контролёр недоступен (лимит/сбой) — проверка пропускается, не блокируя зал."""
+        try:
+            return factcheck.check(self.router, claims, facts)
+        except (LLMUnavailable, LLMError):
+            return {}
+
+    def _reject_log(self, cid, role, asset, reason):
+        self.board.x("INSERT INTO rejected(cycle_id,role,asset,ts,reason,payload) VALUES(?,?,?,?,?,?)",
+                     (cid, role, asset, utcnow(), f"факты не сошлись: {reason}"[:500], "{}"))
+
+    def _verify_analysts(self, cid, asset, res, payloads, b):
+        facts = self._facts(b)
+        bad = self._fc({r: n["rationale"] for r, n in res if n["stance"] != "abstain"}, facts)
+        if not bad:
+            return res
+        out = dict(res)
+        for role, mm in bad.items():
+            self._reject_log(cid, role, asset.name, "; ".join(mm))
+            try:
+                out[role] = agents.run_analyst(role, self.router, {**payloads[role], "previous_rejection": "numbers in your previous report contradict the data: " + "; ".join(mm)})
+            except (LLMError, KeyError):
+                out[role] = {"stance": "abstain", "confidence": 0.0, "rationale": "переделка не удалась"}
+        bad2 = self._fc({r: out[r]["rationale"] for r in bad if out[r]["stance"] != "abstain"}, facts)
+        for role, mm in bad2.items():
+            self._reject_log(cid, role, asset.name, "повтор: " + "; ".join(mm))
+            out[role] = {"stance": "abstain", "confidence": 0.0, "rationale": "отчёт не прошёл проверку фактов: " + "; ".join(mm)[:200]}
+        return [(r, out[r]) for r, _ in res]
+
+    def _cross_price(self, asset, price):
+        """Цена из свечей против снапшота Alpaca (независимый источник): расхождение > 1,5% — данные ненадёжны, актив пропускается."""
+        cl = getattr(self.broker, "c", None)
+        if cl is None or not hasattr(cl, "price"):
+            return
+        try:
+            other = cl.price(asset.alpaca)
+        except Exception:  # noqa: BLE001 — второй источник недоступен: не блокируем
+            return
+        if factcheck.price_gap(price, other) > 0.015:
+            raise Skip(f"цены источников расходятся ({price:.6g} против {other:.6g})")
+
     @staticmethod
     def _tagged(reports):
         return "\n".join(f"[#{r['id']} {r['role']}] {r['stance']} (conf {r['confidence']:.2f}): {r['rationale']}" for r in reports)
 
     # ---------- дебаты ----------
-    def _debate(self, cid, asset, analysts, b, pic):
+    def _debate(self, cid, asset, analysts, b, pic, fact_fb=None):
         live = [r for r in analysts if r["stance"] != "abstain"]
         by = lambda *roles: self._tagged([r for r in live if r["role"] in roles]) or "(no report)"  # noqa: E731
         state = {"company_of_interest": asset.alpaca, "asset_type": asset.kind,
@@ -190,6 +238,7 @@ class Hall:
                  "news_report": by("news"), "fundamentals_report": by("fundamentals"),
                  "investment_debate_state": {"history": "", "bull_history": "", "bear_history": "", "current_response": "", "count": 0}}
         duck = DebateLLM(self.claude)
+        duck.lessons = review.lessons_for(self.board, asset.name, asset.kind)
         nodes = {"bull": create_bull_researcher(duck), "bear": create_bear_researcher(duck)}
         ids = [r["id"] for r in live]
         last = {}  # role -> id последнего отчёта
@@ -201,7 +250,7 @@ class Hall:
                 allowed = ids + [pic["id"]] + ([last[other]] if other in last else []) + ([last[role]] if role in last else [])
 
                 def call(fb=None, role=role, must=must, allowed=allowed, other=other):
-                    duck.allowed, duck.must, duck.last, duck.feedback = allowed, ", ".join(must), None, fb
+                    duck.allowed, duck.must, duck.last, duck.feedback = allowed, ", ".join(must), None, fb or fact_fb
                     duck.must_ids = [pic["id"]] + ([last[other]] if other in last else [])
                     st = {**state, "investment_debate_state": dict(state["investment_debate_state"])}
                     new = nodes[role](st)["investment_debate_state"]
@@ -238,6 +287,7 @@ class Hall:
         except Exception as e:  # noqa: BLE001
             raise Skip(f"нет данных: {type(e).__name__}") from e
         price, atr = b["indicators_1h"]["close"], b["indicators_1h"]["atr14"]
+        self._cross_price(asset, price)
         run_id = self.j.add_run(ts, asset.name, price, atr, cid)
         acct = self._account(asset, ts)
 
@@ -261,21 +311,39 @@ class Hall:
                 self.j.set_summary(run_id, f"skip: {why}")
                 return Result(asset.name, "hold", why, cid)
         analysts = self._analysts(cid, asset, b)
+        wts, st = weights.active(self.board), weights.stats(self.board)
+        for r in analysts:   # роль, отключённая владельцем (после «да»), не голосует
+            if wts.get(r["role"], {}).get("disabled"):
+                r["stance"], r["confidence"] = "abstain", 0.0
+            r["weight"] = weights.weight_of(wts, r["role"])
+            r["conf_calibrated"] = weights.calibrated_conf(st, r["role"], r["confidence"])
         live = [r for r in analysts if r["stance"] != "abstain"]
         if len(live) < 2:
             raise Skip(f"недостаточно аналитиков ({len(live)} из {len(analysts)}; остальные abstain)")
-        if not acct["position"] and not any(r["stance"] in ("buy", "sell") and r["confidence"] >= 0.5 for r in live):
+        if not acct["position"] and not any(r["stance"] in ("buy", "sell") and r["confidence"] * r["weight"] >= 0.5 for r in live):
             self.j.set_summary(run_id, "short-circuit: нет directional мнения >=0.5")
             return Result(asset.name, "hold", "short-circuit: нет directional мнения >=0.5", cid)
 
         last, texts = self._debate(cid, asset, analysts, b, pic)
-        reports = [{"id": r["id"], "role": r["role"], "stance": r["stance"], "confidence": r["confidence"], "rationale": r["rationale"]} for r in live]
+        bad = self._fc(texts, self._facts(b))
+        if bad:   # бык/медведь привели неверные факты: спор переделывается один раз
+            fb = "factual errors in the previous debate, correct them using only the data: " + "; ".join(f"{k}: {' / '.join(v)}" for k, v in bad.items())
+            for k, v in bad.items():
+                self._reject_log(cid, k, asset.name, "; ".join(v))
+            last, texts = self._debate(cid, asset, analysts, b, pic, fact_fb=fb)
+            bad = self._fc(texts, self._facts(b))
+            if bad:
+                for k, v in bad.items():
+                    self._reject_log(cid, k, asset.name, "повтор: " + "; ".join(v))
+                raise Skip("факты в споре быка и медведя не подтвердились")
+        reports = [{"id": r["id"], "role": r["role"], "stance": r["stance"], "confidence": r["confidence"], "weight": r["weight"], "calibrated_confidence": r["conf_calibrated"],
+                    "track_record": weights.track_record(st, r["role"]), "rationale": r["rationale"]} for r in live]
         reports += [{"id": last[k], "role": k, "stance": "-", "confidence": 0.0, "rationale": texts[k][:500]} for k in ("bull", "bear")]
         reports.append({"id": pic["id"], "role": "picture", "stance": pd_.get("regime", "neutral"), "confidence": pic["confidence"],
                         "rationale": f"{pd_.get('summary', '')} Risks: {'; '.join(pd_.get('main_risks', []))}. Forbidden today: {'; '.join(pd_.get('forbidden', []))}"})
         tp = {"asset": asset.name, "price": price, "atr14": atr, "account": acct, "position": acct["position"], "reports": reports,
               "day_picture": {"regime": pd_.get("regime"), "size_mult": pd_.get("size_mult"), "priority_assets": pd_.get("priority_assets"), "expectation": pd_.get("expectation")},
-              "research": self._research_ctx(asset)}
+              "research": self._research_ctx(asset), "weighted_vote": weights.weighted_vote(live, wts), "lessons": review.lessons_for(self.board, asset.name, asset.kind)}
 
         def trader(fb=None):
             raw = self._ask_json("trader", tp, "bull, bear and picture (the Picture of the Day)", fb)
@@ -283,6 +351,10 @@ class Hall:
             if a not in ("buy", "sell", "hold"):
                 raise LLMError(f"trader: action {a!r}")
             refs, st = _refs(raw, "trader")
+            bad_t = self._fc({"trader": str(raw.get("rationale", ""))}, self._facts(b))
+            if bad_t:
+                self._reject_log(cid, "trader", asset.name, "; ".join(bad_t["trader"]))
+                raise RejectedReport("trader: факты не сошлись с данными: " + "; ".join(bad_t["trader"]))
             return (f"{a}: {str(raw.get('rationale', ''))[:400]}", float(raw["confidence"]), refs, st, {**raw, "action": a}, raw)
         tid, t = self._chain_call(cid, "trader", asset.name, trader, ("bull", "bear", "picture"))
         action = str(t["action"]).lower()

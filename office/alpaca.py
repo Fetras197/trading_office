@@ -66,16 +66,21 @@ class AlpacaClient:
 
     DATA = "https://data.alpaca.markets"
 
+    def _snap(self, symbol: str) -> dict:
+        if "/" in symbol:
+            return self._data(f"{self.DATA}/v1beta3/crypto/us/snapshots", {"symbols": symbol})["snapshots"][symbol]
+        return self._data(f"{self.DATA}/v2/stocks/snapshots", {"symbols": symbol, "feed": "iex"})[symbol]
+
+    def price(self, symbol: str) -> float:
+        """Последняя сделка по снапшоту Alpaca (независимый от Yahoo/Binance источник цены)."""
+        snap = self._snap(symbol)
+        return float((snap.get("latestTrade") or {}).get("p") or snap["dailyBar"]["c"])
+
     def day_change(self, symbol: str) -> float:
         """Изменение цены к вчерашнему закрытию по снапшоту Alpaca (тот же источник, что у счёта). Крипта: BTC/USD, акции: SPY."""
-        if "/" in symbol:
-            url, p = f"{self.DATA}/v1beta3/crypto/us/snapshots", {"symbols": symbol}
-            snap = self._data(url, p)["snapshots"][symbol]
-        else:
-            snap = self._data(f"{self.DATA}/v2/stocks/snapshots", {"symbols": symbol, "feed": "iex"})[symbol]
+        snap = self._snap(symbol)
         px = float((snap.get("latestTrade") or {}).get("p") or snap["dailyBar"]["c"])
-        prev = float(snap["prevDailyBar"]["c"])
-        return px / prev - 1
+        return px / float(snap["prevDailyBar"]["c"]) - 1
 
     def _data(self, url, params):
         for i in range(3):

@@ -183,6 +183,7 @@ def test_supervisor_wiring_without_running_anything():
 
     class C:
         def account_view(self): return {}
+        def price(self, s): return 1.0
     s = Supervisor(board=Board(), journal=Journal(), client=C(), hall=object(), notify=lambda t: None)
-    assert [j.name for j in s.sched.jobs] == ["events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "picture"]
+    assert [j.name for j in s.sched.jobs] == ["events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "shadow", "review", "weights", "picture"]
     assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []}

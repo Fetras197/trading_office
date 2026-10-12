@@ -22,6 +22,11 @@ CREATE INDEX IF NOT EXISTS ix_rep_role ON reports(role, id);
 CREATE TABLE IF NOT EXISTS events(key TEXT PRIMARY KEY, ts TEXT, until TEXT, title TEXT, ccy TEXT, impact TEXT, kind TEXT, assets TEXT, src TEXT, data TEXT, seen TEXT);
 CREATE TABLE IF NOT EXISTS memory(id INTEGER PRIMARY KEY, ts TEXT, kind TEXT, asset TEXT, tags TEXT, text TEXT, data TEXT);
 CREATE INDEX IF NOT EXISTS ix_mem ON memory(kind, asset, id);
+CREATE TABLE IF NOT EXISTS shadow_pos(name TEXT, asset TEXT, qty REAL, entry REAL, opened TEXT, PRIMARY KEY(name, asset));
+CREATE TABLE IF NOT EXISTS shadow_eq(ts TEXT, name TEXT, equity REAL, cash REAL);
+CREATE INDEX IF NOT EXISTS ix_sheq ON shadow_eq(name, ts);
+CREATE TABLE IF NOT EXISTS role_weights(role TEXT PRIMARY KEY, weight REAL, disabled INT DEFAULT 0, since TEXT);
+CREATE TABLE IF NOT EXISTS proposals(id INTEGER PRIMARY KEY, ts TEXT, kind TEXT, payload TEXT, text TEXT, status TEXT DEFAULT 'pending', decided TEXT);
 CREATE TABLE IF NOT EXISTS candidates(ts TEXT, symbol TEXT, score REAL, rank INT, data TEXT);
 CREATE TABLE IF NOT EXISTS strategies(id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, name TEXT, params TEXT, approved INT,
   oos_sharpe REAL, bh_sharpe REAL, oos_dd REAL, bh_dd REAL, trades INT, data TEXT);

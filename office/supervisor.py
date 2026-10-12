@@ -9,7 +9,7 @@ import fcntl
 import threading
 import time
 
-from . import accuracy, config, data, events, lab, report, research, scheduler, screener
+from . import accuracy, config, data, events, lab, report, research, review, scheduler, screener, shadow, weights
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
@@ -36,6 +36,7 @@ class Supervisor:
         self.hall = hall or Hall(self.board, self.j, self.broker, self.router, ClaudeBackend(), notify=notify,
                                  lab=lambda s: self._lab(s), picture=self.research.ensure_picture)
         self.next = {"screen": 0.0, "cycle": 0.0, "summary": time.time() + SUMMARY_S}
+        self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"])
         self.sched = scheduler.Scheduler(self.j, self.jobs())
 
     def scope(self) -> dict:
@@ -51,7 +52,14 @@ class Supervisor:
                 J("crypto", R.run_crypto, every=3600),
                 J("sectors", R.run_sectors, at=["07:10"], catchup_h=8),
                 J("portfolio", R.run_portfolio, at=["07:20"], catchup_h=8),
+                J("shadow", self.shadow.step, every=3600),
+                J("review", self.run_review, every=1800),
+                J("weights", lambda: weights.propose(self.board), at=["06:50"], catchup_h=12),
                 J("picture", R.run_picture, at=["03:30", "07:30", "11:30", "15:30", "19:30", "23:30"], catchup_h=3)]
+
+    def run_review(self):
+        """Разбор закрытых сделок (2.2) — Claude; не больше 3 за проход."""
+        review.run(self.board, self.j, self.router, lambda n: data.candles(config.BY_NAME[n], "1h", **({"limit": 500} if "/" in n else {"rng": "60d"})))
 
     def pre_event_macro(self):
         """За час до важного события USD: обновить макро-анализ и картину дня (1 раз на событие)."""
@@ -102,6 +110,7 @@ class Supervisor:
             cost = t[0]["entry"] * t[0]["qty"] if t else 0
             self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"]))
             self.sched.trigger("portfolio")
+            self.sched.trigger("review")
         eq = self.broker.equity()
         self.j.snap_equity(utcnow(), eq)
         if self.j.kv_get("start_equity") is None:
@@ -150,6 +159,8 @@ class Supervisor:
         if r.status in ("opened", "closed"):
             self.notify(report.trade_message(self.board, r))
             self.sched.trigger("portfolio")   # 1.6: портфельный аналитик после каждой сделки
+            if r.status == "closed":
+                self.sched.trigger("review")
         elif r.status == "error":
             self.notify(report.service("asset_fail", r.asset))
 

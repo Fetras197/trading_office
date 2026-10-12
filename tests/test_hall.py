@@ -16,10 +16,15 @@ PRICE, ATR = 100.0, 1.0
 
 
 class FakeRouter:
-    def __init__(self, stance="buy", unavailable=False):
-        self.stance, self.unavailable = stance, unavailable
+    def __init__(self, stance="buy", unavailable=False, fact_bad=None):
+        self.stance, self.unavailable, self.fact_bad, self.fc_calls, self.asked = stance, unavailable, fact_bad or (lambda claims: {}), 0, []
 
     def ask(self, role, payload, system=None):
+        if role == "factcheck":   # контролёр фактов: fact_bad(claims) -> {label: [несовпадения]}
+            self.fc_calls += 1
+            bad = self.fact_bad(payload["claims"])
+            return {"results": {k: ({"ok": False, "mismatches": bad[k]} if k in bad else {"ok": True, "mismatches": []}) for k in payload["claims"]}}
+        self.asked.append((role, payload))
         if self.unavailable:
             raise LLMUnavailable("429")
         return {"stance": self.stance, "confidence": 0.8, "rationale": f"{role} says {self.stance}"}
@@ -221,3 +226,77 @@ def test_picture_size_mult_only_reduces(env):
     h2, _, br2 = mk(pic={"size_mult": 0.5})
     h2.run_asset("BTC/USD")
     assert br1.bought and br2.bought and br2.bought[0][1] < br1.bought[0][1]  # размер меньше (PM-кап в первом прогоне мог уже ограничить)
+
+
+# ---------- v3: проверка фактов, веса, цена из двух источников ----------
+def test_factcheck_redo_analyst_once_then_pass(env):
+    state = {"n": 0}
+
+    def bad(claims):
+        if "market" in claims and state["n"] == 0:
+            state["n"] += 1
+            return {"market": ["RSI 80 -> actual 55"]}
+        return {}
+    r = FakeRouter(fact_bad=bad)
+    h, b, br = mk(router=r)
+    res = h.run_asset("BTC/USD")
+    assert res.status == "opened"
+    redo = [p for role, p in r.asked if role == "market" and "previous_rejection" in p]
+    assert len(redo) == 1 and "RSI 80" in redo[0]["previous_rejection"]
+    assert any("факты не сошлись" in x["reason"] for x in b.q("SELECT reason FROM rejected"))
+
+
+def test_factcheck_persistent_lie_makes_analyst_abstain(env):
+    r = FakeRouter(fact_bad=lambda claims: {"news": ["заголовок выдуман"]} if "news" in claims else {})
+    h, b, br = mk(router=r)
+    h.run_asset("BTC/USD")
+    n = b.q("SELECT verdict FROM reports WHERE role='news'")
+    assert n and n[0]["verdict"].startswith("abstain") and "проверку фактов" in n[0]["verdict"]
+
+
+def test_factcheck_unavailable_does_not_block_hall(env):
+    class Down(FakeRouter):
+        def ask(self, role, payload, system=None):
+            if role == "factcheck":
+                raise LLMUnavailable("limit")
+            return super().ask(role, payload, system)
+    h, b, br = mk(router=Down())
+    assert h.run_asset("BTC/USD").status == "opened"
+
+
+def test_debate_with_false_facts_twice_skips(env):
+    r = FakeRouter(fact_bad=lambda claims: {"bull": ["неверно"]} if "bull" in claims else {})
+    h, b, br = mk(router=r)
+    res = h.run_asset("BTC/USD")
+    assert res.status == "skipped" and "споре" in res.detail and not br.bought
+
+
+def test_trader_false_facts_rejected_and_retried(env):
+    r = FakeRouter(fact_bad=lambda claims: {"trader": ["цена другая"]} if "trader" in claims else {})
+    h, b, br = mk(router=r)
+    res = h.run_asset("BTC/USD")
+    assert res.status == "skipped" and not br.bought
+
+
+def test_price_cross_check_between_sources_skips(env):
+    class C:
+        def price(self, sym): return PRICE * 1.05
+    h, b, br = mk()
+    br.c = C()
+    assert "расходятся" in h.run_asset("BTC/USD").detail
+    br.c = type("C2", (), {"price": lambda self, s: PRICE * 1.005})()
+    assert h.run_asset("BTC/USD").status == "opened"
+
+
+def test_disabled_role_abstains_and_weights_reach_trader(env):
+    r, c = FakeRouter(), FakeClaude()
+    h, b, br = mk(router=r, claude=c)
+    b.x("INSERT INTO role_weights(role,weight,disabled,since) VALUES('market',1.0,1,'t')")
+    b.x("INSERT INTO role_weights(role,weight,disabled,since) VALUES('news',0.5,0,'t')")
+    seen = {}
+    orig = c.ask
+    c.ask = lambda role, payload, system=None: (seen.setdefault(role, payload), orig(role, payload, system))[1]
+    h.run_asset("BTC/USD")
+    tp = seen["trader"]
+    assert "market" not in [x["role"] for x in tp["reports"]]
+    assert next(x for x in tp["reports"] if x["role"] == "news")["weight"] == 0.5 and "weighted_vote" in tp and "lessons" in tp
