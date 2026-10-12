@@ -43,7 +43,7 @@ def test_approved_strategies_vote_as_lab_analyst(monkeypatch):
     df = series(1500, 3)
     _, _, ps = lab.grid(df["close"], df["high"], df["low"], "sma_cross")
     b.x("INSERT INTO strategies(ts,symbol,name,params,approved,oos_sharpe,bh_sharpe) VALUES(datetime('now'),'X','sma_cross',?,1,1.5,0.5)", (__import__("json").dumps(ps[0]),))
-    monkeypatch.setattr(lab, "history", lambda s, d=730: df)
+    monkeypatch.setattr(lab, "history", lambda s, tf="1h", d=None: df)
     sg = lab.signal_for(b, "X")
     assert sg["stance"] in ("buy", "hold") and 0 <= sg["confidence"] <= 1
 

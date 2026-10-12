@@ -32,6 +32,14 @@ class Board:
         self.lock = threading.RLock()
         with self.lock:
             self.db.executescript(SCHEMA)
+            for col in ("tf TEXT", "kind TEXT"):  # миграция: таймфрейм и вид актива у стратегий
+                try:
+                    self.db.execute(f"ALTER TABLE strategies ADD COLUMN {col}")
+                except sqlite3.OperationalError:
+                    pass
+            self.db.execute("UPDATE strategies SET kind=CASE WHEN symbol LIKE '%/%' THEN 'crypto' ELSE 'stock' END WHERE kind IS NULL")
+            self.db.execute("UPDATE strategies SET tf='1h' WHERE tf IS NULL")
+            self.db.commit()
 
     def q(self, sql, args=()):
         with self.lock:

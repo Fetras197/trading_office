@@ -337,7 +337,7 @@ class Hall:
                 return Result(asset.name, "hold", "dry-run: ордер не отправлен", cid)
             o = self.broker.buy(asset.name, qty, price, stop, take, ts, run_id)
             self.j.update_decision(did, executed=1)
-            order = {**o, "order_id": self.broker.last_order_id, "qty": qty, "stop": stop, "take": take}
+            order = {**o, "order_id": self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"]}
             return Result(asset.name, "opened", f"qty={qty} stop={stop} take={take}", cid, order)
 
     def _close(self, asset, cid, run_id, ts, price, tid, acct):
@@ -346,4 +346,6 @@ class Hall:
             return Result(asset.name, "hold", "dry-run: закрытие не отправлено", cid)
         r = self.broker.sell(asset.name, price, ts, "signal")
         self.j.update_decision(did, executed=1)
-        return Result(asset.name, "closed", f"pnl={r['pnl']:.2f}", cid, {"order_id": self.broker.last_order_id, **r})
+        pos = acct["position"]
+        return Result(asset.name, "closed", f"pnl={r['pnl']:.2f}", cid,
+                      {"order_id": self.broker.last_order_id, **r, "pnl_pct": r["pnl"] / (pos["avg"] * pos["qty"]) if pos["avg"] * pos["qty"] else 0.0})

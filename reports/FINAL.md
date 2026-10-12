@@ -38,7 +38,7 @@ crontab -e  →  */10 * * * * /data/data/com.termux/files/home/projects/trading_
 Прочее: `python -m office screen|summary|accuracy|status` (внутри proot, venv `.venv`), тесты `.venv/bin/python -m pytest`.
 
 ## Приёмка
-- **pytest: 60 passed**, ruff F/E9 чист.
+- **pytest: 68 passed (на 2026-10-12 вечер)**, ruff F/E9 чист.
 - **Живой полный цикл с ордером — ONDO/USD (естественный вход, не подстановка).** Скринер отдал ONDO в top-5; все роли ответили живьём: 4 аналитика (fundamentals — честный abstain, HTTPError CoinGecko для альта), bull/bear ×2, trader buy 0.55, risk_manager *reduce*, PM approve, RiskGate, executor ok. Ордер Alpaca paper: **market buy `43748db5-eb4f-4e3a-8768-a9cf7332c589`**, filled 29049.61 @ 0.51697; защитный stop_limit `c9bdd130-111b-4bb1-8d21-8496b54117e6` (stop 0.5033 / limit 0.4983), take 0.5417 исполняет бот. Цепочка отчётов #273–#284 в `board.db`, текст — `reports/acceptance_chain_ONDO.md`. Позиция осталась открытой, пока supervisor не запущен — она под биржевым стопом; тейк и учёт закрытия подхватит `watch` после `./office.sh start`.
 - **BTC: ответы всех ролей живые (≥6 циклов, цепочка до trader включительно), но trader каждый раз сказал hold** (отрицательный 20д-моментум quant, перекупленность) — ордера на BTC нет. Это не подгонялось (DECISIONS #29).
 - Сквозная проверка акций: `once NVDA --dry-run` — все 7 аналитиков, включая Buffett/Munger/Druckenmiller, и дебаты ответили живьём (ордер не отправлялся: биржа закрыта).
@@ -54,3 +54,11 @@ crontab -e  →  */10 * * * * /data/data/com.termux/files/home/projects/trading_
 - FinBERT/torch не ставились (OOM) — сентимент по заголовкам через Gemini.
 - MCP (alpaca, yfinance, coingecko, tradingview, плагины) — для ручной работы в Claude Code; торговый путь их не использует (DECISIONS #22). При обновлении плагина financial-analysis платные коннекторы включатся снова — отключить.
 - Старый v1-бэктест (убыточный базлайн) и код — `reports/archive/`.
+
+
+## Обновление 2026-10-12 (после запуска владельцем)
+- **office.sh исправлен** (DECISIONS #31): бинд `~/projects → /root/projects`, `restart`, cron-строка без изменений (`*/10 * * * * .../office.sh watchdog`). Применить: `./office.sh restart`; через 2 минуты `./office.sh status` должен показать «supervisor: работает». Проверить в Termux самому: `tail -n 20 logs/supervisor.log`.
+- **Telegram по-русски** (DECISIONS #32): покупка / продажа (стоп-лосс, тейк-профит, решение трейдера) / сводка 6 ч / служебные.
+- **Фундаментальный аналитик** починен (DECISIONS #33).
+- **Лаборатория** расширена: 11 семейств × 3 таймфрейма × стоп-лосс, крипта и акции раздельно (DECISIONS #34).
+- pytest: 68 passed.

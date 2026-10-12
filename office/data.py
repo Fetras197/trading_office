@@ -11,7 +11,7 @@ BINANCE = "https://data-api.binance.vision/api/v3/klines"
 YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
 HL = "https://api.hyperliquid.xyz/info"
 UA = {"User-Agent": "Mozilla/5.0"}
-_IV_MS = {"1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+_IV_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 
 
 def _get(url, **kw):
@@ -20,10 +20,10 @@ def _get(url, **kw):
             r = requests.get(url, headers=UA, timeout=20, **kw)
             r.raise_for_status()
             return r
-        except requests.RequestException:
+        except requests.RequestException as e:
             if i == 2:
                 raise
-            time.sleep(1.5 * (i + 1))
+            time.sleep(25 if getattr(getattr(e, "response", None), "status_code", 0) == 429 else 1.5 * (i + 1))  # 429 CoinGecko: ждём минутное окно
 
 
 def crypto_candles(symbol: str, interval: str = "1h", start_ms: int | None = None,
@@ -150,15 +150,35 @@ def news(query: str, n: int = 8) -> list[dict]:
         return []
 
 
+_FUND_CACHE: dict = {}  # asset.name -> (monotonic ts, result); при ошибке источника отдаём последнее удачное
+
+
 def fundamentals(asset) -> dict:
+    hit = _FUND_CACHE.get(asset.name)
+    if hit and time.monotonic() - hit[0] < 1800:
+        return hit[1]
+    r = _fundamentals(asset)
+    if "error" in r and hit:
+        return hit[1]
+    if "error" not in r:
+        _FUND_CACHE[asset.name] = (time.monotonic(), r)
+    return r
+
+
+def _fundamentals(asset) -> dict:
     try:
         if asset.kind == "crypto":
-            j = _get(f"https://api.coingecko.com/api/v3/coins/{asset.cg_id}",
-                     params={"localization": "false", "tickers": "false", "community_data": "false",
-                             "developer_data": "false"}).json()["market_data"]
-            return {"market_cap_usd": j["market_cap"]["usd"], "circulating_supply": j["circulating_supply"],
-                    "max_supply": j["max_supply"], "ath_change_pct": j["ath_change_percentage"]["usd"],
-                    "change_30d_pct": j["price_change_percentage_30d"]}
+            # /coins/markets ищет по тикеру (symbols=) для любой монеты, а не только для трёх с известным id; берём наибольшую капитализацию
+            q = {"ids": asset.cg_id} if asset.cg_id else {"symbols": asset.hl_coin.lower()}
+            rows = _get("https://api.coingecko.com/api/v3/coins/markets",
+                        params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 1, "price_change_percentage": "7d,30d", **q}).json()
+            if not rows:
+                return {"error": "unavailable: монеты нет в CoinGecko"}
+            j = rows[0]
+            return {"market_cap_usd": j["market_cap"], "market_cap_rank": j["market_cap_rank"], "circulating_supply": j["circulating_supply"],
+                    "max_supply": j["max_supply"], "fully_diluted_valuation": j.get("fully_diluted_valuation"),
+                    "volume_24h_usd": j["total_volume"], "ath_change_pct": j["ath_change_percentage"],
+                    "change_7d_pct": j.get("price_change_percentage_7d_in_currency"), "change_30d_pct": j.get("price_change_percentage_30d_in_currency")}
         import yfinance as yf  # опционально
         info = yf.Ticker(asset.ticker).info
         keys = ["marketCap", "trailingPE", "forwardPE", "priceToBook", "profitMargins", "revenueGrowth",
