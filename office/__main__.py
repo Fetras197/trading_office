@@ -53,8 +53,10 @@ def main(argv=None):
             print("позиции:", [(n, p["qty"], p["avg"], p["stop"], p["take"]) for n, p in s.j.positions().items()])
             print("входов сегодня:", s.j.entries_on(utcnow()[:10]))
             print("кандидаты:", [r["symbol"] for r in s.board.q("SELECT symbol FROM candidates ORDER BY rank")])
-            print("approved стратегий:", s.board.q("SELECT COUNT(DISTINCT symbol||name) n FROM strategies WHERE approved=1")[0]["n"],
-                  "| протестировано символов:", s.board.q("SELECT COUNT(DISTINCT symbol) n FROM strategies")[0]["n"])
+            from . import lab
+            ls = lab.stats(s.board)
+            print(f"лаборатория: прошли строгую проверку (с поправкой на случайность): {ls['strict']} | на испытании: {ls['trial']} | подтверждены вживую: {ls['live']}"
+                  f" | протестировано символов: {s.board.q('SELECT COUNT(DISTINCT symbol) n FROM strategies')[0]['n']}")
             for r in s.board.q("SELECT cycle_id, asset, role, verdict FROM reports WHERE role IN ('trader') ORDER BY id DESC LIMIT 5"):
                 print(r["asset"], r["cycle_id"], r["verdict"][:80])
     return 0

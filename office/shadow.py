@@ -22,8 +22,8 @@ def _now():
 
 
 class Shadow:
-    def __init__(self, board, price_fn, equity_fn, now_fn=_now, lab_fn=None):
-        self.b, self.price, self.equity, self.now, self.lab_fn = board, price_fn, equity_fn, now_fn, lab_fn
+    def __init__(self, board, price_fn, equity_fn, now_fn=_now, lab_fn=None, start_fn=None):
+        self.b, self.price, self.equity, self.now, self.lab_fn, self.start_fn = board, price_fn, equity_fn, now_fn, lab_fn, start_fn   # start_fn: стартовый капитал офиса (журнал)
 
     # ---- состояние ----
     def _cash(self, name):
@@ -70,8 +70,13 @@ class Shadow:
     def step(self) -> dict:
         ts, eq_office = self.now().isoformat(timespec="seconds"), float(self.equity())
         out = {}
+        first = not self.b.q("SELECT 1 FROM shadow_eq WHERE name='office' LIMIT 1")
+        start = (self.start_fn() if self.start_fn else None) or eq_office
+        if first:   # точка отсчёта офиса — стартовый капитал, а не первое попавшееся эквити (иначе убыток закрытых до наблюдения сделок не виден)
+            self.b.x("INSERT INTO shadow_eq(ts,name,equity,cash) VALUES(?,?,?,?)", (ts, "office", start, start))
         self.b.x("INSERT INTO shadow_eq(ts,name,equity,cash) VALUES(?,?,?,?)", (ts, "office", eq_office, eq_office))   # cash офиса не важен: считаем по equity
-        start = self.b.q("SELECT equity FROM shadow_eq WHERE name='office' ORDER BY ts LIMIT 1")[0]["equity"]
+        if not first:
+            start = self.b.q("SELECT equity FROM shadow_eq WHERE name='office' ORDER BY ts, rowid LIMIT 1")[0]["equity"]
         for name in ("spy", "btc", "tech", "lab"):
             cash = self._cash(name)
             if cash is None:                       # старт теневого портфеля: тот же капитал, что был у офиса в начале наблюдения
@@ -109,7 +114,7 @@ class Shadow:
     def summary(self, since: str | None = None) -> list[dict]:
         rows = []
         for name, title in NAMES.items():
-            q = "SELECT ts, equity FROM shadow_eq WHERE name=?" + (" AND ts>=?" if since else "") + " ORDER BY ts"
+            q = "SELECT ts, equity FROM shadow_eq WHERE name=?" + (" AND ts>=?" if since else "") + " ORDER BY ts, rowid"
             ser = self.b.q(q, (name, since) if since else (name,))
             if len(ser) < 1:
                 continue

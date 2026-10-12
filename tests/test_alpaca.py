@@ -150,3 +150,19 @@ def test_fill_during_cancel_is_flagged_not_silently_lost(monkeypatch):
     c.cancel = lambda oid: setattr(c, "fill", True)  # ордер исполнился в момент отмены
     with pytest.raises(AlpacaError, match="в момент отмены"):
         b.buy("AAPL", 10, 100.0, 95.0, 110.0, "t")
+
+
+def test_sync_ignores_dust_and_books_offline_close_with_broker_time():
+    b, c, j = mk()
+    b.buy("AAPL", 10, 100.0, 95.0, 110.0, "2026-10-12T07:00:00+00:00")
+    c._pos = [{"symbol": "AAPL", "market_value": "0.0000009"}]   # пыль после продажи — не позиция
+    c._orders = [{"side": "sell", "status": "filled", "filled_avg_price": "94.9", "filled_at": "2026-10-12T09:00:00Z"}]
+    ev = b.sync({}, "2026-10-12T12:00:00+00:00")
+    assert ev[0][1]["offline"] and ev[0][1]["reason"] == "stop" and not j.positions()
+    assert j.q("SELECT exit_ts, exit FROM trades")[0] == {"exit_ts": "2026-10-12T09:00:00+00:00", "exit": 94.9}
+
+
+def test_orphans_skip_dust():
+    b, c, j = mk()
+    c._pos = [{"symbol": "ONDOUSD", "market_value": "0.0000009"}, {"symbol": "NVDA", "market_value": "500"}]
+    assert b.orphans() == ["NVDA"]

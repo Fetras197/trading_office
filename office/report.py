@@ -131,8 +131,11 @@ def trade_message(board, res) -> str:
     return "\n".join(lines)
 
 
-def close_message(asset: str, pnl: float, pnl_pct: float, reason: str) -> str:
-    if reason == "stop":
+def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: bool = False) -> str:
+    if offline and reason in ("stop", "take"):
+        head = (f"🔴 Продажа {name(asset)} — сработал стоп-лосс (пока офис был выключен)" if reason == "stop"
+                else f"🟢 Продажа {name(asset)} — взят тейк-профит (пока офис был выключен)")
+    elif reason == "stop":
         head = f"🔴 Продажа {name(asset)} — сработал стоп-лосс"
     elif reason == "take":
         head = f"🟢 Продажа {name(asset)} — взят тейк-профит"
@@ -151,7 +154,7 @@ def lab_line(st: dict, appr=None) -> str:
     n = st["crypto"]["n"] + st["stock"]["n"]
     if not n:
         return "Лаборатория: за сутки новых проверок нет"
-    ok = st["crypto"].get("ok", 0) + st["stock"].get("ok", 0)
+    ok = st.get("strict", st["crypto"].get("ok", 0) + st["stock"].get("ok", 0))   # строгая проверка = approved + поправка на множественное тестирование
     return (f"Лаборатория: проверено {n} {plural(n, 'стратегия', 'стратегии', 'стратегий')} (крипта {st['crypto']['n']}, акции {st['stock']['n']}); "
             f"прошли строгую проверку: {ok}; на испытании: {st.get('trial', 0)}; подтверждены вживую: {st.get('live', 0)}")
 

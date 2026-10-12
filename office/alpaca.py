@@ -346,10 +346,22 @@ class AlpacaBroker:
             self.sell(a.name, p["avg"], time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), "no_stop")
             raise AlpacaError(f"защиту {a.name} поставить не удалось — позиция закрыта по рынку ({e})") from e
 
+    DUST_USD = 1.0   # Alpaca оставляет «пыль» после продажи с комиссией в активе (ONDO: 0,00000087 шт.) — это не позиция
+
+    def live_positions(self) -> dict:
+        return {p["symbol"]: p for p in self.c.positions() if abs(float(p.get("market_value") or 0)) >= self.DUST_USD}
+
+    def orphans(self) -> list[str]:
+        """Позиции на брокере, которых нет в журнале офиса (кроме пыли)."""
+        mine = {_sym(self.assets[n].alpaca) for n in self.j.positions()}
+        return [s for s in self.live_positions() if s not in mine]
+
     def sync(self, prices: dict, ts):
-        """Сверка с Alpaca: закрытые стопом/тейком позиции → в журнал; крипто-тейк исполняется здесь. Возвращает список событий."""
+        """Сверка с Alpaca (источник истины): закрытые у брокера позиции → в журнал с ценой и временем из истории ордеров; крипто-тейк исполняется здесь.
+        Возвращает [(имя, {price, pnl, reason, offline})]; offline=True — закрылась задолго до этой сверки (пока офис был выключен)."""
+        import datetime as dt
         events = []
-        live = {p["symbol"]: p for p in self.c.positions()}
+        live = self.live_positions()
         for name, p in list(self.j.positions().items()):
             a = self.assets[name]
             if _sym(a.alpaca) not in live:  # позиции нет на брокере → закрылась по стопу/тейку
@@ -361,8 +373,16 @@ class AlpacaBroker:
                     sells = [o for o in self.c.orders(status="closed", symbols=a.alpaca, direction="desc", limit=10)
                              if o["side"] == "sell" and o["status"] == "filled"]
                 px = float(sells[0]["filled_avg_price"]) if sells else min(prices.get(name, p["stop"]), p["stop"])  # без данных — консервативно
+                fill_ts, offline = ts, False
+                if sells and sells[0].get("filled_at"):
+                    ft = dt.datetime.fromisoformat(sells[0]["filled_at"].replace("Z", "+00:00"))
+                    fill_ts = ft.isoformat(timespec="seconds")
+                    try:
+                        offline = (dt.datetime.fromisoformat(ts) - ft).total_seconds() > 900
+                    except ValueError:
+                        pass
                 reason = "take" if px >= p["avg"] and p["take"] and px >= p["take"] * 0.998 else "stop"
-                events.append((name, self._book_close(name, px, ts, reason)))
+                events.append((name, {**self._book_close(name, px, fill_ts, reason), "offline": offline}))
             elif a.kind == "crypto" and p["take"] and prices.get(name, 0) >= p["take"]:
                 events.append((name, self.sell(name, prices[name], ts, "take")))
         return events

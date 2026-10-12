@@ -56,3 +56,11 @@ def test_stale_signal_ignored():
     sig(b, "market", "X/USD", "buy", 0.9, 1.0, T0 - dt.timedelta(hours=5))
     s.step()
     assert not s._positions("tech")
+
+
+def test_office_baseline_is_start_equity_from_journal():
+    b = Board()
+    s = shadow.Shadow(b, lambda a: 100.0, lambda: 99_509.64, lambda: T0, start_fn=lambda: 100_000.0)
+    s.step()
+    r = {x["name"]: x for x in s.summary()}
+    assert abs(r["office"]["ret"] - (99_509.64 / 100_000 - 1)) < 1e-12 and r["spy"]["start"] == 100_000.0

@@ -355,6 +355,7 @@ def stats(board, hours: int = 24) -> dict:
         r = board.q("SELECT COUNT(*) n, COALESCE(SUM(approved),0) raw_ok, COALESCE(SUM(mt),0) ok, COUNT(DISTINCT symbol) syms FROM strategies WHERE name!='nodata' AND COALESCE(kind,'stock')=? AND ts>=datetime('now',?)",
                     (kind, f"-{hours} hours"))[0]
         out[kind] = r
+    out["strict"] = board.q("SELECT COUNT(*) n FROM (SELECT DISTINCT symbol, name, COALESCE(tf,'1h') FROM strategies WHERE mt=1 AND ts>=datetime('now','-30 days'))")[0]["n"]
     t = {r["status"]: r["n"] for r in board.q("SELECT status, COUNT(*) n FROM lab_trial GROUP BY status")}
     out["trial"], out["live"], out["failed"] = t.get("trial", 0), t.get("live", 0), t.get("failed", 0)
     return out

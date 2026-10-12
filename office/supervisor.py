@@ -38,7 +38,7 @@ class Supervisor:
         self.next = {"screen": 0.0, "cycle": 0.0, "summary": time.time() + SUMMARY_S}
         self.it = it.ITDept(self.j, notify)
         self.manager = manage.Manager(self.broker, self.j, self.client, notify)
-        self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"], lab_fn=lambda: lab.shadow_signals(self.board))
+        self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"], lab_fn=lambda: lab.shadow_signals(self.board), start_fn=lambda: self.j.kv_get("start_equity"))
         self.sched = scheduler.Scheduler(self.j, self.jobs())
 
     def scope(self) -> dict:
@@ -177,9 +177,13 @@ class Supervisor:
         for name, ev in self.broker.sync(prices, utcnow()):
             t = self.j.q("SELECT entry, qty FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
             cost = t[0]["entry"] * t[0]["qty"] if t else 0
-            self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"]))
+            self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"], ev.get("offline", False)))
             self.sched.trigger("portfolio")
             self.sched.trigger("review")
+        for sym in self.broker.orphans():   # на брокере есть позиция, которой нет в журнале — молча не игнорируем
+            if self.j.kv_get(f"orphan:{sym}") is None:
+                self.j.kv_set(f"orphan:{sym}", utcnow())
+                self.notify(f"⚠️ У брокера открыта позиция {report.pos_name(sym)}, которой нет в журнале офиса. Проверьте её вручную: офис её не сопровождает.")
         eq = self.broker.equity()
         self.j.snap_equity(utcnow(), eq)
         if self.j.kv_get("start_equity") is None:
@@ -202,6 +206,10 @@ class Supervisor:
         return out[:it.ECON_ASSETS if econ else MAX_ASSETS]
 
     def cycle(self):
+        try:
+            self.watch()   # состояние позиций берём у брокера в начале каждого цикла
+        except Exception as e:  # noqa: BLE001
+            print(f"{utcnow()} сверка с брокером: {type(e).__name__}: {str(e)[:120]}", flush=True)
         if config.STOP_FILE.exists():
             return
         res = []
@@ -275,6 +283,10 @@ class Supervisor:
         except OSError:
             raise SystemExit("supervisor уже запущен")
         self.it.on_start()
+        try:
+            self.watch()   # при старте: закрытое у брокера, пока офис был выключен, попадает в журнал и в Telegram
+        except Exception as e:  # noqa: BLE001
+            print(f"{utcnow()} стартовая сверка: {type(e).__name__}: {str(e)[:120]}", flush=True)
         self.notify(report.service("start"))
         threading.Thread(target=self.research_loop, name="research", daemon=True).start()
         threading.Thread(target=tgbot.TgBot(self).run, name="tgbot", daemon=True).start()
