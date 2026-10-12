@@ -3,13 +3,14 @@
 approved <=> OOS Sharpe > buy&hold И |OOS maxDD| < |maxDD buy&hold| И >=30 сделок OOS (+ OOS доходность > 0, защита от множественных сравнений).
 Approved-стратегии пишутся в board.strategies и голосуют в зале как аналитик 'lab'."""
 import json
+import math
 import time
 
 import numpy as np
 import pandas as pd
 import talib as ta
 
-from . import data
+from . import data, regime
 from .config import COSTS, make_asset
 
 TRAIN_D, TEST_D = 122, 61  # 4 и 2 месяца
@@ -169,7 +170,28 @@ def walk_forward(df: pd.DataFrame, family: str, fee: float) -> dict | None:
     res = {"family": family, "params": params[cur], "oos_sharpe": _sharpe(r, ppy), "bh_sharpe": _sharpe(b, ppy), "oos_dd": _maxdd(r), "bh_dd": _maxdd(b),
            "oos_return": float((1 + r).prod() - 1), "bh_return": float((1 + b).prod() - 1), "trades": trades, "folds": len(folds)}
     res["approved"] = is_approved(res)
+    daily = (1 + r).groupby(r.index.floor("D")).prod() - 1      # OOS-доходность по дням: независимее, чем по барам
+    res["p_value"] = p_value(daily)
+    res["regime_perf"] = regime_perf(daily, df)
     return res
+
+
+def p_value(daily: pd.Series) -> float:
+    """Односторонний p-value гипотезы «средняя дневная OOS-доходность > 0» (нормальное приближение t-статистики). Меньше = убедительнее."""
+    d = daily.dropna()
+    if len(d) < 30 or not d.std():
+        return 1.0
+    z = float(d.mean() / d.std(ddof=1) * math.sqrt(len(d)))
+    return 0.5 * math.erfc(z / math.sqrt(2))
+
+
+def regime_perf(daily: pd.Series, df: pd.DataFrame) -> dict:
+    """Средняя дневная OOS-доходность стратегии по режимам рынка символа (trend / sideways / high_vol)."""
+    try:
+        d = df.resample("1D").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+        return regime.mean_returns_by_regime(daily, regime.labels(d))
+    except Exception:  # noqa: BLE001 — режимы вспомогательны
+        return {}
 
 
 def is_approved(r: dict) -> bool:
@@ -208,14 +230,38 @@ def test_symbol(board, symbol: str, tfs=TIMEFRAMES) -> list[dict]:
             if not r:
                 continue
             r["tf"] = tf
-            board.x("INSERT INTO strategies(ts,symbol,name,params,approved,oos_sharpe,bh_sharpe,oos_dd,bh_dd,trades,data,tf,kind) VALUES(datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (symbol, fam, json.dumps(r["params"]), int(r["approved"]), r["oos_sharpe"], r["bh_sharpe"], r["oos_dd"], r["bh_dd"], r["trades"], json.dumps(r), tf, a.kind))
+            board.x("INSERT INTO strategies(ts,symbol,name,params,approved,oos_sharpe,bh_sharpe,oos_dd,bh_dd,trades,data,tf,kind,p) VALUES(datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (symbol, fam, json.dumps(r["params"]), int(r["approved"]), r["oos_sharpe"], r["bh_sharpe"], r["oos_dd"], r["bh_dd"], r["trades"], json.dumps(r), tf, a.kind, r.get("p_value")))
             out.append(r)
+    multitest(board)
     return out
 
 
-def approved(board, symbol: str, max_age_days: int = 30) -> list[dict]:
-    rows = board.q("SELECT * FROM strategies WHERE symbol=? AND approved=1 AND ts>=datetime('now',?) ORDER BY id DESC", (symbol, f"-{max_age_days} days"))
+def multitest(board, q: float = 0.10, days: int = 30) -> int:
+    """Поправка на множественное тестирование (Benjamini–Hochberg, FDR q) по ВСЕМ тестам за `days` дней (по последнему тесту каждой комбинации
+    символ/семейство/ТФ): при сотнях проб часть «approved» неизбежно случайна. mt=1 — approved И p-значение прошло порог BH. Критерии approved не менялись.
+    Старые строки без p-значения поправку не проходят. Возвращает число прошедших."""
+    rows = board.q("SELECT id, symbol, name, tf, approved, p FROM strategies WHERE name!='nodata' AND p IS NOT NULL AND ts>=datetime('now',?) ORDER BY id", (f"-{days} days",))
+    latest = {}
+    for r in rows:
+        latest[(r["symbol"], r["name"], r["tf"])] = r
+    items = sorted(latest.values(), key=lambda r: r["p"])
+    m = len(items)
+    kmax = max((k for k, r in enumerate(items, 1) if r["p"] <= k / m * q), default=0) if m else 0
+    thr = items[kmax - 1]["p"] if kmax else -1
+    board.x("UPDATE strategies SET mt=0 WHERE mt IS NOT NULL OR p IS NOT NULL")
+    ok = [r["id"] for r in items if r["approved"] and r["p"] <= thr]
+    for i in ok:
+        board.x("UPDATE strategies SET mt=1 WHERE id=?", (i,))
+    return len(ok)
+
+
+def approved(board, symbol: str, max_age_days: int = 30, include_trial: bool = False) -> list[dict]:
+    """Стратегии символа с правом голоса: approved + поправка BH (mt=1) + подтверждены вживую (lab_trial.status='live').
+    include_trial=True — ещё и испытуемые (для теневого портфеля лаборатории)."""
+    st = ("trial", "live") if include_trial else ("live",)
+    rows = board.q("SELECT s.* FROM strategies s JOIN lab_trial t ON t.symbol=s.symbol AND t.name=s.name AND t.tf=COALESCE(s.tf,'1h') "
+                   f"WHERE s.symbol=? AND s.approved=1 AND s.mt=1 AND t.status IN ({','.join('?' * len(st))}) AND s.ts>=datetime('now',?) ORDER BY s.id DESC", (symbol, *st, f"-{max_age_days} days"))
     seen, out = set(), []
     for r in rows:
         key = (r["name"], r.get("tf") or "1h")
@@ -223,6 +269,10 @@ def approved(board, symbol: str, max_age_days: int = 30) -> list[dict]:
             seen.add(key)
             out.append(r)
     return out
+
+
+def live_symbols(board) -> set[str]:
+    return {r["symbol"] for r in board.q("SELECT DISTINCT symbol FROM lab_trial WHERE status='live'")}
 
 
 def state_now(df: pd.DataFrame, family: str, params: dict) -> bool:
@@ -237,30 +287,74 @@ def state_now(df: pd.DataFrame, family: str, params: dict) -> bool:
     return le > lx
 
 
-def signal_for(board, symbol: str) -> dict | None:
-    """Голос лаборатории для зала: None, если у актива нет approved-стратегий."""
-    strats = approved(board, symbol)
+_REG_CACHE: dict = {}
+
+
+def symbol_regime(symbol: str) -> str | None:
+    """Текущий режим символа по его дневным барам (кэш 1 ч)."""
+    hit = _REG_CACHE.get(symbol)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    a = make_asset(symbol)
+    try:
+        d = data.crypto_candles(a.ticker, "1d", limit=250) if a.kind == "crypto" else data.stock_candles(a.ticker, "1d", "1y")
+        val = regime.labels(d).dropna().iloc[-1]
+    except Exception:  # noqa: BLE001
+        val = None
+    _REG_CACHE[symbol] = (time.time(), val)
+    return val
+
+
+def regime_ok(strategy: dict, current: str | None) -> bool:
+    """Стратегия голосует «за» только в режиме, где её OOS-результат был положительным (≥10 дней наблюдений). Нет разбивки/режима — не фильтруем."""
+    if current is None:
+        return True
+    perf = (json.loads(strategy["data"]) if isinstance(strategy.get("data"), str) and strategy.get("data") else {}).get("regime_perf") or {}
+    cur = perf.get(current)
+    return True if not perf else bool(cur and cur["days"] >= 10 and cur["mean"] > 0)
+
+
+def signal_for(board, symbol: str, include_trial: bool = False) -> dict | None:
+    """Голос лаборатории для зала: None, если у актива нет стратегий с правом голоса (approved + поправка + подтверждение вживую)."""
+    strats = approved(board, symbol, include_trial=include_trial)
     if not strats:
         return None
     dfs, longs = {}, []
+    cur = symbol_regime(symbol)
     for s in strats:
         tf = s.get("tf") or "1h"
         if tf not in dfs:
             dfs[tf] = history(symbol, tf, SIGNAL_D[tf])
-        longs.append((f"{s['name']}/{tf}", state_now(dfs[tf], s["name"], json.loads(s["params"]))))
+        longs.append((f"{s['name']}/{tf}", state_now(dfs[tf], s["name"], json.loads(s["params"])) and regime_ok(s, cur)))
     n_long = sum(1 for _, v in longs if v)
     stance = "buy" if n_long * 2 > len(longs) else "hold"
     best = max(strats, key=lambda s: s["oos_sharpe"])
     conf = round(min(0.8, 0.5 + 0.1 * max(0.0, best["oos_sharpe"] - best["bh_sharpe"])), 2) if stance == "buy" else 0.5
     desc = ", ".join(f"{n}={'long' if v else 'flat'}" for n, v in longs)
-    return {"stance": stance, "confidence": conf, "rationale": f"approved стратегии: {desc} (OOS Sharpe {best['oos_sharpe']:.2f} vs B&H {best['bh_sharpe']:.2f})"}
+    price = float(next(iter(dfs.values()))["close"].iloc[-1])
+    return {"stance": stance, "confidence": conf, "price": price, "rationale": f"approved стратегии: {desc} (OOS Sharpe {best['oos_sharpe']:.2f} vs B&H {best['bh_sharpe']:.2f}, режим {cur})"}
+
+
+def shadow_signals(board) -> list[tuple[str, float, float]]:
+    """Сигналы для теневого портфеля «только стратегии лаборатории»: approved + поправка, включая испытуемые."""
+    out = []
+    for sym in [r["symbol"] for r in board.q("SELECT DISTINCT symbol FROM lab_trial WHERE status IN ('trial','live')")]:
+        try:
+            sg = signal_for(board, sym, include_trial=True)
+        except Exception:  # noqa: BLE001
+            continue
+        if sg and sg["stance"] == "buy":
+            out.append((sym, sg["confidence"], sg["price"]))
+    return sorted(out, key=lambda x: -x[1])[:3]
 
 
 def stats(board, hours: int = 24) -> dict:
-    """Сводка лаборатории отдельно по крипте и акциям (для Telegram)."""
+    """Сводка лаборатории отдельно по крипте и акциям (для Telegram): проверено, прошли approved, прошли поправку; испытание и подтверждённые."""
     out = {}
     for kind in ("crypto", "stock"):
-        r = board.q("SELECT COUNT(*) n, COALESCE(SUM(approved),0) ok, COUNT(DISTINCT symbol) syms FROM strategies WHERE name!='nodata' AND COALESCE(kind,'stock')=? AND ts>=datetime('now',?)",
+        r = board.q("SELECT COUNT(*) n, COALESCE(SUM(approved),0) raw_ok, COALESCE(SUM(mt),0) ok, COUNT(DISTINCT symbol) syms FROM strategies WHERE name!='nodata' AND COALESCE(kind,'stock')=? AND ts>=datetime('now',?)",
                     (kind, f"-{hours} hours"))[0]
         out[kind] = r
+    t = {r["status"]: r["n"] for r in board.q("SELECT status, COUNT(*) n FROM lab_trial GROUP BY status")}
+    out["trial"], out["live"], out["failed"] = t.get("trial", 0), t.get("live", 0), t.get("failed", 0)
     return out

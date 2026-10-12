@@ -72,7 +72,7 @@ def scan(board, alpaca_client, stocks_open: bool, top_n: int = 5, exclude: set |
                 bars.update(data.alpaca_bars(syms[i:i + 150], kind, days=100))
             except Exception:  # noqa: BLE001 — пачка не пришла: остальные считаем
                 continue
-    appr = {r["symbol"] for r in board.q("SELECT DISTINCT symbol FROM strategies WHERE approved=1 AND ts>=datetime('now','-30 days')")}
+    appr = lab.live_symbols(board)
     rows = []
     for sym, df in bars.items():
         m = metrics(df)

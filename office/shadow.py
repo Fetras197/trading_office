@@ -22,8 +22,8 @@ def _now():
 
 
 class Shadow:
-    def __init__(self, board, price_fn, equity_fn, now_fn=_now):
-        self.b, self.price, self.equity, self.now = board, price_fn, equity_fn, now_fn
+    def __init__(self, board, price_fn, equity_fn, now_fn=_now, lab_fn=None):
+        self.b, self.price, self.equity, self.now, self.lab_fn = board, price_fn, equity_fn, now_fn, lab_fn
 
     # ---- состояние ----
     def _cash(self, name):
@@ -47,6 +47,8 @@ class Shadow:
 
     def signals(self, name) -> list[tuple[str, float, float]]:
         """[(asset, conf, price)] — активы с актуальным buy от роли портфеля, лучшие первыми."""
+        if name == "lab" and self.lab_fn:   # approved + поправка, включая стратегии на испытательном сроке (они торгуются здесь)
+            return self.lab_fn()
         since = (self.now() - dt.timedelta(hours=SIGNAL_MAX_AGE_H)).isoformat(timespec="seconds")
         latest = {}
         for r in self.b.q("SELECT asset, confidence, data FROM reports WHERE role=? AND ts>=? ORDER BY id", (SIGNAL_ROLE[name], since)):

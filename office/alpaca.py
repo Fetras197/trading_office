@@ -239,6 +239,113 @@ class AlpacaBroker:
         self.j.add_fill(ts, name, "sell", p["qty"], price, exit_fee, reason, p["run_id"])
         return {"price": price, "pnl": pnl, "reason": reason}
 
+    # ---------- сопровождение позиции (3.2): стоп только вверх, частичная фиксация ----------
+    def _open_sells(self, a):
+        return [o for o in self.c.orders(status="open", symbols=a.alpaca) if o.get("side") == "sell"]
+
+    def _install_stop(self, a, qty, stop, take=None):
+        """Защитный ордер на остаток: крипто — stop_limit, акции — OCO (стоп + тейк). Возвращает id (или None для акций с OCO)."""
+        if a.kind == "crypto":
+            so = self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(qty * 1e6) / 1e6:.6f}", "side": "sell", "type": "stop_limit", "time_in_force": "gtc",
+                                "stop_price": f"{stop:.4f}", "limit_price": f"{stop * 0.99:.4f}"})
+            return so["id"]
+        body = {"symbol": a.alpaca, "qty": str(int(qty)), "side": "sell", "type": "limit", "time_in_force": "gtc", "order_class": "oco",
+                "stop_loss": {"stop_price": f"{stop:.2f}"}, "take_profit": {"limit_price": f"{(take or stop * 1.1):.2f}"}}
+        return self.c.submit(body)["id"]
+
+    def move_stop(self, name, new_stop):
+        """Поднять защитный стоп (никогда не опускает). True, если стоп переставлен."""
+        p = self.position(name)
+        if not p or new_stop <= p["stop"]:
+            return False
+        a = self.assets[name]
+        done = False
+        for o in self._open_sells(a):
+            if o.get("type") in ("stop", "stop_limit"):
+                body = {"stop_price": f"{new_stop:.4f}" if a.kind == "crypto" else f"{new_stop:.2f}"}
+                if o.get("type") == "stop_limit":
+                    body["limit_price"] = f"{new_stop * 0.99:.4f}" if a.kind == "crypto" else f"{new_stop * 0.99:.2f}"
+                try:
+                    r = self.c._req("PATCH", f"/orders/{o['id']}", json=body)   # Alpaca replace создаёт НОВЫЙ ордер с новым id
+                    if a.kind == "crypto" and r.get("id"):
+                        self.j.kv_set(f"stop_oid:{name}", r["id"])
+                    done = True
+                except AlpacaError:
+                    done = self._restop(a, p, new_stop, o)   # замена не принята: отмена и новый ордер (с откатом)
+        if done:
+            self.j._x("UPDATE positions SET stop=? WHERE asset=?", (new_stop, name))
+        return done
+
+    def _restop(self, a, p, new_stop, old):
+        qty = float(old["qty"])
+        try:
+            self.c.cancel(old["id"])
+            time.sleep(1)
+            oid = self._install_stop(a, qty, new_stop, p["take"])
+        except AlpacaError:
+            try:   # откат: вернуть прежний стоп, чтобы позиция не осталась без защиты
+                oid = self._install_stop(a, qty, p["stop"], p["take"])
+            except AlpacaError as e:
+                self.sell(a.name, p["avg"], time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), "no_stop")
+                raise AlpacaError(f"стоп {a.name} не удалось переставить и вернуть — позиция закрыта по рынку ({e})") from e
+            if a.kind == "crypto":
+                self.j.kv_set(f"stop_oid:{a.name}", oid)
+            return False
+        if a.kind == "crypto":
+            self.j.kv_set(f"stop_oid:{a.name}", oid)
+        return True
+
+    def sell_part(self, name, frac, ts, new_stop, reason="partial"):
+        """Продать долю позиции по рынку и сразу поставить защиту на остаток (стоп new_stop, тейк прежний). Возвращает {'price','pnl','qty'} или None."""
+        p = self.position(name)
+        if not p:
+            return None
+        a = self.assets[name]
+        for o in self._open_sells(a):
+            try:
+                self.c.cancel(o["id"])
+            except AlpacaError:
+                pass
+        time.sleep(1)
+        live = self.c.position(a.alpaca)
+        have = float(live["qty_available"]) if live else p["qty"]
+        sell_q = math.floor(have * frac * 1e6) / 1e6 if a.kind == "crypto" else int(have * frac)
+        rest = have - sell_q
+        price_hint = float(live["current_price"]) if live else p["avg"]
+        if sell_q <= 0 or sell_q * price_hint < 10 or rest * price_hint < 10:
+            self._reprotect(a, p, have, p["stop"])
+            return None
+        try:
+            o = self._wait_fill(self.c.submit({"symbol": a.alpaca, "qty": f"{sell_q:.6f}" if a.kind == "crypto" else str(sell_q), "side": "sell", "type": "market", "time_in_force": "gtc"})["id"])
+        except AlpacaError:
+            self._reprotect(a, p, have, p["stop"])
+            raise
+        if o["status"] != "filled":
+            self._reprotect(a, p, have, p["stop"])
+            raise AlpacaError(f"частичная продажа не исполнена: {o['status']}")
+        px = float(o["filled_avg_price"])
+        live2 = self.c.position(a.alpaca)
+        rest = float(live2["qty_available"]) if live2 else rest
+        self._reprotect(a, p, rest, max(new_stop, p["stop"]))
+        exit_fee = sell_q * px * COSTS[a.kind].fee
+        entry_fee = p["fees"] * sell_q / p["qty"] if p["qty"] else 0.0
+        pnl = (px - p["avg"]) * sell_q - entry_fee - exit_fee
+        risk = sell_q * (p["avg"] - p["stop"])
+        self.j._x("INSERT INTO trades(asset,entry_ts,exit_ts,entry,exit,qty,fees,pnl,r_mult,run_id,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (name, p["opened_ts"], ts, p["avg"], px, sell_q, entry_fee + exit_fee, pnl, pnl / risk if risk > 0 else None, p["run_id"], reason))
+        self.j._x("UPDATE positions SET qty=?, fees=?, stop=? WHERE asset=?", (rest, p["fees"] - entry_fee, max(new_stop, p["stop"]), name))
+        self.j.add_fill(ts, name, "sell", sell_q, px, exit_fee, reason, p["run_id"])
+        return {"price": px, "pnl": pnl, "qty": sell_q}
+
+    def _reprotect(self, a, p, qty, stop):
+        try:
+            oid = self._install_stop(a, qty, stop, p["take"])
+            if a.kind == "crypto":
+                self.j.kv_set(f"stop_oid:{a.name}", oid)
+        except AlpacaError as e:   # без защиты не оставляем
+            self.sell(a.name, p["avg"], time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), "no_stop")
+            raise AlpacaError(f"защиту {a.name} поставить не удалось — позиция закрыта по рынку ({e})") from e
+
     def sync(self, prices: dict, ts):
         """Сверка с Alpaca: закрытые стопом/тейком позиции → в журнал; крипто-тейк исполняется здесь. Возвращает список событий."""
         events = []

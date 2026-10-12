@@ -7,7 +7,7 @@ import hashlib
 import math
 import threading
 
-from . import config, data, events, memory, portfolio, sources
+from . import config, data, events, memory, portfolio, regime, sources
 from .board import PICTURE_MAX_AGE_H, age_h
 from .llm import LLMError, LLMUnavailable
 
@@ -350,6 +350,20 @@ class Research:
         except LLMError:
             out = {"summary": "Оценка по правилам: " + ("; ".join(d["flags"]) or "перекосов не найдено"), "risk_level": "medium" if d["flags"] else "low", "suggestions": []}
         return self._publish("portfolio_an", out["summary"], 0.7, {**d, **out, "reason": reason})
+
+    # ---------- 3.1 режим рынка (код, без LLM) ----------
+    def run_regime(self) -> int:
+        snap = regime.snapshot(lambda a: data.candles(a, "1d", **({"limit": 150} if a.kind == "crypto" else {"rng": "1y"})), lambda: sources.yahoo_close("^VIX", "1mo").iloc[-1])
+        if not snap.get("crypto") and not snap.get("stock"):
+            raise LLMError("regime: нет данных")
+        prev = self.board.latest("regime", max_age_h=12)
+        parts = [f"{t}: {regime.RU[snap[k]['regime']]} ({'; '.join(snap[k]['why'])})" for k, t in (("crypto", "Крипта"), ("stock", "Акции")) if snap.get(k)]
+        rid = self._publish("regime", ". ".join(parts), 1.0, snap)
+        for k, t in (("crypto", "крипторынке"), ("stock", "рынке акций")):
+            now_r, was = (snap.get(k) or {}).get("regime"), ((prev or {}).get("data", {}).get(k) or {}).get("regime")
+            if now_r == "panic" and was != "panic":
+                self.notify(f"🚨 Паника на {t}: {'; '.join(snap[k]['why'])}. Новые покупки запрещены, пока режим не сменится.")
+        return rid
 
     # ---------- 1.7 картина дня ----------
     def picture_inputs(self) -> dict:

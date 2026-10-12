@@ -9,7 +9,7 @@ import fcntl
 import threading
 import time
 
-from . import accuracy, config, data, events, lab, report, research, review, scheduler, screener, shadow, weights
+from . import accuracy, config, data, events, lab, labtrial, manage, report, research, review, scheduler, screener, shadow, smartmoney, weights
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
@@ -34,9 +34,10 @@ class Supervisor:
         self.research = research.Research(self.board, self.j, self.client, self.router, self.scope, notify=notify)
         self.research.on_urgent = self.urgent
         self.hall = hall or Hall(self.board, self.j, self.broker, self.router, ClaudeBackend(), notify=notify,
-                                 lab=lambda s: self._lab(s), picture=self.research.ensure_picture)
+                                 lab=lambda s: self._lab(s), picture=self.research.ensure_picture, smart=smartmoney.signal_for)
         self.next = {"screen": 0.0, "cycle": 0.0, "summary": time.time() + SUMMARY_S}
-        self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"])
+        self.manager = manage.Manager(self.broker, self.j, self.client, notify)
+        self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"], lab_fn=lambda: lab.shadow_signals(self.board))
         self.sched = scheduler.Scheduler(self.j, self.jobs())
 
     def scope(self) -> dict:
@@ -52,6 +53,10 @@ class Supervisor:
                 J("crypto", R.run_crypto, every=3600),
                 J("sectors", R.run_sectors, at=["07:10"], catchup_h=8),
                 J("portfolio", R.run_portfolio, at=["07:20"], catchup_h=8),
+                J("manage", self.manager.run, every=300),
+                J("smartmoney", smartmoney.refresh, every=1800),
+                J("regime", R.run_regime, every=1800),
+                J("labtrial", lambda: labtrial.promote(self.board), every=3600),
                 J("shadow", self.shadow.step, every=3600),
                 J("review", self.run_review, every=1800),
                 J("weights", lambda: weights.propose(self.board), at=["06:50"], catchup_h=12),
@@ -171,8 +176,7 @@ class Supervisor:
 
     def summary(self):
         view, now = self.client.account_view(), utcnow()
-        appr = self.board.q("SELECT symbol, name, tf FROM strategies WHERE approved=1 AND ts>=datetime('now','-1 day') ORDER BY oos_sharpe DESC LIMIT 3")
-        text = report.summary_message(view, self.bench(), self.j.entries_on(now[:10]), report.lab_line(lab.stats(self.board), appr))
+        text = report.summary_message(view, self.bench(), self.j.entries_on(now[:10]), report.lab_line(lab.stats(self.board)))
         acc = accuracy.role_accuracy(self.board)
         if acc:
             text += "\nТочность оценок: " + ", ".join(f"{report.ACC_RU[a['role']]} {a['accuracy'] * 100:.0f}%".replace(".", ",") for a in acc if a["role"] in report.ACC_RU)

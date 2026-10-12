@@ -185,5 +185,17 @@ def test_supervisor_wiring_without_running_anything():
         def account_view(self): return {}
         def price(self, s): return 1.0
     s = Supervisor(board=Board(), journal=Journal(), client=C(), hall=object(), notify=lambda t: None)
-    assert [j.name for j in s.sched.jobs] == ["events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "shadow", "review", "weights", "picture"]
+    names = [j.name for j in s.sched.jobs]
+    assert set(names) == {"events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "labtrial", "regime", "shadow", "review", "weights", "picture"}
+    assert names.index("events") < names.index("macro") < names.index("picture")   # порядок первичного наполнения: картина дня — последняя
     assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []}
+
+
+def test_polymarket_parsing_sorted_and_closed_markets_dropped(monkeypatch):
+    ev = {"events": [{"title": "Fed Decision in October?", "active": True, "closed": False, "volume": "3000000", "endDate": "2026-10-29T03:59:00Z",
+                      "markets": [{"question": "no change", "outcomePrices": "[\"0.835\", \"0.165\"]", "closed": False}, {"question": "hike 25", "outcomePrices": "[\"0.165\", \"0.835\"]", "closed": False},
+                                  {"question": "old", "outcomePrices": "[\"0.5\", \"0.5\"]", "closed": True}, {"question": "broken", "outcomePrices": "oops", "closed": False}]},
+                     {"title": "Closed one", "active": True, "closed": True, "volume": "9", "markets": [{"question": "x", "outcomePrices": "[\"1\",\"0\"]"}]}]}
+    monkeypatch.setattr(sources, "_get_json", lambda url, **kw: ev)
+    out = sources.polymarket(("fed decision",), per_query=3)
+    assert len(out) == 1 and [m["yes"] for m in out[0]["markets"]] == [0.835, 0.165] and out[0]["ends"] == "2026-10-29"

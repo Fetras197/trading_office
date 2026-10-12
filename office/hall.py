@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
 from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
 
-from . import agents, data, events, factcheck, portfolio, review, weights
+from . import agents, data, events, factcheck, portfolio, regime, review, weights
 from .board import PICTURE_MAX_AGE_H, RejectedReport
 from . import config
 from .config import COSTS, Limits, make_asset
@@ -80,9 +80,10 @@ def _refs(raw: dict, role: str) -> tuple[list[int], dict]:
 
 
 class Hall:
-    def __init__(self, board, journal, broker, router, claude, lab=None, notify=None, limits: Limits = Limits(), auto_trade=True, picture=None):
+    def __init__(self, board, journal, broker, router, claude, lab=None, notify=None, limits: Limits = Limits(), auto_trade=True, picture=None, smart=None):
         self.board, self.j, self.broker, self.router, self.claude = board, journal, broker, router, claude
         self.picture = picture or (lambda: board.latest('picture', max_age_h=PICTURE_MAX_AGE_H))  # актуальная «Картина дня» (обязательна для ссылок)
+        self.smart = smart   # coin -> {stance, confidence, rationale} | None (умные деньги, 3.3)
         self.lab, self.notify, self.gate, self.auto_trade = lab, notify or (lambda t: None), RiskGate(limits), auto_trade
         self.exec_lock = threading.Lock()
 
@@ -158,6 +159,14 @@ class Hall:
                 rid = self.board.publish(cid, "lab", asset.name, f"{sig['stance']}: {sig['rationale']}", sig["confidence"],
                                          data={**sig, "price": b["indicators_1h"]["close"]})
                 out.append({"id": rid, "role": "lab", **sig})
+        if self.smart and asset.kind == "crypto":
+            try:
+                sm = self.smart(asset.hl_coin)
+            except Exception:  # noqa: BLE001 — внешний источник не критичен
+                sm = None
+            if sm:
+                rid = self.board.publish(cid, "smartmoney", asset.name, f"{sm['stance']}: {sm['rationale']}", sm["confidence"], data={**sm, "price": b["indicators_1h"]["close"]})
+                out.append({"id": rid, "role": "smartmoney", "stance": sm["stance"], "confidence": sm["confidence"], "rationale": sm["rationale"]})
         return out
 
     def _research_ctx(self, asset) -> dict:
@@ -234,7 +243,7 @@ class Hall:
         live = [r for r in analysts if r["stance"] != "abstain"]
         by = lambda *roles: self._tagged([r for r in live if r["role"] in roles]) or "(no report)"  # noqa: E731
         state = {"company_of_interest": asset.alpaca, "asset_type": asset.kind,
-                 "market_report": by("market", "quant", "lab") + "\n" + self._pic_line(pic), "sentiment_report": by(*INVESTORS) if asset.kind == "stock" else by("quant"),
+                 "market_report": by("market", "quant", "lab", "smartmoney") + "\n" + self._pic_line(pic), "sentiment_report": by(*INVESTORS) if asset.kind == "stock" else by("quant"),
                  "news_report": by("news"), "fundamentals_report": by("fundamentals"),
                  "investment_debate_state": {"history": "", "bull_history": "", "bear_history": "", "current_response": "", "count": 0}}
         duck = DebateLLM(self.claude)
@@ -303,6 +312,11 @@ class Hall:
         if not pic:
             raise Skip("нет актуальной «Картины дня» — без неё зал не работает")
         pd_ = pic["data"]
+        rg = regime.current(self.board, asset.kind)          # режим рынка (3.1); нет свежего — ограничений нет
+        rname = rg["regime"] if rg else None
+        if not acct["position"] and rname == "panic":
+            self.j.set_summary(run_id, "skip: режим паника")
+            return Result(asset.name, "hold", "режим рынка: паника — новые входы запрещены", cid)
         if not acct["position"]:  # запреты исследовательского отдела: до LLM-вызовов (экономия бюджета)
             why = (f"событие: {events.blocked(self.board, asset.name, asset.kind)}" if events.blocked(self.board, asset.name, asset.kind) else
                    "картина дня: новые входы запрещены" if pd_.get("no_new_entries") else
@@ -315,7 +329,7 @@ class Hall:
         for r in analysts:   # роль, отключённая владельцем (после «да»), не голосует
             if wts.get(r["role"], {}).get("disabled"):
                 r["stance"], r["confidence"] = "abstain", 0.0
-            r["weight"] = weights.weight_of(wts, r["role"])
+            r["weight"] = round(weights.weight_of(wts, r["role"]) * regime.prior(rname, r["role"]), 3)
             r["conf_calibrated"] = weights.calibrated_conf(st, r["role"], r["confidence"])
         live = [r for r in analysts if r["stance"] != "abstain"]
         if len(live) < 2:
@@ -343,7 +357,7 @@ class Hall:
                         "rationale": f"{pd_.get('summary', '')} Risks: {'; '.join(pd_.get('main_risks', []))}. Forbidden today: {'; '.join(pd_.get('forbidden', []))}"})
         tp = {"asset": asset.name, "price": price, "atr14": atr, "account": acct, "position": acct["position"], "reports": reports,
               "day_picture": {"regime": pd_.get("regime"), "size_mult": pd_.get("size_mult"), "priority_assets": pd_.get("priority_assets"), "expectation": pd_.get("expectation")},
-              "research": self._research_ctx(asset), "weighted_vote": weights.weighted_vote(live, wts), "lessons": review.lessons_for(self.board, asset.name, asset.kind)}
+              "research": self._research_ctx(asset), "market_regime": {"regime": rname, "why": (rg or {}).get("why"), "guidance": regime.GUIDANCE.get(rname)}, "weighted_vote": weights.weighted_vote(live, wts), "lessons": review.lessons_for(self.board, asset.name, asset.kind)}
 
         def trader(fb=None):
             raw = self._ask_json("trader", tp, "bull, bear and picture (the Picture of the Day)", fb)
@@ -408,7 +422,7 @@ class Hall:
             why = "risk_manager: reject" if str(rm["verdict"]).lower() == "reject" else "portfolio_manager: reject"
             self.j.add_decision(run_id, ts, asset.name, "buy", entry, stop, take, None, "rejected", why)
             return Result(asset.name, "rejected", why, cid)
-        mult = min(1.0, max(0.0, float(pmr.get("size_mult", 1.0) or 0)), float(pd_.get("size_mult", 1.0)))  # картина дня может только уменьшить
+        mult = min(1.0, max(0.0, float(pmr.get("size_mult", 1.0) or 0)), float(pd_.get("size_mult", 1.0)), regime.SIZE_MULT.get(rname, 1.0))  # картина дня и режим рынка могут только уменьшить
         if str(rm["verdict"]).lower() == "reduce":
             mult = min(mult, min(1.0, max(0.0, float(rm.get("size_mult", 1.0) or 0))))
         # --- RiskGate (код) + исполнение: под локом и со свежим состоянием счёта (лимиты не гонятся между параллельными активами) ---
@@ -445,6 +459,13 @@ class Hall:
                 return Result(asset.name, "hold", "dry-run: ордер не отправлен", cid)
             o = self.broker.buy(asset.name, qty, price, stop, take, ts, run_id)
             self.j.update_decision(did, executed=1)
+            try:   # решение трейдера о частичной фиксации (3.2); по умолчанию менеджер возьмёт +3%
+                pt = float(t.get("partial_take") or 0)
+                self.j.kv_set(f"partial_at:{asset.name}", pt if entry < pt < take else None)
+                self.j.kv_set(f"partial_done:{asset.name}", None)
+                self.j.kv_set(f"init_stop:{asset.name}", stop)
+            except (TypeError, ValueError):
+                pass
             order = {**o, "order_id": self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"]}
             return Result(asset.name, "opened", f"qty={qty} stop={stop} take={take}", cid, order)
 

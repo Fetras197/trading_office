@@ -74,7 +74,7 @@ def run(board, journal, router, candles_fn=None, max_n: int = 3) -> list[int]:
     """Разобрать ещё не разобранные закрытые сделки (не более max_n за проход)."""
     done = []
     for t in journal.q("SELECT * FROM trades ORDER BY id"):
-        if journal.kv_get(f"reviewed:{t['id']}"):
+        if journal.kv_get(f"reviewed:{t['id']}") or t["exit_reason"] == "partial":   # частичные фиксации — часть одной сделки
             continue
         if len(done) >= max_n:
             break

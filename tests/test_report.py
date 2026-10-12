@@ -95,13 +95,13 @@ def test_alpaca_account_view_and_day_change():
 
 def test_lab_line():
     st = {"crypto": {"n": 14, "ok": 0, "syms": 1}, "stock": {"n": 14, "ok": 0, "syms": 1}}
-    assert report.lab_line(st, []) == "Лаборатория: проверено 28 стратегий (крипта 14, акции 14), рабочих пока нет"
+    assert report.lab_line(st, []) == ("Лаборатория: проверено 28 стратегий (крипта 14, акции 14); прошли строгую проверку: 0; на испытании: 0; подтверждены вживую: 0")
 
 
 def test_plural_and_lab_line_grammar():
     assert [report.plural(n, "стратегия", "стратегии", "стратегий") for n in (1, 2, 5, 11, 21, 94, 112)] == ["стратегия", "стратегии", "стратегий", "стратегий", "стратегия", "стратегии", "стратегий"]
     st = {"crypto": {"n": 1, "ok": 0, "syms": 1}, "stock": {"n": 1, "ok": 0, "syms": 1}}
-    assert "проверено 2 стратегии" in report.lab_line(st, [])
+    assert "проверено 2 стратегии" in report.lab_line({**st, "trial": 2, "live": 1}, []) and "на испытании: 2; подтверждены вживую: 1" in report.lab_line({**st, "trial": 2, "live": 1}, [])
 
 
 def test_crypto_fundamentals_resolved_by_symbol_not_cg_id(monkeypatch):

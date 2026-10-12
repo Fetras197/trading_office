@@ -300,3 +300,26 @@ def test_disabled_role_abstains_and_weights_reach_trader(env):
     tp = seen["trader"]
     assert "market" not in [x["role"] for x in tp["reports"]]
     assert next(x for x in tp["reports"] if x["role"] == "news")["weight"] == 0.5 and "weighted_vote" in tp and "lessons" in tp
+
+
+def test_regime_panic_blocks_entries_and_high_vol_halves_size(env):
+    h, b, br = mk()
+    b.publish("R-regime", "regime", "*", "x", 1.0, data={"crypto": {"regime": "panic", "why": ["падение"]}, "stock": None})
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "паника" in r.detail and not br.bought
+    h1, b1, br1 = mk()
+    h1.run_asset("BTC/USD")
+    h2, b2, br2 = mk()
+    b2.publish("R-regime", "regime", "*", "x", 1.0, data={"crypto": {"regime": "high_vol", "why": ["волатильность"]}, "stock": None})
+    h2.run_asset("BTC/USD")
+    assert br2.bought[0][1] < br1.bought[0][1]
+
+
+def test_smartmoney_voice_published_for_crypto_only(env):
+    h, b, br = mk(smart=lambda coin: {"stance": "buy", "confidence": 0.7, "rationale": "умные деньги в лонгах"} if coin == "BTC" else None)
+    h.run_asset("BTC/USD")
+    r = b.q("SELECT verdict, confidence FROM reports WHERE role='smartmoney'")
+    assert r and r[0]["verdict"].startswith("buy: умные")
+    h2, b2, _ = mk(smart=lambda coin: {"stance": "buy", "confidence": 0.7, "rationale": "x"})
+    h2.run_asset("NVDA")
+    assert not b2.q("SELECT 1 FROM reports WHERE role='smartmoney'")

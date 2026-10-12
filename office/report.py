@@ -8,10 +8,10 @@ from . import config, proofread, telegram
 from .llm import ClaudeBackend, GeminiBackend, LLMError
 
 ROLE_RU = {"market": "Технический анализ", "news": "Новости", "fundamentals": "Фундаментальный анализ", "quant": "Квант-аналитик",
-           "buffett": "Баффетт", "munger": "Мангер", "druckenmiller": "Друкенмиллер", "lab": "Лаборатория стратегий"}
+           "buffett": "Баффетт", "munger": "Мангер", "druckenmiller": "Друкенмиллер", "lab": "Лаборатория стратегий", "smartmoney": "Умные деньги"}
 FALLBACK = {"market": "оценка по графику цены", "news": "оценка новостного фона", "fundamentals": "оценка размера и динамики проекта",
             "quant": "оценка волатильности и импульса", "buffett": "оценка качества бизнеса", "munger": "оценка качества бизнеса",
-            "druckenmiller": "оценка роста и макрофона", "lab": "сигнал проверенных стратегий",
+            "druckenmiller": "оценка роста и макрофона", "lab": "сигнал проверенных стратегий", "smartmoney": "позиции крупных прибыльных трейдеров",
             "debate": "решение принято по итогам обсуждения", "risk": "проверил риск сделки", "manager": "проверил сделку целиком"}
 ACC_RU = {**ROLE_RU, "bull": "Бык", "bear": "Медведь", "trader": "Трейдер"}
 STANCE_RU = {"buy": "за", "sell": "против", "hold": "сомневается"}
@@ -140,16 +140,13 @@ def plural(n: int, one: str, few: str, many: str) -> str:
     return one if n % 10 == 1 and n % 100 != 11 else few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
 
 
-def lab_line(st: dict, appr: list[dict]) -> str:
+def lab_line(st: dict, appr=None) -> str:
     n = st["crypto"]["n"] + st["stock"]["n"]
-    ok = st["crypto"]["ok"] + st["stock"]["ok"]
     if not n:
         return "Лаборатория: за сутки новых проверок нет"
-    s = f"Лаборатория: проверено {n} {plural(n, 'стратегия', 'стратегии', 'стратегий')} (крипта {st['crypto']['n']}, акции {st['stock']['n']}), "
-    if not ok:
-        return s + "рабочих пока нет"
-    names = ", ".join(f"{name(a['symbol'])}: {FAMILY_RU.get(a['name'], 'стратегия')}, {a.get('tf') or '1ч'}".replace("1h", "1 ч").replace("4h", "4 ч").replace("15m", "15 мин") for a in appr[:3])
-    return s + f"рабочих: {ok} ({names})"
+    ok = st["crypto"].get("ok", 0) + st["stock"].get("ok", 0)
+    return (f"Лаборатория: проверено {n} {plural(n, 'стратегия', 'стратегии', 'стратегий')} (крипта {st['crypto']['n']}, акции {st['stock']['n']}); "
+            f"прошли строгую проверку: {ok}; на испытании: {st.get('trial', 0)}; подтверждены вживую: {st.get('live', 0)}")
 
 
 def summary_message(view: dict, bench: dict, trades_today: int, lab_text: str, now=None, title: str = "Сводка офиса") -> str:
@@ -170,6 +167,17 @@ def service(kind: str, asset: str = "", detail: str = "") -> str:
             "asset_fail": f"⚠️ {a}: не удалось обработать актив в этом цикле (сбой данных или ответа аналитиков). Покупок и продаж по нему не было.",
             "task_fail": f"⚠️ Плановое задание «{detail}» завершилось с ошибкой. Офис продолжает работу, подробности в журнале.",
             "halt_daily": "⛔ Дневной стоп достигнут: новые покупки заблокированы до следующих суток."}[kind]
+
+
+def manage_message(kind: str, asset: str, **k) -> str:
+    n = name(asset)
+    if kind == "stop":
+        why = " и ".join("безубыток" if w == "безубыток" else "подтяжка за ценой" for w in k["why"] if w in ("безубыток", "подтяжка за ценой")) or "защита прибыли"
+        side = "выше цены входа" if k["pct"] > 0 else "ниже цены входа"
+        return f"🛡 {n}: стоп-лосс поднят до {price(k['price'])} ({pct(k['pct'])} {side}) — {why}"
+    if kind == "partial":
+        return f"🟢 {n}: продана половина позиции по {price(k['price'])}, зафиксировано {signed(k['pnl'])} $. Остаток под стопом {price(k['stop'])}"
+    return f"{'🟢' if k['pnl'] >= 0 else '🔴'} Продажа {n} — цена стояла 48 часов\nРезультат: {signed(k['pnl'])} $ ({pct(k['pnl_pct'])})"
 
 
 def notify(text: str, proof: bool = True) -> None:

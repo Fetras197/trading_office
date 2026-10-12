@@ -42,7 +42,10 @@ def test_approved_strategies_vote_as_lab_analyst(monkeypatch):
     assert lab.signal_for(b, "X") is None  # нет approved -> лаборатория не голосует
     df = series(1500, 3)
     _, _, ps = lab.grid(df["close"], df["high"], df["low"], "sma_cross")
-    b.x("INSERT INTO strategies(ts,symbol,name,params,approved,oos_sharpe,bh_sharpe) VALUES(datetime('now'),'X','sma_cross',?,1,1.5,0.5)", (__import__("json").dumps(ps[0]),))
+    b.x("INSERT INTO strategies(ts,symbol,name,params,approved,oos_sharpe,bh_sharpe,tf,mt,p) VALUES(datetime('now'),'X','sma_cross',?,1,1.5,0.5,'1h',1,1e-9)", (__import__("json").dumps(ps[0]),))
+    assert lab.signal_for(b, "X") is None  # approved без испытательного срока голоса не имеет
+    b.x("INSERT INTO lab_trial(key,symbol,name,tf,params,start,status,updated) VALUES('X|sma_cross|1h','X','sma_cross','1h','{}','2026-01-01','live','2026-01-20')")
+    monkeypatch.setattr(lab, "symbol_regime", lambda s: None)
     monkeypatch.setattr(lab, "history", lambda s, tf="1h", d=None: df)
     sg = lab.signal_for(b, "X")
     assert sg["stance"] in ("buy", "hold") and 0 <= sg["confidence"] <= 1
