@@ -3,6 +3,7 @@
 -> правило входа (entry.py: «за» не меньше половины и больше «против»; неполные данные = половинный объём) -> RiskGate (лимиты риска, код) -> Alpaca paper.
 Каждая отсечка пишется в journal.nogo (для вечернего блока «Почему не вошли»)."""
 import concurrent.futures as cf
+import dataclasses
 import datetime as dt
 import threading
 import time
@@ -125,6 +126,15 @@ class Hall:
         for r in analysts:
             r["id"] = self.board.publish(cid, r["role"], asset.name, f"{r['stance']}: {r['rationale']}", r["confidence"], data={**r, "price": price})
 
+    def _spread(self, asset):
+        cl = getattr(self.broker, "c", None)
+        if cl is None or not hasattr(cl, "spread"):
+            return None
+        try:
+            return cl.spread(asset.alpaca)
+        except Exception:  # noqa: BLE001 — котировки недоступны: не блокируем
+            return None
+
     def _cross_price(self, asset, price):
         """Цена из свечей против снапшота Alpaca (независимый источник): расхождение > 1,5% — данные ненадёжны."""
         if price <= 0:
@@ -218,6 +228,14 @@ class Hall:
         if not patterns:
             return hold("signal", "нет технического сигнала: " + ("; ".join(tech.notes[:2]) or "условия не выполнены"))
 
+        # --- спред: BONK 18.10 — круг «купили-продали» стоил 2,7% (≈134 $). Спред шире порога — не входим; реальный спред входит в расчёт экономики как проскальзывание ---
+        costs = COSTS[asset.kind]
+        sp = self._spread(asset)
+        if sp is not None:
+            if sp > entry.MAX_SPREAD:
+                return hold("spread", f"спред {sp * 100:.2f}% шире допустимых {entry.MAX_SPREAD * 100:.2f}%: круг «купили-продали» съест прибыль", score=0.8)
+            costs = dataclasses.replace(costs, slippage=max(costs.slippage, sp / 2))
+
         # --- отдел: первый подходящий со свободным лимитом (3 позиции, 5 входов/сутки, остаток бюджета) ---
         desk, why_no = None, ""
         for pat in patterns:
@@ -228,7 +246,7 @@ class Hall:
         if not desk:
             return hold("desk", why_no, score=0.8)
         # --- экономика: цель с комиссиями ≥ 2× риска с комиссиями (крипта ещё и ≥ 4× комиссии круга) ---
-        plan = entry.trade_plan(price, atr, pattern, asset.kind, COSTS[asset.kind])
+        plan = entry.trade_plan(price, atr, pattern, asset.kind, costs)
         if not plan.ok:
             return hold("economics", plan.reason, score=0.85)
 
@@ -275,7 +293,7 @@ class Hall:
             if not cap["ok"]:
                 return hold("desk", f"«{desk['name']}»: {cap['why']}", votes, score=0.9)
             v = RiskGate(desks.limits_for(desk, acct["equity"])).check_entry(
-                kind=asset.kind, costs=COSTS[asset.kind], entry=price, stop=stop, atr=atr, equity=acct["equity"], day_start_equity=acct["day_start_equity"],
+                kind=asset.kind, costs=costs, entry=price, stop=stop, atr=atr, equity=acct["equity"], day_start_equity=acct["day_start_equity"],
                 entries_today=cap["entries"], open_positions=cap["open"], cash=min(acct["cash"], cap["free"]), has_position=bool(acct["position"]), size_mult=mult)
             did = self.j.add_decision(run_id, ts, asset.name, "buy", price, stop, take, v.qty, "ok" if v.ok else "rejected", v.reason)
             if not v.ok:

@@ -286,3 +286,21 @@ def test_economics_rejection_logged_when_costs_eat_the_target(env):
     r = h.run_asset("BTC/USD")
     assert r.status == "hold" and "экономика сделки не сходится" in r.detail and not br.bought
     assert j.nogo_top("2000-01-01")[0]["stage"] == "economics"
+
+
+def test_wide_spread_blocks_entry_and_real_spread_counts_as_slippage(env):
+    class C:
+        def __init__(self, sp): self.sp = sp
+        def price(self, s): return PRICE
+        def spread(self, s): return self.sp
+    h, b, j, br = mk()
+    br.c = C(0.027)                                   # BONK 18.10: круг стоил 2,7%
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "спред 2.70% шире" in r.detail and not br.bought and j.nogo_top("2000-01-01")[0]["stage"] == "spread"
+    h2, b2, j2, br2 = mk()
+    br2.c = C(0.0)
+    h2.run_asset("BTC/USD")
+    h3, b3, j3, br3 = mk()
+    br3.c = C(0.0024)                                  # допустимый, но заметный спред: проскальзывание в расчёте = 0,12% (> 0,05%) → тейк дальше, размер меньше
+    r3 = h3.run_asset("BTC/USD")
+    assert r3.status == "opened" and br3.bought[0][3] > br2.bought[0][3] and br3.bought[0][1] <= br2.bought[0][1]

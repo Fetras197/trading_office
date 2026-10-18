@@ -12,6 +12,15 @@ PAPER_HOST = "paper-api.alpaca.markets"
 DUST_USD = 1.0   # позиции дешевле 1 $ — «пыль» после продажи с комиссией в активе (ONDO: 0,00000087 шт.): не позиция, в отчётах и планах не показываем
 
 
+def px_str(x: float) -> str:
+    """Цена для заявки крипты. 4 знака для обычных монет, а для дешёвых (BONK, PEPE, SHIB ~1e-5) — до 9: «0.0000» даёт ошибку Alpaca «limit price must be > 0», и позиция без защиты закрывалась."""
+    if x >= 1:
+        return f"{x:.4f}"
+    if x <= 0:
+        return "0"
+    return f"{x:.{min(9, max(4, 6 - math.floor(math.log10(x))))}f}"
+
+
 def stop_limit_price(stop: float, entry: float | None) -> float:
     """Лимит защитного stop_limit крипты. Расстояние от стопа до лимита — не больше 10% от «стоп-дистанции с комиссиями» (и в пределах 0,05–1% цены), чтобы проскальзывание
     при срабатывании добавляло к заложенному риску не более ~10%. Пример BTC: вход 82 126, стоп 81 248 → дистанция с комиссиями 1,57% → лимит на 0,157% ниже стопа."""
@@ -84,6 +93,12 @@ class AlpacaClient:
         """Последняя сделка по снапшоту Alpaca (независимый от Yahoo/Binance источник цены)."""
         snap = self._snap(symbol)
         return float((snap.get("latestTrade") or {}).get("p") or snap["dailyBar"]["c"])
+
+    def spread(self, symbol: str) -> float | None:
+        """Относительный спред лучшей покупки/продажи по снапшоту Alpaca ((ask−bid)/mid); None — котировки нет."""
+        q = self._snap(symbol).get("latestQuote") or {}
+        bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
+        return (ask - bid) / ((ask + bid) / 2) if bid > 0 and ask >= bid else None
 
     def day_change(self, symbol: str) -> float:
         """Изменение цены к вчерашнему закрытию по снапшоту Alpaca (тот же источник, что у счёта). Крипта: BTC/USD, акции: SPY."""
@@ -197,12 +212,14 @@ class AlpacaBroker:
             try:  # bracket для крипты запрещён API → отдельный защитный stop_limit (limit на 1% ниже стопа)
                 qty_s = math.floor(fq * 1e6) / 1e6
                 so = self.c.submit({"symbol": a.alpaca, "qty": f"{qty_s:.6f}", "side": "sell", "type": "stop_limit",
-                                    "time_in_force": "gtc", "stop_price": f"{stop:.4f}", "limit_price": f"{stop_limit_price(stop, price):.4f}"})
+                                    "time_in_force": "gtc", "stop_price": px_str(stop), "limit_price": px_str(stop_limit_price(stop, price))})
                 stop_oid = so["id"]
             except AlpacaError as e:
                 mo = self._wait_fill(self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(fq * 1e6) / 1e6:.6f}", "side": "sell",
                                                     "type": "market", "time_in_force": "gtc"})["id"])
-                if mo["status"] == "filled":
+                if mo["status"] == "filled":   # круг «купили → продали» оплачен комиссиями: фиксируем его в журнале (иначе убыток отдела не виден)
+                    self._record_open(name, fq, price, stop, take, fee_usd, ts, run_id, None, desk)
+                    self._book_close(name, float(mo["filled_avg_price"]), ts, "no_stop")
                     raise AlpacaError(f"защитный стоп не встал ({e}) — позиция немедленно закрыта") from e
                 # закрытие не подтверждено: позицию обязательно ведём в журнале, иначе она «потеряется» без стопа
                 self._record_open(name, fq, price, stop, take, fee_usd, ts, run_id, None, desk)
@@ -257,7 +274,7 @@ class AlpacaBroker:
         """Защитный ордер на остаток: крипто — stop_limit, акции — OCO (стоп + тейк). Возвращает id (или None для акций с OCO)."""
         if a.kind == "crypto":
             so = self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(qty * 1e6) / 1e6:.6f}", "side": "sell", "type": "stop_limit", "time_in_force": "gtc",
-                                "stop_price": f"{stop:.4f}", "limit_price": f"{stop_limit_price(stop, (self.position(a.name) or {}).get('avg')):.4f}"})
+                                "stop_price": px_str(stop), "limit_price": px_str(stop_limit_price(stop, (self.position(a.name) or {}).get('avg')))})
             return so["id"]
         body = {"symbol": a.alpaca, "qty": str(int(qty)), "side": "sell", "type": "limit", "time_in_force": "gtc", "order_class": "oco",
                 "stop_loss": {"stop_price": f"{stop:.2f}"}, "take_profit": {"limit_price": f"{(take or stop * 1.1):.2f}"}}
@@ -272,9 +289,9 @@ class AlpacaBroker:
         done = False
         for o in self._open_sells(a):
             if o.get("type") in ("stop", "stop_limit"):
-                body = {"stop_price": f"{new_stop:.4f}" if a.kind == "crypto" else f"{new_stop:.2f}"}
+                body = {"stop_price": px_str(new_stop) if a.kind == "crypto" else f"{new_stop:.2f}"}
                 if o.get("type") == "stop_limit":
-                    body["limit_price"] = f"{stop_limit_price(new_stop, p['avg']):.4f}" if a.kind == "crypto" else f"{new_stop * 0.99:.2f}"
+                    body["limit_price"] = px_str(stop_limit_price(new_stop, p['avg'])) if a.kind == "crypto" else f"{new_stop * 0.99:.2f}"
                 try:
                     r = self.c._req("PATCH", f"/orders/{o['id']}", json=body)   # Alpaca replace создаёт НОВЫЙ ордер с новым id
                     if a.kind == "crypto" and r.get("id"):
@@ -424,7 +441,7 @@ class AlpacaBroker:
                 want = stop_limit_price(float(o.get("stop_price") or p["stop"]), p["avg"])
                 if float(o["limit_price"]) < want * (1 - 0.0002):   # лимит стоит шире допустимого (старые заявки: −1%) — подтягиваем к стопу
                     try:
-                        r = self.c._req("PATCH", f"/orders/{o['id']}", json={"limit_price": f"{want:.4f}"})
+                        r = self.c._req("PATCH", f"/orders/{o['id']}", json={"limit_price": px_str(want)})
                         if r.get("id"):
                             self.j.kv_set(f"stop_oid:{name}", r["id"])
                         return "tightened"

@@ -87,6 +87,19 @@ def test_crypto_stop_failure_flattens_position():
         b.buy("BTC/USD", 10, 100.0, 95.0, 110.0, "t")
     assert c.submitted[-1]["side"] == "sell" and c.submitted[-1]["type"] == "market"
     assert not j.positions()
+    t = j.q("SELECT exit_reason, pnl FROM trades")                       # круг «купили-продали» виден в журнале (комиссии отдела)
+    assert t and t[0]["exit_reason"] == "no_stop" and len(j.q("SELECT 1 FROM fills")) == 2
+
+
+def test_micro_price_stop_limit_has_nonzero_price():
+    from office.alpaca import px_str, stop_limit_price
+    assert px_str(82125.8) == "82125.8000" and px_str(0.0000123) == "0.000012300" and float(px_str(0.0000123)) > 0
+    lim = stop_limit_price(0.0000118, 0.0000125)                       # BONK-подобная цена: раньше «0.0000» → Alpaca: limit price must be > 0
+    assert float(px_str(lim)) > 0 and float(px_str(0.0000118)) > 0
+    b, c, j = mk()
+    b.buy("BTC/USD", 10, 0.0000125, 0.0000118, 0.0000140, "t")
+    s = c.submitted[1]
+    assert s["type"] == "stop_limit" and float(s["stop_price"]) > 0 and 0 < float(s["limit_price"]) < float(s["stop_price"])
 
 
 def test_crypto_stop_failure_and_unconfirmed_close_keeps_position_tracked(monkeypatch):

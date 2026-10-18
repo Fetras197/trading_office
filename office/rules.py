@@ -15,7 +15,7 @@ VERSION = "v5.0"
 def snapshot() -> dict:
     """Всё, что определяет вход, размер, выход и блокировки."""
     return {"entry": {k: getattr(entry, k) for k in ("STOP_ATR", "TAKE_ATR", "HALF", "MIN_LIVE_FULL", "RSI_MAX", "RSI_MIN_TREND", "RSI_BOUNCE", "COOLDOWN_H", "CT_STOP_ATR", "CT_TAKE_ATR",
-                                                      "CRYPTO_STOP_ATR", "CRYPTO_TAKE_ATR", "TECH_ONLY", "MIN_REWARD_RISK", "MIN_TARGET_FEES", "MAX_TAKE_ATR")},
+                                                      "CRYPTO_STOP_ATR", "CRYPTO_TAKE_ATR", "TECH_ONLY", "MIN_REWARD_RISK", "MIN_TARGET_FEES", "MAX_TAKE_ATR", "MAX_SPREAD")},
             "desks": {k: getattr(desks, k) for k in ("BASE_SHARE", "RESERVE", "MIN_SHARE", "MAX_SHARE", "STEP", "MAX_POSITIONS", "MAX_ENTRIES_DAY", "CLOSE_AFTER_TRADES", "POSITION_CAP", "ORDER")},
             "desk_specs": {k: [v["patterns"], v["assets"]] for k, v in desks.BUILTIN.items()},
             "counter": list(entry.COUNTER), "events": [events.PRE_MIN, events.POST_MIN], "limits": vars(config.Limits()), "turnover": dict(config.MIN_TURNOVER),
