@@ -59,16 +59,21 @@ def test_gemini_garbage_and_missing_key(monkeypatch):
         GeminiBackend(session=Sess(), min_interval=0).ask("tech_analyst", {})
 
 
-def test_router_analysts_gemini_rest_claude():
+def test_router_all_roles_gemini_and_cached():
     class B:
-        def __init__(self, n):
-            self.n = n
+        n = 0
 
         def ask(self, role, p, system=None):
-            return self.n
-    r = RoleRouter(claude=B("claude"), gemini=B("gemini"))
-    assert [r.ask(x, {}) for x in ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller")] == ["gemini"] * 7
-    assert [r.ask(x, {}) for x in ("trader", "risk_manager", "portfolio_manager", "executor")] == ["claude"] * 4
+            B.n += 1
+            return {"role": role}
+    r = RoleRouter(gemini=B())
+    assert [r.ask(x, {})["role"] for x in ("market", "picture", "postmortem", "weekly")] == ["market", "picture", "postmortem", "weekly"]
+    r.ask("market", {})
+    assert B.n == 4                                   # повтор — из кэша
+
+
+def test_no_claude_anywhere():
+    assert not hasattr(llm, "ClaudeBackend") and "subprocess" not in vars(llm)
 
 
 def test_gemini_429_all_models_is_unavailable_not_crash(monkeypatch):
@@ -81,3 +86,48 @@ def test_gemini_429_all_models_is_unavailable_not_crash(monkeypatch):
             return type("R", (), {"status_code": 429, "text": "RESOURCE_EXHAUSTED PerDay", "json": lambda s: {}})()
     with pytest.raises(LLMUnavailable):
         GeminiBackend(session=S(), min_interval=0).ask("market", {}, system="x")
+
+
+class _B:
+    def __init__(self, fn):
+        self.fn, self.calls = fn, []
+
+    def ask(self, role, p, system=None, model=""):
+        self.calls.append((role, system, model))
+        return self.fn()
+
+
+def _unavail():
+    raise llm.LLMUnavailable("429")
+
+
+def test_router_limit_propagates_as_unavailable_for_every_role():
+    r = RoleRouter(gemini=_B(_unavail))
+    for role in ("market", "newsdesk", "picture"):
+        with pytest.raises(llm.LLMUnavailable):
+            r.ask(role, {}, system="x")
+
+
+def test_gemini_pause_after_429_stops_requests_and_budget_shares(monkeypatch):
+    class S:
+        n = 0
+
+        def post(self, *a, **k):
+            S.n += 1
+            return type("R", (), {"status_code": 429, "text": "PerDay", "json": lambda s: {}})()
+    g = GeminiBackend(session=S(), min_interval=0)
+    with pytest.raises(llm.LLMUnavailable):
+        g.ask("market", {}, system="x")
+    n = S.n
+    assert llm.status()["gemini_down"]
+    with pytest.raises(llm.LLMUnavailable, match="пауз"):
+        g.ask("market", {}, system="x")
+    assert S.n == n                               # на паузе запросы не уходят
+    llm.reset_state()
+    monkeypatch.setattr(llm, "DAILY_BUDGET", 10)
+    for _ in range(3):
+        llm.budget_spend("newsdesk")
+    assert not llm.budget_allow("newsdesk") and llm.budget_allow("market")   # фону доля 25% (2 из 10), залу можно
+    for _ in range(7):
+        llm.budget_spend("market")
+    assert not llm.budget_allow("market")

@@ -68,3 +68,17 @@ def blocked(board, asset: str, kind: str, now: dt.datetime | None = None) -> str
             elif _dt(r["ts"]) - dt.timedelta(minutes=PRE_MIN) <= now <= _dt(r["ts"]) + dt.timedelta(minutes=POST_MIN):
                 return f"{title_ru(r)}"
     return ""
+
+
+def picture_bans(d: dict, now: dt.datetime | None = None) -> dict[str, dict]:
+    """Действующие запреты из «Картины дня»: актив -> {reason, until}. Без причины/срока (старый формат) или с истёкшим сроком запрета нет."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    out = {}
+    for e in d.get("avoid_assets") or []:
+        if isinstance(e, dict) and e.get("asset") and e.get("reason") and e.get("until"):
+            try:
+                if _dt(e["until"]) > now:
+                    out[e["asset"]] = e
+            except ValueError:
+                pass
+    return out

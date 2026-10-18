@@ -48,8 +48,9 @@ PICTURE_SYS = f"""You are the head of research of a paper-trading firm (US stock
 Input JSON: macro report, event calendar for the next 24h, news desk, crypto desk, sector rotation, portfolio analyst, market regime (code), account state, open positions, the screener's candidates, and notes from previous days with what actually happened since.
 Be concrete and conservative. Your restrictions are enforced by code: no_new_entries=true blocks ALL new entries; avoid_assets blocks the listed assets; size_mult (0..1) can only REDUCE position size. You can never loosen the firm's risk limits.
 Use no_new_entries=true only when risk is genuinely extreme (panic, imminent major event, data failure). Prefer avoid_assets/size_mult for milder caution.
+An avoid_assets entry is valid ONLY with a concrete reason (a specific event or fact from the input) and a term in hours (1..24); entries without both are discarded by code. Never list an asset that is in priority_assets or a core crypto asset (BTC/USD, ETH/USD, SOL/USD): such entries are discarded.
 Schema: {{"regime": "risk_on|risk_off|neutral", "summary": "<=80 words", "main_risks": ["<=12 words", ...max 4], "priority_assets": ["asset exactly as in input candidates/positions", ...max 5],
-"avoid_assets": ["asset", ...], "forbidden": ["<=14 words: what must NOT be done today", ...max 4], "no_new_entries": true|false, "size_mult": 0.0-1.0, "confidence": 0.0-1.0,
+"avoid_assets": [{{"asset": "asset", "reason": "<=12 words, specific", "hours": 1-24}}, ...], "forbidden": ["<=14 words: what must NOT be done today", ...max 4], "no_new_entries": true|false, "size_mult": 0.0-1.0, "confidence": 0.0-1.0,
 "expectation": "<=30 words: what you expect over the next 4 hours", "lesson_of_previous": "<=30 words: what from the previous picture came true / did not (empty if no data)"}}
 {UNTRUSTED}
 {OUT}"""
@@ -108,13 +109,27 @@ def v_macro(raw):
     return {"regime": _regime(raw["regime"]), "confidence": _num(raw["confidence"], 0, 1, "confidence"), "summary": str(raw["summary"])[:700], "key_risks": _strs(raw.get("key_risks"), 3)}
 
 
+def _avoid(x, protected, now=None) -> list[dict]:
+    """Запрет актива — только с причиной и сроком (1..24 ч); приоритетные и ядро крипты в запрет не попадают. Старый формат (голые строки) — без причины, отбрасывается."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    out = []
+    for e in x if isinstance(x, list) else []:
+        try:
+            a, why, h = str(e["asset"]).strip(), str(e["reason"]).strip()[:120], float(e["hours"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if a and a not in protected and len(why) >= 5 and 0 < h <= 24 and a not in [o["asset"] for o in out]:
+            out.append({"asset": a, "reason": why, "until": (now + dt.timedelta(hours=h)).isoformat(timespec="minutes")})
+    return out[:10]
+
+
 def v_picture(raw, known_assets=()):
     pic = {"regime": _regime(raw["regime"]), "summary": str(raw["summary"])[:900], "main_risks": _strs(raw.get("main_risks"), 4), "forbidden": _strs(raw.get("forbidden"), 4),
            "no_new_entries": bool(raw.get("no_new_entries", False)), "size_mult": _num(raw.get("size_mult", 1.0), 0, 1, "size_mult"),
            "confidence": _num(raw["confidence"], 0, 1, "confidence"), "expectation": str(raw.get("expectation", ""))[:400], "lesson_of_previous": str(raw.get("lesson_of_previous", ""))[:400]}
     ka = set(known_assets)
     pic["priority_assets"] = [a for a in _strs(raw.get("priority_assets"), 5, 20) if not ka or a in ka]
-    pic["avoid_assets"] = _strs(raw.get("avoid_assets"), 20, 20)
+    pic["avoid_assets"] = _avoid(raw.get("avoid_assets"), set(pic["priority_assets"]) | set(config.CRYPTO_CORE))
     if not pic["summary"].strip():
         raise ValueError("пустая картина")
     return pic
@@ -199,7 +214,7 @@ class Research:
         heads = {}
         for s in syms:
             a = config.make_asset(s)
-            h = (data.yf_news(a.ticker) if a.kind == "stock" else []) or data.news(f"{s.split('/')[0]} crypto")
+            h = data.headlines(a.alpaca)
             if h:
                 heads[s] = [{"title": x["title"], "published": x.get("published")} for x in h[:6]]
         if not heads:

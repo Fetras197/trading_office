@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY, asset TEXT, entry_ts T
 CREATE TABLE IF NOT EXISTS equity(ts TEXT, equity REAL);
 CREATE TABLE IF NOT EXISTS outcomes(opinion_id INTEGER PRIMARY KEY, label INT, correct INT);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS nogo(id INTEGER PRIMARY KEY, ts TEXT, asset TEXT, stage TEXT, reason TEXT, score REAL);
+CREATE INDEX IF NOT EXISTS ix_nogo_ts ON nogo(ts);
 """
 
 
@@ -79,3 +81,18 @@ class Journal:
 
     def snap_equity(self, ts, equity):
         self._x("INSERT INTO equity(ts,equity) VALUES(?,?)", (ts, equity))
+
+    def add_nogo(self, ts, asset, stage, reason, score):
+        """Кандидат не вошёл: на какой стадии и почему; score 0..1 — близость ко входу (для отчёта «Почему не вошли»)."""
+        self._x("INSERT INTO nogo(ts,asset,stage,reason,score) VALUES(?,?,?,?,?)", (ts, asset, stage, reason, float(score)))
+
+    def nogo_top(self, since_ts: str, n: int = 3) -> list[dict]:
+        """Ближайшие к входу кандидаты с момента since_ts: по одной (лучшей) записи на актив. Купленные за этот период исключаются."""
+        bought = {r["asset"] for r in self.q("SELECT DISTINCT asset FROM fills WHERE side='buy' AND ts>=?", (since_ts,))}
+        rows = self.q("SELECT asset, stage, reason, score, ts FROM nogo WHERE ts>=? ORDER BY score DESC, id DESC", (since_ts,))
+        out, seen = [], set(bought)
+        for r in rows:
+            if r["asset"] not in seen:
+                seen.add(r["asset"])
+                out.append(r)
+        return out[:n]

@@ -35,30 +35,27 @@ class FakeLLM:
 def test_phrases_reject_latin_and_fall_back(monkeypatch):
     items = {"market": "RSI overbought", "risk": "reduce"}
     monkeypatch.setattr(report, "GeminiBackend", lambda: FakeLLM([{"market": "RSI высокий", "risk": "уменьшил размер позиции из-за изменчивости"}]))
-    monkeypatch.setattr(report, "ClaudeBackend", lambda model="": FakeLLM([{"market": "рынок перекуплен и может откатиться"}]))
     ph = report.phrases(items)
-    assert ph["market"] == "рынок перекуплен и может откатиться" and ph["risk"].startswith("уменьшил")
-    monkeypatch.setattr(report, "GeminiBackend", lambda: FakeLLM([{"market": "bad"}]))
-    monkeypatch.setattr(report, "ClaudeBackend", lambda model="": FakeLLM([report.LLMError("x")]))
+    assert ph["market"] == report.FALLBACK["market"] and ph["risk"].startswith("уменьшил")   # латиница в фразе = брак → запасная фраза
+    monkeypatch.setattr(report, "GeminiBackend", lambda: FakeLLM([report.LLMError("x")]))
     assert report.phrases(items) == {"market": report.FALLBACK["market"], "risk": report.FALLBACK["risk"]}
 
 
 def test_trade_message_template_and_no_latin(monkeypatch):
     b = Board()
     cid = "c"
-    for role, st, v in (("market", "buy", "buy: bullish EMA"), ("quant", "hold", "hold: high vol"), ("bull", "buy", "buy: arg"), ("bear", "sell", "sell: arg"),
-                        ("trader", "buy", "buy: ok")):
-        b.publish(cid, role, "ONDO/USD", v, 0.7, refs=[] if role in ("market", "quant") else [1], stances={} if role in ("market", "quant") else {1: "agree"},
-                  data={"stance": st, "action": st})
-    b.publish(cid, "risk_manager", "ONDO/USD", "reduce: x", 0.5, refs=[1], stances={1: "agree"}, data={"verdict": "reduce", "rationale": "vol"})
-    b.publish(cid, "portfolio_manager", "ONDO/USD", "approve: x", 0.6, refs=[1], stances={1: "agree"}, data={"decision": "approve"})
-    monkeypatch.setattr(report, "phrases", lambda items: {k: f"фраза про {k}".replace("market", "график").replace("quant", "волатильность") if False else "тренд сильный" for k in items})
-    res = SimpleNamespace(status="opened", asset="ONDO/USD", cycle_id=cid, order={"price": 0.51697, "qty": 29049.61, "stop": 0.5033, "take": 0.5417, "equity": 100000})
+    for role, st, v in (("market", "buy", "buy: bullish EMA"), ("quant", "hold", "hold: high vol")):
+        b.publish(cid, role, "BTC/USD", v, 0.7, data={"stance": st})
+    b.publish(cid, "decision", "BTC/USD", "buy: тренд", 0.6, data={"gaps": ["нет свежих новостей"]})
+    monkeypatch.setattr(report, "phrases", lambda items: {k: "тренд сильный" for k in items})
+    res = SimpleNamespace(status="opened", asset="BTC/USD", cycle_id=cid, order={"price": 0.51697, "qty": 29049.61, "stop": 0.5033, "take": 0.5417, "equity": 100000,
+                                                                                 "tech": "trend", "half": True, "gaps": ["нет свежих новостей"]})
     m = norm(report.trade_message(b, res))
-    assert m.startswith("🟢 Покупка ONDO (демо-счёт)\nЦена входа: 0,517 $\nСтоп-лосс: 0,503 $ (−2,6%)\nТейк-профит: 0,542 $ (+4,8%)\nСумма: 15 018 $ · риск: 397 $ (0,4% счёта)")
+    assert m.startswith("🟢 Покупка BTC (демо-счёт)\nЦена входа: 0,517 $\nСтоп-лосс: 0,503 $ (−2,6%)\nТейк-профит: 0,542 $ (+4,8%)\nСумма: 15 018 $ · риск: 397 $ (0,4% счёта)")
     assert "• Технический анализ: тренд сильный (за)" in m and "• Квант-аналитик: тренд сильный (сомневается)" in m
-    assert "• Спор быка и медведя:" in m and "• Риск-менеджер:" in m and "• Управляющий:" in m
-    assert not re.search(r"[A-Za-z#]", m.replace("ONDO", ""))  # ни латиницы, ни номеров отчётов
+    assert "• Технический сигнал: растущий тренд" in m and "• Объём вдвое меньше обычного: нет свежих новостей" in m
+    assert "Спор быка" not in m and "Риск-менеджер" not in m
+    assert not re.search(r"[A-Za-z#]", m.replace("BTC", ""))  # ни латиницы, ни номеров отчётов
 
 
 def test_summary_template():

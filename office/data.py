@@ -14,10 +14,10 @@ UA = {"User-Agent": "Mozilla/5.0"}
 _IV_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 
 
-def _get(url, **kw):
+def _get(url, timeout=20, **kw):
     for i in range(3):
         try:
-            r = requests.get(url, headers=UA, timeout=20, **kw)
+            r = requests.get(url, headers=UA, timeout=timeout, **kw)
             r.raise_for_status()
             return r
         except requests.RequestException as e:
@@ -45,12 +45,36 @@ def crypto_candles(symbol: str, interval: str = "1h", start_ms: int | None = Non
     return _norm(df, "ts", "ms")
 
 
-def stock_candles(ticker: str, interval: str = "1h", rng: str = "60d") -> pd.DataFrame:
+_RNG_DAYS = {"5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730}
+_ALPACA_TF = {"1h": "1Hour", "1d": "1Day", "15m": "15Min"}
+
+
+def _rng_days(rng: str) -> int:
+    return int(rng[:-1]) if rng.endswith("d") and rng[:-1].isdigit() else _RNG_DAYS.get(rng, 60)
+
+
+def yahoo_candles(ticker: str, interval: str = "1h", rng: str = "60d") -> pd.DataFrame:
     j = _get(YAHOO.format(ticker), params={"range": rng, "interval": interval}).json()
     res = j["chart"]["result"][0]
     q = res["indicators"]["quote"][0]
     df = pd.DataFrame({"ts": res["timestamp"], **{k: q[k] for k in ("open", "high", "low", "close", "volume")}})
     return _norm(df.dropna(), "ts", "s")
+
+
+def stock_candles(ticker: str, interval: str = "1h", rng: str = "60d") -> pd.DataFrame:
+    """Yahoo; облачные IP он часто режет (429/пусто) → запасной источник: бары Alpaca (IEX, бесплатно, нужны ключи). Индексы (^VIX) только на Yahoo."""
+    try:
+        df = yahoo_candles(ticker, interval, rng)
+        if len(df):
+            return df
+    except Exception:  # noqa: BLE001
+        pass
+    if ticker.startswith("^") or "=" in ticker or interval not in _ALPACA_TF:
+        raise ValueError(f"нет данных {ticker}")
+    r = alpaca_bars([ticker], "stock", days=_rng_days(rng) * (1 if interval == "1d" else 1), timeframe=_ALPACA_TF[interval])
+    if ticker not in r or r[ticker].empty:
+        raise ValueError(f"нет данных {ticker}")
+    return r[ticker]
 
 
 def _norm(df: pd.DataFrame, col: str, unit: str) -> pd.DataFrame:
@@ -140,14 +164,90 @@ def derivs_now(coin: str) -> dict:
         return {"error": f"unavailable: {e}"}
 
 
+def _rss(url: str, n: int) -> list[dict]:
+    items = ET.fromstring(_get(url).content).findall(".//item")[:n]
+    return [{"title": i.findtext("title"), "published": i.findtext("pubDate")} for i in items if i.findtext("title")]
+
+
 def news(query: str, n: int = 8) -> list[dict]:
     """Google News RSS, best-effort."""
     try:
-        r = _get(f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en")
-        items = ET.fromstring(r.content).findall(".//item")[:n]
-        return [{"title": i.findtext("title"), "published": i.findtext("pubDate")} for i in items]
+        return _rss(f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en", n)
     except Exception:  # noqa: BLE001
         return []
+
+
+def bing_news(query: str, n: int = 8) -> list[dict]:
+    try:
+        return _rss(f"https://www.bing.com/news/search?q={quote(query)}&format=rss", n)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def yahoo_rss(ticker: str, n: int = 8) -> list[dict]:
+    try:
+        return _rss(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote(ticker)}&region=US&lang=en-US", n)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+CRYPTO_FEEDS = ("https://www.coindesk.com/arc/outboundfeeds/rss/", "https://cointelegraph.com/rss")
+_CRYPTO_NAMES = {"BTC": ("bitcoin", "btc"), "ETH": ("ethereum", "ether", "eth"), "SOL": ("solana", "sol")}
+
+
+def crypto_rss(coin: str, n: int = 8) -> list[dict]:
+    """Заголовки профильных крипто-лент, где упомянута монета; если упоминаний нет — общий фон рынка."""
+    words = _CRYPTO_NAMES.get(coin.upper(), (coin.lower(),))
+    hit, general = [], []
+    for url in CRYPTO_FEEDS:
+        try:
+            rows = _rss(url, 40)
+        except Exception:  # noqa: BLE001
+            continue
+        for r in rows:
+            low = " " + r["title"].lower() + " "
+            (hit if any(f" {w} " in low or f" {w}," in low or f" {w}'" in low or f" {w}:" in low for w in words) else general).append(r)
+    return (hit or general)[:n]
+
+
+def alpaca_news(symbol: str, n: int = 8) -> list[dict]:
+    """Alpaca News API (Benzinga; бесплатно с ключами) — не режется облачными IP."""
+    key, sec = os.environ.get("ALPACA_API_KEY"), os.environ.get("ALPACA_SECRET_KEY")
+    if not (key and sec):
+        return []
+    try:
+        r = requests.get("https://data.alpaca.markets/v1beta1/news", params={"symbols": symbol, "limit": n, "sort": "desc"}, timeout=20,
+                         headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec})
+        r.raise_for_status()
+        return [{"title": a["headline"], "published": a.get("created_at")} for a in r.json().get("news", []) if a.get("headline")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def headlines(symbol: str, n: int = 8) -> list[dict]:
+    """Заголовки по активу (символ Alpaca) из цепочки бесплатных источников; пока не набрали 3 — пробуем следующий, дубли убираем."""
+    crypto = "/" in symbol
+    base = symbol.split("/")[0]
+    chain = [lambda: alpaca_news(symbol, n),
+             (lambda: crypto_rss(base, n)) if crypto else (lambda: yahoo_rss(symbol, n)),
+             lambda: news(f"{base} {'crypto' if crypto else 'stock'}", n),
+             lambda: bing_news(f"{base} {'crypto' if crypto else 'stock'}", n)]
+    if not crypto:
+        chain.insert(2, lambda: yf_news(symbol, n))
+    out, seen = [], set()
+    for src in chain:
+        try:
+            rows = src()
+        except Exception:  # noqa: BLE001
+            rows = []
+        for r in rows:
+            k = "".join(ch for ch in r["title"].lower() if ch.isalnum())[:60]
+            if k not in seen:
+                seen.add(k)
+                out.append(r)
+        if len(out) >= 3:
+            break
+    return out[:n]
 
 
 _FUND_CACHE: dict = {}  # asset.name -> (monotonic ts, result); при ошибке источника отдаём последнее удачное
@@ -226,7 +326,7 @@ def bundle(asset, candles_df: pd.DataFrame | None = None) -> dict:
     b = {"asset": asset.name, "kind": asset.kind, "as_of": str(df.index[-1]),
          "indicators_1h": ind.snapshot(df), "indicators_4h": ind.snapshot(d4),
          "last_candles_1h": df.tail(12).round(4).reset_index().astype({"ts": str}).to_dict("records")}
-    b["news"] = (yf_news(asset.ticker) if asset.kind == "stock" else []) or news(f"{asset.alpaca.split('/')[0]} {'crypto' if asset.kind == 'crypto' else 'stock'}")
+    b["news"] = headlines(asset.alpaca)
     b["fundamentals"] = fundamentals(asset)
     b["tradingview"] = tradingview(asset)
     if asset.kind == "crypto":

@@ -8,11 +8,11 @@ import time
 import ijson
 import requests
 
-from .config import ROOT
+from .config import STATE_DIR
 
 LEADERBOARD = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 INFO = "https://api.hyperliquid.xyz/info"
-CACHE = ROOT / "data_cache"
+CACHE = STATE_DIR / "data_cache"
 TOP_N, MIN_ACCOUNT, MIN_MONTH_ROI, MIN_ALLTIME = 80, 250_000, 0.05, 250_000
 MIN_COIN_USD, MIN_TRADERS, BIAS = 1_000_000, 3, 0.3
 BUCKETS = (3, 5, 10, 20)   # зоны ликвидаций: до N% от текущей цены
@@ -84,7 +84,7 @@ def aggregate(states: list[dict], marks: dict[str, float]) -> dict:
 
 def refresh(leaders_max_age_h: float = 6.0, post=None) -> dict:
     """Обновить снапшот: лидеры (≤ раз в 6 ч, потоково) + их позиции + марк-цены. Пишет data_cache/smartmoney.json."""
-    CACHE.mkdir(exist_ok=True)
+    CACHE.mkdir(parents=True, exist_ok=True)
     lf = CACHE / "hl_leaders.json"
     if lf.exists() and time.time() - lf.stat().st_mtime < leaders_max_age_h * 3600:
         leaders = json.loads(lf.read_text())

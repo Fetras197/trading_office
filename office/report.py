@@ -1,12 +1,12 @@
 """Уведомления в Telegram — только по-русски, для человека, не программиста: без кодов ролей, id, английских слов и обрывков.
 Три вида: сделка (покупка), закрытие (стоп-лосс / тейк-профит / решение трейдера), сводка раз в 6 часов + служебные сообщения.
-Причины («почему купили») пишутся одной короткой фразой на роль: Gemini → Claude → запасная фраза; ответ проверяется на латиницу."""
+Причины («почему купили») пишутся одной короткой фразой на роль: Gemini → запасная фраза; ответ проверяется на латиницу."""
 import datetime as dt
 import re
 import subprocess
 
 from . import config, proofread, telegram
-from .llm import ClaudeBackend, GeminiBackend, LLMError
+from .llm import GeminiBackend, LLMError
 
 ROLE_RU = {"market": "Технический анализ", "news": "Новости", "fundamentals": "Фундаментальный анализ", "quant": "Квант-аналитик",
            "buffett": "Баффетт", "munger": "Мангер", "druckenmiller": "Друкенмиллер", "lab": "Лаборатория стратегий", "smartmoney": "Умные деньги"}
@@ -82,17 +82,14 @@ def phrases(items: dict[str, str]) -> dict[str, str]:
         return {}
     payload = {"items": {k: v[:400] for k, v in items.items()}}
     out: dict[str, str] = {}
-    for backend in (GeminiBackend(), ClaudeBackend(model="haiku")):
-        try:
-            got = backend.ask("notify", payload, system=PHRASE_SYSTEM).get("phrases", {})
-        except (LLMError, AttributeError):
-            continue
-        for k, v in got.items():
-            if k in items and k not in out and _valid(v):
-                v = v.strip().rstrip(".").strip()
-                out[k] = v[:1].lower() + v[1:]
-        if len(out) == len(items):
-            break
+    try:
+        got = GeminiBackend().ask("notify", payload, system=PHRASE_SYSTEM).get("phrases", {})
+    except (LLMError, AttributeError):
+        got = {}
+    for k, v in got.items():
+        if k in items and k not in out and _valid(v):
+            v = v.strip().rstrip(".").strip()
+            out[k] = v[:1].lower() + v[1:]
     base = {k: FALLBACK.get(k.split(":")[0], "оценка получена") for k in items}
     return {**base, **out}
 
@@ -118,13 +115,12 @@ def trade_message(board, res) -> str:
         if r and (r["data"].get("stance") in STANCE_RU):
             items[role] = r["verdict"]
             order.append(role)
-    items["debate"] = f"Бык: {last.get('bull', {}).get('verdict', '')}\nМедведь: {last.get('bear', {}).get('verdict', '')}\nРешение трейдера: {last.get('trader', {}).get('verdict', '')}"
-    rm, pm = last.get("risk_manager"), last.get("portfolio_manager")
-    items["risk"] = f"Решение: {rm['data'].get('verdict')}. {rm['data'].get('rationale', '')}" if rm else "одобрил"
-    items["manager"] = f"Решение: {pm['data'].get('decision')}. {pm['data'].get('rationale', '')}" if pm else "одобрил"
     ph = phrases(items)
+    dec = last.get("decision", {}).get("data", {})
     why = [f"• {ROLE_RU[r]}: {ph[r]} ({STANCE_RU[last[r]['data']['stance']]})" for r in order]
-    why += [f"• Спор быка и медведя: {ph['debate']}", f"• Риск-менеджер: {ph['risk']}", f"• Управляющий: {ph['manager']}"]
+    why.insert(0, "• Технический сигнал: " + ("отскок от перепроданности при целом долгом тренде" if o.get("tech") == "bounce" else "растущий тренд, импульс подтверждает"))
+    if o.get("half"):
+        why.append("• Объём вдвое меньше обычного: " + "; ".join(o.get("gaps") or dec.get("gaps") or ["данные неполные"]))
     lines = [f"🟢 Покупка {name(res.asset)} (демо-счёт)", f"Цена входа: {price(entry)}", f"Стоп-лосс: {price(stop)} ({pct(stop / entry - 1)})",
              f"Тейк-профит: {price(take)} ({pct(take / entry - 1)})",
              f"Сумма: {usd(notional)} · риск: {usd(risk)}" + (f" ({num(risk / eq * 100, 1)}% счёта)" if eq else ""), "", "Почему купили:"] + why
@@ -203,7 +199,10 @@ def notify(text: str, proof: bool = True) -> None:
     if proof:
         text = proofread.proofread(text)
     if not telegram.notify(text):
-        subprocess.run(["tgnotify", text[:3800]], capture_output=True, timeout=20, check=False)
+        try:   # запасной канал (Termux); в облаке утилиты нет — просто молчим, ошибка отправки не должна ронять проход
+            subprocess.run(["tgnotify", text[:3800]], capture_output=True, timeout=20, check=False)
+        except (OSError, subprocess.SubprocessError):
+            print("telegram: сообщение не отправлено", flush=True)
 
 
 def chain_text(board, cycle_id: str, asset: str) -> str:

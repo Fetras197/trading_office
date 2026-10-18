@@ -42,11 +42,11 @@ def picture_text(pic: dict | None, reg: dict | None = None) -> str:
         lines += ["Главные риски:"] + [f"• {r}" for r in d["main_risks"]]
     if d.get("priority_assets"):
         lines.append("В приоритете: " + ", ".join(name(a) for a in d["priority_assets"]))
-    if d.get("forbidden") or d.get("avoid_assets"):
+    bans = events.picture_bans(d)
+    if d.get("forbidden") or bans:
         lines.append("Сегодня нельзя:")
         lines += [f"• {f}" for f in d.get("forbidden", [])]
-        if d.get("avoid_assets"):
-            lines.append("• покупать: " + ", ".join(name(a) for a in d["avoid_assets"]))
+        lines += [f"• не покупать {name(a)} до {_tz_hhmm(e['until'])} — {e['reason']}" for a, e in bans.items()]
     sm = d.get("size_mult", 1.0)
     lines.append("Новые покупки запрещены" if d.get("no_new_entries") else f"Размер новых позиций: {num(sm * 100)}% от обычного" if sm < 1 else "Новые покупки разрешены в обычном размере")
     if d.get("mechanical"):
@@ -109,18 +109,35 @@ def briefing_text(pic, reg, evs, view, jpos, cands) -> str:
     return "\n".join(lines)
 
 
-def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst) -> str:
+STAGE_RU = {"signal": "нет сигнала", "votes": "аналитики", "limits": "лимит риска", "regime": "режим рынка", "event": "событие", "cooldown": "остывание после стопа",
+            "halt": "пауза", "riskgate": "риск-гейт", "broker": "брокер", "data": "нет данных"}
+
+
+def nogo_lines(rows: list[dict]) -> list[str]:
+    """«Почему не вошли»: 3 ближайших к входу кандидата за сутки и что их заблокировало (rows = Journal.nogo_top)."""
+    if not rows:
+        return ["🔎 Почему не вошли: кандидатов за сутки не оценивали (рынок акций закрыт или не было данных)."]
+    out = ["🔎 Почему не вошли (ближайшие кандидаты):"]
+    for i, r in enumerate(rows, 1):
+        out.append(f"{i}) {name(r['asset'])} — {STAGE_RU.get(r['stage'], r['stage'])}: {r['reason']}")
+    return out
+
+
+def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None) -> str:
     day = view["equity"] / view["last_equity"] - 1 if view["last_equity"] else 0.0
     lines = ["🌙 Вечерний отчёт", f"Счёт: {usd(view['equity'])} ({pct(day, 2)} за день)", f"S&P 500 {pct(bench.get('SPY', 0))}, биткоин {pct(bench.get('BTC', 0))} за день",
              f"Покупок за день: {opened_today}, закрыто сделок: {len(trades_today)}"]
     for t in trades_today[:5]:
         lines.append(f"• {name(t['asset'])}: {signed(t['pnl'])} $ ({'по стопу' if t['exit_reason'] == 'stop' else 'по цели' if t['exit_reason'] == 'take' else 'по решению офиса'})")
+    if nogo is not None:
+        lines += [""] + nogo_lines(nogo)
     lines += ["", shadow_text(shadow_rows)]
     if lessons:
         lines += ["", "Уроки дня:"] + [f"• {l}" for l in lessons[:3]]
     if evs:
         lines += ["", "Завтра в календаре:"] + events_lines(evs, 4)
-    lines += ["", f"Лаборатория: на испытании {labst.get('trial', 0)}, подтверждено вживую {labst.get('live', 0)}"]
+    if labst.get("trial") or labst.get("live"):
+        lines += ["", f"Лаборатория: на испытании {labst.get('trial', 0)}, подтверждено вживую {labst.get('live', 0)}"]
     return "\n".join(lines)
 
 

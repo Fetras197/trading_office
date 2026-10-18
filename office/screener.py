@@ -10,10 +10,10 @@ import pandas as pd
 import requests
 import talib as ta
 
-from . import data, lab
-from .config import ROOT
+from . import config, data, lab
 
-CACHE = ROOT / "data_cache" / "universe.json"
+CACHE = config.STATE_DIR / "data_cache" / "universe.json"
+VOL_CACHE = config.STATE_DIR / "data_cache" / "crypto_volume.json"
 UA = {"User-Agent": "Mozilla/5.0 (trading_office)"}
 WIKI = {"sp500": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
         "ndx": ("https://stockanalysis.com/list/nasdaq-100-stocks/", "Symbol")}  # Википедия убрала таблицу состава NDX
@@ -30,7 +30,7 @@ def _wiki(url: str, col: str) -> list[str]:
 def universe(alpaca_client, max_age_h: float = 24 * 7) -> dict:
     """{'crypto': [...BTC/USD], 'stock': [...]}; кэш data_cache/universe.json (обновление раз в неделю, при сбое — старый кэш)."""
     if CACHE.exists() and time.time() - CACHE.stat().st_mtime < max_age_h * 3600:
-        return json.loads(CACHE.read_text())
+        return _clean(json.loads(CACHE.read_text()))
     try:
         cr = alpaca_client._req("GET", "/assets", params={"asset_class": "crypto", "status": "active"})
         crypto = sorted(a["symbol"] for a in cr if a["symbol"].endswith("/USD") and a.get("tradable", True))
@@ -38,13 +38,53 @@ def universe(alpaca_client, max_age_h: float = 24 * 7) -> dict:
         ok = {a["symbol"] for a in st if a.get("tradable")}
         stocks = sorted((set(_wiki(*WIKI["sp500"])) | set(_wiki(*WIKI["ndx"]))) & ok)
         u = {"crypto": crypto, "stock": stocks}
-        CACHE.parent.mkdir(exist_ok=True)
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
         CACHE.write_text(json.dumps(u))
-        return u
+        return _clean(u)
     except Exception:  # noqa: BLE001
         if CACHE.exists():
-            return json.loads(CACHE.read_text())
+            return _clean(json.loads(CACHE.read_text()))
         raise
+
+
+def _clean(u: dict) -> dict:
+    """Убрать ONDO и стейблкоины из универсума."""
+    return {k: [s for s in v if not config.excluded(s)] for k, v in u.items()}
+
+
+def crypto_volumes(max_age_h: float = 6) -> dict[str, float]:
+    """Оборот за 24 ч в $ по тикеру ('BTC') — агрегат рынка (CoinGecko, топ-250 по капитализации; запасной — Binance 24hr). Кэш в state. {} если источники недоступны."""
+    if VOL_CACHE.exists() and time.time() - VOL_CACHE.stat().st_mtime < max_age_h * 3600:
+        return json.loads(VOL_CACHE.read_text())
+    out: dict[str, float] = {}
+    try:
+        for page in (1, 2):
+            rows = data._get("https://api.coingecko.com/api/v3/coins/markets", params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": page}).json()
+            for r in rows:
+                out.setdefault(r["symbol"].upper(), float(r.get("total_volume") or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    if not out:
+        try:
+            for r in data._get("https://data-api.binance.vision/api/v3/ticker/24hr").json():
+                if r["symbol"].endswith("USDT"):
+                    out[r["symbol"][:-4]] = float(r["quoteVolume"])
+        except Exception:  # noqa: BLE001
+            pass
+    if out:
+        VOL_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        VOL_CACHE.write_text(json.dumps(out))
+        return out
+    return json.loads(VOL_CACHE.read_text()) if VOL_CACHE.exists() else {}
+
+
+def liquid(sym: str, df: pd.DataFrame | None, cvol: dict[str, float]) -> bool:
+    """Фильтр по обороту. Крипта: 24 ч-оборот рынка ≥ порога (нет данных об обороте — только ядро). Акции: средний дневной оборот за 20 дней (close·volume) ≥ порога."""
+    if "/" in sym:
+        if not cvol:
+            return sym in config.CRYPTO_CORE
+        return cvol.get(sym.split("/")[0], 0.0) >= config.MIN_TURNOVER["crypto"]
+    return df is not None and len(df) >= 20 and float((df["close"] * df["volume"]).tail(20).mean()) >= config.MIN_TURNOVER["stock"]
 
 
 def metrics(df: pd.DataFrame) -> dict | None:
@@ -73,8 +113,11 @@ def scan(board, alpaca_client, stocks_open: bool, top_n: int = 5, exclude: set |
             except Exception:  # noqa: BLE001 — пачка не пришла: остальные считаем
                 continue
     appr = lab.live_symbols(board)
+    cvol = crypto_volumes()
     rows = []
     for sym, df in bars.items():
+        if config.excluded(sym) or not liquid(sym, df, cvol):
+            continue
         m = metrics(df)
         if not m:
             continue

@@ -1,27 +1,21 @@
-"""Торговый зал: цепочка ролей по одному активу с публикацией каждого отчёта на шину board.db.
-Аналитики (Gemini) -> bull/bear x2 раунда (промпты TradingAgents, LLM=claude -p) -> trader -> risk (+Riskfolio CVaR)
--> PM (+PyPortfolioOpt) -> RiskGate (код) -> executor -> Alpaca paper. Любой невалидный ответ роли после аналитиков = пропуск актива."""
+"""Торговый зал (v4, облако): один актив за проход, без claude -p.
+Данные -> технический сигнал (код) -> блокировки (лимиты, режим «паника», события, остывание после стопа) -> аналитики (Gemini, с кэшем 90 мин)
+-> правило входа (entry.py: «за» не меньше половины и больше «против»; неполные данные = половинный объём) -> RiskGate (лимиты риска, код) -> Alpaca paper.
+Каждая отсечка пишется в journal.nogo (для вечернего блока «Почему не вошли»)."""
 import concurrent.futures as cf
 import datetime as dt
-import json
-import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 
-from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
-from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
-
-from . import agents, data, events, factcheck, portfolio, regime, review, weights
-from .board import PICTURE_MAX_AGE_H, RejectedReport
-from . import config
+from . import agents, config, data, entry, events, factcheck, regime
+from .alpaca import AlpacaError
 from .config import COSTS, Limits, make_asset
-from .llm import LLMError, LLMUnavailable
+from .llm import LLMError, LLMUnavailable, budget_allow
 from .risk import RiskGate
 
-INVESTORS = ("buffett", "munger", "druckenmiller")
-ROUNDS = 2
+VOTES_TTL_H = 1.5   # свежие голоса аналитиков по активу переиспользуем (экономия бюджета Gemini)
 
 
 def utcnow() -> str:
@@ -38,54 +32,17 @@ class Result:
 
 
 class Skip(Exception):
-    """Актив пропускается в этом цикле (невалидный ответ роли, лимиты LLM, нет данных)."""
-
-
-class DebateLLM:
-    """Утка под TradingAgents: node вызывает llm.invoke(prompt).content. Добавляет правило цитирования и парсит REFS_JSON."""
-    def __init__(self, claude):
-        self.claude, self.allowed, self.must, self.last, self.feedback, self.must_ids = claude, [], "", None, None, []
-        self.lessons: list[str] = []
-
-    def invoke(self, prompt):
-        extra = f"\nYou MUST cite these report ids explicitly: {self.must_ids}." if self.must_ids else ""
-        extra += f"\nYour previous reply was rejected: {self.feedback}. Fix it." if self.feedback else ""
-        extra += "\nLessons from our past closed trades (use if the situation is similar): " + " | ".join(self.lessons) if self.lessons else ""
-        text = self.claude.text(None, prompt + agents.REFS_TEXT % (self.allowed, self.must) + extra, "")
-        m = re.search(r"REFS_JSON:\s*(\{.*\})\s*$", text.strip(), re.S)
-        if not m:
-            raise LLMError("дебаты: нет REFS_JSON")
-        try:
-            j = json.loads(m.group(1))
-            agree, dispute = [int(x) for x in j.get("agree", [])], [int(x) for x in j.get("dispute", [])]
-            self.last = {"refs": agree + dispute, "stances": {**{i: "agree" for i in agree}, **{i: "dispute" for i in dispute}},
-                         "confidence": float(j["confidence"]), "stance": str(j["stance"]).lower()}
-        except (ValueError, KeyError, TypeError) as e:
-            raise LLMError(f"дебаты: битый REFS_JSON ({e})") from e
-        if self.last["stance"] not in ("buy", "sell", "hold"):
-            raise LLMError("дебаты: stance вне buy/sell/hold")
-        missing = [i for i in self.must_ids if i not in self.last["refs"]]
-        if missing:
-            raise LLMError(f"не процитированы обязательные отчёты {missing}")
-        return SimpleNamespace(content=text[:m.start()].strip())
-
-
-def _refs(raw: dict, role: str) -> tuple[list[int], dict]:
-    try:
-        refs = [int(x) for x in raw["refs"]]
-        stances = {int(k): str(v).lower() for k, v in dict(raw["stances"]).items()}
-    except (KeyError, TypeError, ValueError) as e:
-        raise LLMError(f"{role}: нет/битые refs/stances ({e})") from e
-    return refs, stances
+    """Актив пропускается в этом проходе (нет данных, лимиты LLM)."""
 
 
 class Hall:
-    def __init__(self, board, journal, broker, router, claude, lab=None, notify=None, limits: Limits = Limits(), auto_trade=True, picture=None, smart=None):
-        self.board, self.j, self.broker, self.router, self.claude = board, journal, broker, router, claude
-        self.picture = picture or (lambda: board.latest('picture', max_age_h=PICTURE_MAX_AGE_H))  # актуальная «Картина дня» (обязательна для ссылок)
-        self.smart = smart   # coin -> {stance, confidence, rationale} | None (умные деньги, 3.3)
+    def __init__(self, board, journal, broker, router, lab=None, notify=None, limits: Limits = Limits(), auto_trade=True, smart=None, fresh_rounds: int = 3):
+        self.board, self.j, self.broker, self.router = board, journal, broker, router
+        self.smart = smart   # coin -> {stance, confidence, rationale} | None (умные деньги)
         self.lab, self.notify, self.gate, self.auto_trade = lab, notify or (lambda t: None), RiskGate(limits), auto_trade
         self.exec_lock = threading.Lock()
+        self.fresh_left = fresh_rounds   # сколько новых раундов аналитиков можно запустить за проход (бюджет Gemini)
+        self._fresh_lock = threading.Lock()
 
     # ---------- состояние ----------
     def _account(self, asset, ts):
@@ -100,130 +57,67 @@ class Hall:
                 "entries_today": self.j.entries_on(ts[:10]), "open_positions": len(self.j.positions()),
                 "position": {k: pos[k] for k in ("qty", "avg", "stop", "take")} if pos else None}
 
-    # ---------- публикация с повтором ----------
-    def _chain_call(self, cid, role, asset, call, must_cite):
-        """call() -> (verdict, confidence, refs, stances, data, raw). 2 попытки: ошибка LLM или отклонение шиной -> повтор -> Skip."""
-        last = None
-        for _ in range(2):
-            try:
-                verdict, conf, refs, stances, d, raw = call(str(last) if last else None)
-                rid = self.board.publish(cid, role, asset, verdict, conf, refs, stances, d, must_cite)
-                return rid, raw
-            except LLMUnavailable as e:
-                raise Skip(f"{role}: лимит LLM ({e})") from e
-            except (LLMError, RejectedReport) as e:
-                last = e
-        raise Skip(f"{role}: невалидный ответ -> пропуск ({last})")
-
-    def _ask_json(self, role, payload, must, fb=None):
-        if fb:
-            payload = {**payload, "previous_rejection": fb}
-        return self.claude.ask(role, payload, system=agents.system_prompt(role, must))
+    def _nogo(self, ts, asset, stage, reason, tech, votes=None, score=None):
+        self.j.add_nogo(ts, asset.name, stage, reason, entry.proximity(tech, votes) if score is None else score)
 
     # ---------- аналитики ----------
-    def _analysts(self, cid, asset, b):
-        payloads = {"market": {"market": {k: b[k] for k in ("indicators_1h", "indicators_4h", "last_candles_1h", "tradingview")}},
-                    "news": {"asset": asset.name, "news": b["news"]},
-                    "fundamentals": {"asset": asset.name, "kind": asset.kind, "fundamentals": b["fundamentals"]}}
+    def _payloads(self, asset, b) -> dict:
+        p = {"market": {"market": {k: b[k] for k in ("indicators_1h", "indicators_4h", "last_candles_1h", "tradingview")}},
+             "news": {"asset": asset.name, "news": b["news"]},
+             "fundamentals": {"asset": asset.name, "kind": asset.kind, "fundamentals": b["fundamentals"]}}
         try:
-            payloads["quant"] = {"asset": asset.name, "quant": agents.quant_stats(asset)}
+            p["quant"] = {"asset": asset.name, "quant": agents.quant_stats(asset)}
         except Exception as e:  # noqa: BLE001
-            payloads["quant"] = {"error": f"unavailable: {type(e).__name__}"}
-        if asset.kind == "stock":
-            try:
-                inv = agents.investor_data(asset)
-                for r in INVESTORS:
-                    payloads[r] = {"asset": asset.name, **inv}
-            except Exception:  # noqa: BLE001 — нет фундаментала: инвесторы не голосуют
-                pass
+            p["quant"] = {"error": f"unavailable: {type(e).__name__}"}
         if asset.kind == "crypto":
-            payloads["fundamentals"]["derivatives"] = b.get("derivatives")
+            p["fundamentals"]["derivatives"] = b.get("derivatives")
+        q = {"decision": f"open a small LONG position in {asset.name} now? Stop {entry.STOP_ATR:g}*ATR below, take-profit {entry.TAKE_ATR:g}*ATR above, horizon ~24h. "
+                         "buy = risk/reward from your domain looks favourable; hold = no edge; sell = expect decline; abstain = your data is missing."}
+        return {k: {**v, "question": q} for k, v in p.items()}
+
+    def _ask_analysts(self, asset, b) -> list[dict]:
+        payloads = self._payloads(asset, b)
 
         def one(role):
             try:
                 n = agents.run_analyst(role, self.router, payloads[role])
-            except (LLMError, KeyError) as e:  # лимит/невалидный ответ аналитика = пропуск его голоса
+            except (LLMError, KeyError) as e:   # лимит/невалидный ответ = воздержался
                 n = {"stance": "abstain", "confidence": 0.0, "rationale": f"{type(e).__name__}: {str(e)[:150]}"}
-            return role, n
+            return {"role": role, **n}
         with cf.ThreadPoolExecutor(3) as ex:
-            res = list(ex.map(one, list(payloads)))
-        res = self._verify_analysts(cid, asset, res, payloads, b)
-        out = []
-        for role, n in res:
-            rid = self.board.publish(cid, role, asset.name, f"{n['stance']}: {n['rationale']}", n["confidence"],
-                                     data={**n, "price": b["indicators_1h"]["close"]})
-            out.append({"id": rid, "role": role, **n})
-        if self.lab:
-            sig = self.lab(asset.name)
-            if sig:
-                rid = self.board.publish(cid, "lab", asset.name, f"{sig['stance']}: {sig['rationale']}", sig["confidence"],
-                                         data={**sig, "price": b["indicators_1h"]["close"]})
-                out.append({"id": rid, "role": "lab", **sig})
+            out = list(ex.map(one, list(payloads)))
         if self.smart and asset.kind == "crypto":
             try:
                 sm = self.smart(asset.hl_coin)
             except Exception:  # noqa: BLE001 — внешний источник не критичен
                 sm = None
             if sm:
-                rid = self.board.publish(cid, "smartmoney", asset.name, f"{sm['stance']}: {sm['rationale']}", sm["confidence"], data={**sm, "price": b["indicators_1h"]["close"]})
-                out.append({"id": rid, "role": "smartmoney", "stance": sm["stance"], "confidence": sm["confidence"], "rationale": sm["rationale"]})
+                out.append({"role": "smartmoney", "stance": sm["stance"], "confidence": sm["confidence"], "rationale": sm["rationale"]})
         return out
 
-    def _research_ctx(self, asset) -> dict:
-        """Свежие выводы исследовательского отдела по активу: новости, деривативы, события ближайших 6 часов."""
-        out = {}
-        nd = self.board.latest("newsdesk", max_age_h=3)
-        if nd and asset.name in nd["data"].get("assets", {}):
-            out["news_desk"] = nd["data"]["assets"][asset.name]
-        cd = self.board.latest("cryptodesk", max_age_h=3)
-        if cd and asset.kind == "crypto":
-            out["crypto_desk"] = {"market": cd["data"].get("market"), "asset": cd["data"].get("assets", {}).get(asset.hl_coin)}
-        up = events.upcoming(self.board, 6)
-        if up:
-            out["events_next_6h"] = [{"when_utc": e["ts"], "what": events.title_ru(e), "impact": e["impact"]} for e in up][:5]
-        return out
+    def _votes(self, asset, b, now=None) -> tuple[list[dict], str]:
+        """(голоса, источник: 'fresh'|'cache'|'queue'|'budget'). queue/budget — голосов нет: лимит раундов за проход или бюджет Gemini."""
+        now = now or time.time()
+        c = self.j.kv_get(f"votes:{asset.name}")
+        if c and now - c["t"] < VOTES_TTL_H * 3600:
+            return c["analysts"], "cache"
+        if not budget_allow("market"):
+            return [], "budget"
+        with self._fresh_lock:
+            if self.fresh_left <= 0:
+                return [], "queue"
+            self.fresh_left -= 1
+        analysts = self._ask_analysts(asset, b)
+        if entry.count_votes(analysts).live:
+            self.j.kv_set(f"votes:{asset.name}", {"t": now, "analysts": analysts})
+        return analysts, "fresh"
 
-    @staticmethod
-    def _pic_line(pic):
-        d = pic["data"]
-        return (f"[#{pic['id']} picture] regime={d.get('regime')} size_mult={d.get('size_mult')} (conf {pic['confidence']:.2f}): {d.get('summary', '')} "
-                f"Risks: {'; '.join(d.get('main_risks', []))}. Forbidden today: {'; '.join(d.get('forbidden', []))}")
-
-    # ---------- проверка фактов (2.4) ----------
-    def _facts(self, b):
-        return factcheck.facts_for(b)
-
-    def _fc(self, claims, facts) -> dict:
-        """Провалившиеся проверки. Контролёр недоступен (лимит/сбой) — проверка пропускается, не блокируя зал."""
-        try:
-            return factcheck.check(self.router, claims, facts)
-        except (LLMUnavailable, LLMError):
-            return {}
-
-    def _reject_log(self, cid, role, asset, reason):
-        self.board.x("INSERT INTO rejected(cycle_id,role,asset,ts,reason,payload) VALUES(?,?,?,?,?,?)",
-                     (cid, role, asset, utcnow(), f"факты не сошлись: {reason}"[:500], "{}"))
-
-    def _verify_analysts(self, cid, asset, res, payloads, b):
-        facts = self._facts(b)
-        bad = self._fc({r: n["rationale"] for r, n in res if n["stance"] != "abstain"}, facts)
-        if not bad:
-            return res
-        out = dict(res)
-        for role, mm in bad.items():
-            self._reject_log(cid, role, asset.name, "; ".join(mm))
-            try:
-                out[role] = agents.run_analyst(role, self.router, {**payloads[role], "previous_rejection": "numbers in your previous report contradict the data: " + "; ".join(mm)})
-            except (LLMError, KeyError):
-                out[role] = {"stance": "abstain", "confidence": 0.0, "rationale": "переделка не удалась"}
-        bad2 = self._fc({r: out[r]["rationale"] for r in bad if out[r]["stance"] != "abstain"}, facts)
-        for role, mm in bad2.items():
-            self._reject_log(cid, role, asset.name, "повтор: " + "; ".join(mm))
-            out[role] = {"stance": "abstain", "confidence": 0.0, "rationale": "отчёт не прошёл проверку фактов: " + "; ".join(mm)[:200]}
-        return [(r, out[r]) for r, _ in res]
+    def _publish_votes(self, cid, asset, analysts, price):
+        for r in analysts:
+            r["id"] = self.board.publish(cid, r["role"], asset.name, f"{r['stance']}: {r['rationale']}", r["confidence"], data={**r, "price": price})
 
     def _cross_price(self, asset, price):
-        """Цена из свечей против снапшота Alpaca (независимый источник): расхождение > 1,5% — данные ненадёжны, актив пропускается."""
+        """Цена из свечей против снапшота Alpaca (независимый источник): расхождение > 1,5% — данные ненадёжны."""
         cl = getattr(self.broker, "c", None)
         if cl is None or not hasattr(cl, "price"):
             return
@@ -234,247 +128,121 @@ class Hall:
         if factcheck.price_gap(price, other) > 0.015:
             raise Skip(f"цены источников расходятся ({price:.6g} против {other:.6g})")
 
-    @staticmethod
-    def _tagged(reports):
-        return "\n".join(f"[#{r['id']} {r['role']}] {r['stance']} (conf {r['confidence']:.2f}): {r['rationale']}" for r in reports)
-
-    # ---------- дебаты ----------
-    def _debate(self, cid, asset, analysts, b, pic, fact_fb=None):
-        live = [r for r in analysts if r["stance"] != "abstain"]
-        by = lambda *roles: self._tagged([r for r in live if r["role"] in roles]) or "(no report)"  # noqa: E731
-        state = {"company_of_interest": asset.alpaca, "asset_type": asset.kind,
-                 "market_report": by("market", "quant", "lab", "smartmoney") + "\n" + self._pic_line(pic), "sentiment_report": by(*INVESTORS) if asset.kind == "stock" else by("quant"),
-                 "news_report": by("news"), "fundamentals_report": by("fundamentals"),
-                 "investment_debate_state": {"history": "", "bull_history": "", "bear_history": "", "current_response": "", "count": 0}}
-        duck = DebateLLM(self.claude)
-        duck.lessons = review.lessons_for(self.board, asset.name, asset.kind)
-        nodes = {"bull": create_bull_researcher(duck), "bear": create_bear_researcher(duck)}
-        ids = [r["id"] for r in live]
-        last = {}  # role -> id последнего отчёта
-        texts = {}
-        for rnd in range(1, ROUNDS + 1):
-            for role in ("bull", "bear"):
-                other = "bear" if role == "bull" else "bull"
-                must = ["analyst", "picture"] + ([other] if other in last else [])
-                allowed = ids + [pic["id"]] + ([last[other]] if other in last else []) + ([last[role]] if role in last else [])
-
-                def call(fb=None, role=role, must=must, allowed=allowed, other=other):
-                    duck.allowed, duck.must, duck.last, duck.feedback = allowed, ", ".join(must), None, fb or fact_fb
-                    duck.must_ids = [pic["id"]] + ([last[other]] if other in last else [])
-                    st = {**state, "investment_debate_state": dict(state["investment_debate_state"])}
-                    new = nodes[role](st)["investment_debate_state"]
-                    text = new["current_response"].split(":", 1)[1].strip()
-                    j = duck.last
-                    return (f"{j['stance']}: {text[:600]}", j["confidence"], j["refs"], j["stances"],
-                            {"round": rnd, "stance": j["stance"], "text": text, "price": b["indicators_1h"]["close"]}, (new, text))
-                rid, (new, text) = self._chain_call(cid, role, asset.name, call, tuple(must))
-                state["investment_debate_state"] = new
-                last[role], texts[role] = rid, text
-                new["history"] += f" [report #{rid}]"  # оппонент видит id отчёта, на который можно сослаться
-        return last, texts
-
-    # ---------- основной цикл ----------
+    # ---------- основной проход ----------
     def run_asset(self, symbol: str) -> Result:
         asset, cid, ts = make_asset(symbol), uuid.uuid4().hex[:12], utcnow()
         try:
             return self._run(asset, cid, ts)
         except Skip as e:
+            self.j.add_nogo(ts, asset.name, "data", str(e), 0.0)
             return Result(asset.name, "skipped", str(e), cid)
-        except (LLMError, RejectedReport) as e:  # любая ошибка/невалидный ответ -> пропуск актива
+        except (LLMError, LLMUnavailable) as e:
             return Result(asset.name, "skipped", f"{type(e).__name__}: {e}", cid)
-        except Exception as e:  # noqa: BLE001 — сбой одного актива не валит цикл остальных
+        except Exception as e:  # noqa: BLE001 — сбой одного актива не валит проход по остальным
             return Result(asset.name, "error", f"{type(e).__name__}: {e}"[:200], cid)
 
     def _run(self, asset, cid, ts) -> Result:
         try:
             df = data.candles(asset, "1h", **({"limit": 500} if asset.kind == "crypto" else {"rng": "60d"}))
             if len(df) < 210:
-                raise Skip("мало свечей")
+                raise Skip(f"мало свечей ({len(df)})")
             b = data.bundle(asset, df)
         except Skip:
             raise
         except Exception as e:  # noqa: BLE001
             raise Skip(f"нет данных: {type(e).__name__}") from e
-        price, atr = b["indicators_1h"]["close"], b["indicators_1h"]["atr14"]
+        ind = b["indicators_1h"]
+        price, atr = ind["close"], ind["atr14"]
+        if not atr:
+            raise Skip("нет ATR")
         self._cross_price(asset, price)
         run_id = self.j.add_run(ts, asset.name, price, atr, cid)
         acct = self._account(asset, ts)
+        if acct["position"]:   # позицию ведёт manage.py (стоп/тейк/частичная фиксация); новых входов по активу нет
+            self.j.set_summary(run_id, "hold: позиция открыта")
+            return Result(asset.name, "hold", "позиция уже открыта", cid)
+        tech = entry.technical(ind)
 
-        if not acct["position"]:  # лимиты исчерпаны -> новый вход невозможен: не тратим LLM-бюджет
-            l = self.gate.l
-            why = ("дневной стоп" if self.gate.trading_halted(acct["equity"], acct["day_start_equity"]) else
-                   "лимит входов/сутки" if acct["entries_today"] >= l.max_trades_day else
-                   "лимит позиций" if acct["open_positions"] >= l.max_positions else "")
-            if why:
-                self.j.set_summary(run_id, f"skip: {why}")
-                return Result(asset.name, "hold", f"{why}: новый вход невозможен", cid)
-        pic = self.picture()
-        if not pic:
-            raise Skip("нет актуальной «Картины дня» — без неё зал не работает")
-        pd_ = pic["data"]
-        rg = regime.current(self.board, asset.kind)          # режим рынка (3.1); нет свежего — ограничений нет
+        def hold(stage, why, votes=None, score=None):
+            self.j.set_summary(run_id, f"{stage}: {why}")
+            self._nogo(ts, asset, stage, why, tech, votes, score)
+            return Result(asset.name, "hold", why, cid)
+
+        # --- блокировки: лимиты риска (RiskGate проверит ещё раз перед ордером) и защитные запреты ---
+        l = self.gate.l
+        if self.gate.trading_halted(acct["equity"], acct["day_start_equity"]):
+            return hold("limits", f"дневной стоп {l.daily_stop:.0%} достигнут", score=0.95 if tech.signal else None)
+        if acct["entries_today"] >= l.max_trades_day:
+            return hold("limits", f"лимит {l.max_trades_day} входов в сутки исчерпан", score=0.95 if tech.signal else None)
+        if acct["open_positions"] >= l.max_positions:
+            return hold("limits", f"лимит {l.max_positions} позиций исчерпан", score=0.95 if tech.signal else None)
+        if config.STOP_FILE.exists():
+            return hold("halt", "включён режим паузы (STOP): новые входы запрещены")
+        rg = regime.current(self.board, asset.kind)
         rname = rg["regime"] if rg else None
-        if not acct["position"] and rname == "panic":
-            self.j.set_summary(run_id, "skip: режим паника")
-            return Result(asset.name, "hold", "режим рынка: паника — новые входы запрещены", cid)
-        if not acct["position"]:  # запреты исследовательского отдела: до LLM-вызовов (экономия бюджета)
-            why = (f"событие: {events.blocked(self.board, asset.name, asset.kind)}" if events.blocked(self.board, asset.name, asset.kind) else
-                   "картина дня: новые входы запрещены" if pd_.get("no_new_entries") else
-                   "картина дня: актив в списке запретов" if asset.name in (pd_.get("avoid_assets") or []) else "")
-            if why:
-                self.j.set_summary(run_id, f"skip: {why}")
-                return Result(asset.name, "hold", why, cid)
-        analysts = self._analysts(cid, asset, b)
-        wts, st = weights.active(self.board), weights.stats(self.board)
-        for r in analysts:   # роль, отключённая владельцем (после «да»), не голосует
-            if wts.get(r["role"], {}).get("disabled"):
-                r["stance"], r["confidence"] = "abstain", 0.0
-            r["weight"] = round(weights.weight_of(wts, r["role"]) * regime.prior(rname, r["role"]), 3)
-            r["conf_calibrated"] = weights.calibrated_conf(st, r["role"], r["confidence"])
-        live = [r for r in analysts if r["stance"] != "abstain"]
-        if len(live) < 2:
-            raise Skip(f"недостаточно аналитиков ({len(live)} из {len(analysts)}; остальные abstain)")
-        if not acct["position"] and not any(r["stance"] in ("buy", "sell") and r["confidence"] * r["weight"] >= 0.5 for r in live):
-            self.j.set_summary(run_id, "short-circuit: нет directional мнения >=0.5")
-            return Result(asset.name, "hold", "short-circuit: нет directional мнения >=0.5", cid)
+        if rname == "panic":
+            return hold("regime", "режим рынка «паника»: новые входы запрещены")
+        ev = events.blocked(self.board, asset.name, asset.kind)
+        if ev:
+            return hold("event", f"событие: {ev}")
+        last = self.j.q("SELECT exit_ts FROM trades WHERE asset=? AND exit_reason='stop' ORDER BY id DESC LIMIT 1", (asset.name,))
+        if last:
+            try:
+                t = dt.datetime.fromisoformat(last[0]["exit_ts"])
+                t = t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+                if (dt.datetime.now(dt.timezone.utc) - t).total_seconds() < entry.COOLDOWN_H * 3600:
+                    return hold("cooldown", f"остывание: стоп по активу был меньше {entry.COOLDOWN_H:g} ч назад")
+            except ValueError:
+                pass
+        if not tech.signal:
+            return hold("signal", "нет технического сигнала: " + ("; ".join(tech.notes[:2]) or "условия не выполнены"))
 
-        last, texts = self._debate(cid, asset, analysts, b, pic)
-        bad = self._fc(texts, self._facts(b))
-        if bad:   # бык/медведь привели неверные факты: спор переделывается один раз
-            fb = "factual errors in the previous debate, correct them using only the data: " + "; ".join(f"{k}: {' / '.join(v)}" for k, v in bad.items())
-            for k, v in bad.items():
-                self._reject_log(cid, k, asset.name, "; ".join(v))
-            last, texts = self._debate(cid, asset, analysts, b, pic, fact_fb=fb)
-            bad = self._fc(texts, self._facts(b))
-            if bad:
-                for k, v in bad.items():
-                    self._reject_log(cid, k, asset.name, "повтор: " + "; ".join(v))
-                raise Skip("факты в споре быка и медведя не подтвердились")
-        reports = [{"id": r["id"], "role": r["role"], "stance": r["stance"], "confidence": r["confidence"], "weight": r["weight"], "calibrated_confidence": r["conf_calibrated"],
-                    "track_record": weights.track_record(st, r["role"]), "rationale": r["rationale"]} for r in live]
-        reports += [{"id": last[k], "role": k, "stance": "-", "confidence": 0.0, "rationale": texts[k][:500]} for k in ("bull", "bear")]
-        reports.append({"id": pic["id"], "role": "picture", "stance": pd_.get("regime", "neutral"), "confidence": pic["confidence"],
-                        "rationale": f"{pd_.get('summary', '')} Risks: {'; '.join(pd_.get('main_risks', []))}. Forbidden today: {'; '.join(pd_.get('forbidden', []))}"})
-        tp = {"asset": asset.name, "price": price, "atr14": atr, "account": acct, "position": acct["position"], "reports": reports,
-              "day_picture": {"regime": pd_.get("regime"), "size_mult": pd_.get("size_mult"), "priority_assets": pd_.get("priority_assets"), "expectation": pd_.get("expectation")},
-              "research": self._research_ctx(asset), "market_regime": {"regime": rname, "why": (rg or {}).get("why"), "guidance": regime.GUIDANCE.get(rname)}, "weighted_vote": weights.weighted_vote(live, wts), "lessons": review.lessons_for(self.board, asset.name, asset.kind)}
+        # --- голоса аналитиков (Gemini) ---
+        analysts, src = self._votes(asset, b)
+        votes = entry.count_votes(analysts)
+        if not votes.live:
+            why = {"queue": "очередь аналитиков: за проход разбирается ограниченное число активов (бюджет Gemini)",
+                   "budget": "дневной бюджет Gemini исчерпан"}.get(src, "нет голосов аналитиков (Gemini недоступен или все воздержались)")
+            return hold("votes", why, votes, score=0.5 + 0.25)
+        self._publish_votes(cid, asset, analysts, price)
+        if not entry.majority(votes):
+            return hold("votes", f"аналитики не одобрили: «за» {votes.buy}, «против» {votes.sell}, сомневаются {votes.hold} (нужно «за» не меньше половины и больше «против»)", votes)
 
-        def trader(fb=None):
-            raw = self._ask_json("trader", tp, "bull, bear and picture (the Picture of the Day)", fb)
-            a = str(raw.get("action", "")).lower()
-            if a not in ("buy", "sell", "hold"):
-                raise LLMError(f"trader: action {a!r}")
-            refs, st = _refs(raw, "trader")
-            bad_t = self._fc({"trader": str(raw.get("rationale", ""))}, self._facts(b))
-            if bad_t:
-                self._reject_log(cid, "trader", asset.name, "; ".join(bad_t["trader"]))
-                raise RejectedReport("trader: факты не сошлись с данными: " + "; ".join(bad_t["trader"]))
-            return (f"{a}: {str(raw.get('rationale', ''))[:400]}", float(raw["confidence"]), refs, st, {**raw, "action": a}, raw)
-        tid, t = self._chain_call(cid, "trader", asset.name, trader, ("bull", "bear", "picture"))
-        action = str(t["action"]).lower()
-        if action == "hold" or (action == "sell" and not acct["position"]):
-            self.j.set_summary(run_id, f"trader: {action}")
-            return Result(asset.name, "hold", "trader: hold", cid)
-        if action == "sell":
-            return self._close(asset, cid, run_id, ts, price, tid, acct)
+        # --- решение: размер ---
+        gaps = entry.data_gaps(b, votes)
+        mult = entry.HALF if gaps else 1.0
+        mult = min(mult, regime.SIZE_MULT.get(rname, 1.0))
+        stop, take = entry.levels(price, atr)
+        why = f"сигнал «{ 'тренд' if tech.kind == 'trend' else 'отскок' }», «за» {votes.buy} из {votes.live}" + (f"; половинный объём: {'; '.join(gaps)}" if gaps else "")
+        self.board.publish(cid, "decision", asset.name, f"buy: {why}", 0.6, data={"tech": tech.kind, "votes": votes.__dict__, "gaps": gaps, "size_mult": mult, "stop": stop, "take": take, "price": price})
 
-        entry = float(t.get("entry") or price)
-        try:
-            stop, take = float(t["stop"]), float(t["take_profit"])
-        except (KeyError, TypeError, ValueError) as e:
-            raise Skip(f"trader: нет stop/take_profit ({e})") from e
-        if not (0 < stop < entry < take):
-            raise Skip(f"trader: нелогичные уровни stop={stop} entry={entry} take={take}")
-        # --- risk: Riskfolio CVaR + wshobson risk-manager ---
-        syms = [asset.name] + [s for s in self.j.positions() if s != asset.name]
-        px = portfolio.daily_closes(syms)
-        rets = px.pct_change().dropna()
-        w_new = {asset.name: self.gate.l.max_notional}
-        w_held = {s: self.gate.l.max_notional for s in syms}
-        cv = {"asset_cvar95_daily": round(portfolio.cvar95(rets[[asset.name]], {asset.name: 1.0}), 4) if asset.name in rets else None,
-              "portfolio_cvar95_with_candidate": round(portfolio.cvar95(rets, w_held), 4) if len(rets) > 30 else None,
-              "held": list(self.j.positions()), "candidate_notional_cap": w_new[asset.name]}
-        rp = {**tp, "proposal": t, "riskfolio": cv, "reports": reports + [{"id": tid, "role": "trader", "stance": action, "confidence": float(t["confidence"]), "rationale": str(t.get("rationale", ""))[:400]}]}
-
-        def risk(fb=None):
-            raw = self._ask_json("risk_manager", rp, "trader", fb)
-            v = str(raw.get("verdict", "")).lower()
-            if v not in ("approve", "reduce", "reject"):
-                raise LLMError(f"risk_manager: verdict {v!r}")
-            refs, st = _refs(raw, "risk_manager")
-            return (f"{v}: {str(raw.get('rationale', ''))[:400]}", 0.5 if v != "reject" else 0.8, refs, st, {**raw, "riskfolio": cv}, raw)
-        rid, rm = self._chain_call(cid, "risk_manager", asset.name, risk, ("trader",))
-        # --- PM: PyPortfolioOpt ---
-        alloc = portfolio.allocate(px, self.gate.l.max_notional) if len(px.columns) and len(rets) > 30 else {}
-        w_pm = min(self.gate.l.max_notional, max(0.05, alloc.get(asset.name, 0.05)))
-        pp = {**rp, "risk_manager": rm, "pyportfolioopt": {"weights": {k: round(v, 3) for k, v in alloc.items()}, "weight_cap_for_candidate": round(w_pm, 3)},
-              "reports": rp["reports"] + [{"id": rid, "role": "risk_manager", "stance": str(rm["verdict"]), "confidence": 0.5, "rationale": str(rm.get("rationale", ""))[:300]}]}
-
-        def pm(fb=None):
-            raw = self._ask_json("portfolio_manager", pp, "trader, risk_manager", fb)
-            d = str(raw.get("decision", "")).lower()
-            if d not in ("approve", "reject"):
-                raise LLMError(f"portfolio_manager: decision {d!r}")
-            refs, st = _refs(raw, "portfolio_manager")
-            return (f"{d}: {str(raw.get('rationale', ''))[:400]}", 0.6, refs, st, {**raw, "pyportfolioopt": pp["pyportfolioopt"]}, raw)
-        pid, pmr = self._chain_call(cid, "portfolio_manager", asset.name, pm, ("trader", "risk_manager"))
-        if str(rm["verdict"]).lower() == "reject" or str(pmr["decision"]).lower() == "reject":
-            why = "risk_manager: reject" if str(rm["verdict"]).lower() == "reject" else "portfolio_manager: reject"
-            self.j.add_decision(run_id, ts, asset.name, "buy", entry, stop, take, None, "rejected", why)
-            return Result(asset.name, "rejected", why, cid)
-        mult = min(1.0, max(0.0, float(pmr.get("size_mult", 1.0) or 0)), float(pd_.get("size_mult", 1.0)), regime.SIZE_MULT.get(rname, 1.0))  # картина дня и режим рынка могут только уменьшить
-        if str(rm["verdict"]).lower() == "reduce":
-            mult = min(mult, min(1.0, max(0.0, float(rm.get("size_mult", 1.0) or 0))))
-        # --- RiskGate (код) + исполнение: под локом и со свежим состоянием счёта (лимиты не гонятся между параллельными активами) ---
+        # --- RiskGate (код) + исполнение: под локом и со свежим состоянием счёта ---
         with self.exec_lock:
             if config.STOP_FILE.exists():
-                return Result(asset.name, "hold", "STOP-файл: новые решения не принимаются", cid)
+                return hold("halt", "включён режим паузы (STOP): новые входы запрещены")
             acct = self._account(asset, utcnow())
-            v = self.gate.check_entry(kind=asset.kind, costs=COSTS[asset.kind], entry=entry, stop=stop, atr=atr, equity=acct["equity"],
+            live = getattr(self.broker, "live_positions", lambda: {})()
+            if asset.alpaca.replace("/", "") in live:
+                return hold("broker", "по активу уже есть позиция у брокера", votes, score=0.9)
+            v = self.gate.check_entry(kind=asset.kind, costs=COSTS[asset.kind], entry=price, stop=stop, atr=atr, equity=acct["equity"],
                                       day_start_equity=acct["day_start_equity"], entries_today=acct["entries_today"],
                                       open_positions=acct["open_positions"], cash=acct["cash"], has_position=bool(acct["position"]), size_mult=mult)
-            qty = v.qty
-            if v.ok:
-                cap = w_pm * acct["equity"] / entry  # PM-распределение PyPortfolioOpt только уменьшает размер
-                qty = int(min(qty, cap)) if asset.kind == "stock" else int(min(qty, cap) * 1e6) / 1e6
-                if qty * entry < self.gate.l.min_notional_usd or qty <= 0:
-                    v.ok, v.reason = False, "размер после PM-распределения ниже минимума"
-            did = self.j.add_decision(run_id, ts, asset.name, "buy", entry, stop, take, qty, "ok" if v.ok else "rejected", v.reason)
+            did = self.j.add_decision(run_id, ts, asset.name, "buy", price, stop, take, v.qty, "ok" if v.ok else "rejected", v.reason)
             if not v.ok:
+                self._nogo(ts, asset, "riskgate", v.reason, tech, votes, score=0.95)
                 return Result(asset.name, "rejected", v.reason, cid)
-            ticket = {"asset": asset.name, "side": "buy", "qty": qty, "entry": price, "stop": stop, "take": take, "notional": round(qty * price, 2),
-                      "cash": acct["cash"], "equity": acct["equity"], "as_of": b["as_of"], "reports": [{"id": pid, "role": "portfolio_manager", "stance": "approve", "confidence": 0.6, "rationale": ""}]}
-
-            def execu(fb=None):
-                raw = self._ask_json("executor", ticket, "portfolio_manager", fb)
-                if "ticket_ok" not in raw:
-                    raise LLMError("executor: нет ticket_ok")
-                refs, st = _refs(raw, "executor")
-                return (f"{'ok' if raw['ticket_ok'] else 'issues'}: {str(raw.get('rationale', ''))[:300]}", 0.5, refs, st, raw, raw)
-            eid, ex = self._chain_call(cid, "executor", asset.name, execu, ("portfolio_manager",))
-            if ex.get("ticket_ok") is False:
-                self.j.update_decision(did, verdict="rejected", reason=f"executor: {ex.get('issues')}")
-                return Result(asset.name, "rejected", f"executor: {ex.get('issues')}", cid)
             if not self.auto_trade:
                 return Result(asset.name, "hold", "dry-run: ордер не отправлен", cid)
-            o = self.broker.buy(asset.name, qty, price, stop, take, ts, run_id)
+            try:
+                o = self.broker.buy(asset.name, v.qty, price, stop, take, ts, run_id)
+            except AlpacaError as e:
+                if "вручную" in str(e) or "СТОП НЕ ВСТАЛ" in str(e):
+                    raise
+                self._nogo(ts, asset, "broker", str(e)[:160], tech, votes, score=0.9)
+                return Result(asset.name, "skipped", f"брокер: {e}"[:200], cid)
             self.j.update_decision(did, executed=1)
-            try:   # решение трейдера о частичной фиксации (3.2); по умолчанию менеджер возьмёт +3%
-                pt = float(t.get("partial_take") or 0)
-                self.j.kv_set(f"partial_at:{asset.name}", pt if entry < pt < take else None)
-                self.j.kv_set(f"partial_done:{asset.name}", None)
-                self.j.kv_set(f"init_stop:{asset.name}", stop)
-            except (TypeError, ValueError):
-                pass
-            order = {**o, "order_id": self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"]}
-            return Result(asset.name, "opened", f"qty={qty} stop={stop} take={take}", cid, order)
-
-    def _close(self, asset, cid, run_id, ts, price, tid, acct):
-        did = self.j.add_decision(run_id, ts, asset.name, "sell", price, None, None, acct["position"]["qty"], "ok", "trader: закрыть", approved=1)
-        if not self.auto_trade:
-            return Result(asset.name, "hold", "dry-run: закрытие не отправлено", cid)
-        r = self.broker.sell(asset.name, price, ts, "signal")
-        self.j.update_decision(did, executed=1)
-        pos = acct["position"]
-        return Result(asset.name, "closed", f"pnl={r['pnl']:.2f}", cid,
-                      {"order_id": self.broker.last_order_id, **r, "pnl_pct": r["pnl"] / (pos["avg"] * pos["qty"]) if pos["avg"] * pos["qty"] else 0.0})
+            self.j.kv_set(f"partial_at:{asset.name}", None)
+            self.j.kv_set(f"partial_done:{asset.name}", None)
+            self.j.kv_set(f"init_stop:{asset.name}", stop)
+            order = {**o, "order_id": self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"], "half": bool(gaps), "gaps": gaps, "tech": tech.kind}
+            return Result(asset.name, "opened", f"qty={v.qty} stop={stop:.6g} take={take:.6g}" + (" (половинный объём)" if gaps else ""), cid, order)

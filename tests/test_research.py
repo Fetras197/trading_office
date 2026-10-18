@@ -35,7 +35,7 @@ def mk(handler, held=("ONDO/USD",), cands=("SOL/USD",), notify=None):
     return r, sent
 
 
-PIC_OK = {"regime": "risk_off", "summary": "Осторожность: ждём решение ФРС.", "main_risks": ["решение ФРС"], "priority_assets": ["SOL/USD", "FAKE"], "avoid_assets": ["ONDO/USD"],
+PIC_OK = {"regime": "risk_off", "summary": "Осторожность: ждём решение ФРС.", "main_risks": ["решение ФРС"], "priority_assets": ["SOL/USD", "FAKE"], "avoid_assets": [{"asset": "ONDO/USD", "reason": "взлом пула", "hours": 6}],
           "forbidden": ["не покупать перед ФРС"], "no_new_entries": False, "size_mult": 0.5, "confidence": 0.7, "expectation": "боковик", "lesson_of_previous": ""}
 
 
@@ -177,18 +177,18 @@ def test_weekly_job_only_on_its_weekday():
     assert s.run_due(at(20, 5, 11)) == ["j"]                       # 11-е — воскресенье
 
 
-def test_supervisor_wiring_without_running_anything():
-    """Только сборка (без запуска потоков/циклов): задания отдела на месте, зал получает ensure_picture, срочная новость подключена."""
-    from office.supervisor import Supervisor
+def test_office_wiring_without_running_anything():
+    """Только сборка: задания отдела на месте (без телефонных it/labtrial/weights), срочная новость подключена, зал получил лимит раундов Gemini."""
+    from office.cloud import Office
 
     class C:
         def account_view(self): return {}
         def price(self, s): return 1.0
-    s = Supervisor(board=Board(), journal=Journal(), client=C(), hall=object(), notify=lambda t: None)
+    s = Office(board=Board(), journal=Journal(), client=C(), notify=lambda t: None, router=object())
     names = [j.name for j in s.sched.jobs]
-    assert set(names) == {"events", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "labtrial", "it", "realmoney", "summary", "briefing", "evening", "weekly", "regime", "shadow", "review", "weights", "picture"}
-    assert names.index("events") < names.index("macro") < names.index("picture")   # порядок первичного наполнения: картина дня — последняя
-    assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []}
+    assert set(names) == {"events", "regime", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "realmoney", "shadow", "review", "summary", "picture", "briefing", "evening", "weekly"}
+    assert names.index("events") < names.index("macro") < names.index("picture")   # порядок первичного наполнения: картина дня — последняя среди исследований
+    assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []} and s.hall.fresh_left == 3
 
 
 def test_polymarket_parsing_sorted_and_closed_markets_dropped(monkeypatch):
@@ -206,3 +206,20 @@ def test_non_bootstrap_job_waits_for_its_time_after_first_sight():
     s = scheduler.Scheduler(Journal(), [scheduler.Job("b", lambda: ran.append(1), at=["08:00"], catchup_h=3, bootstrap=False)], log=lambda *a: None)
     assert s.run_due(at(15, 0)) == []                 # впервые увидели днём — утренний брифинг не запускаем
     assert s.run_due(at(7, 59, 13)) == [] and s.run_due(at(8, 1, 13)) == ["b"]
+
+
+def test_avoid_needs_reason_and_term_and_spares_priority_and_core():
+    raw = {**PIC_OK, "priority_assets": ["SOL/USD", "ONDO/USD"], "avoid_assets": [
+        "BTC/USD", {"asset": "BTC/USD", "reason": "просто так", "hours": 3}, {"asset": "ETH/USD", "reason": "нет срока"},
+        {"asset": "ONDO/USD", "reason": "приоритетный", "hours": 3}, {"asset": "XRP/USD", "reason": "без", "hours": 3},
+        {"asset": "AVAX/USD", "reason": "взлом моста", "hours": 99}, {"asset": "DOGE/USD", "reason": "делистинг на бирже", "hours": 6}]}
+    p = research.v_picture(raw, known_assets={"SOL/USD", "ONDO/USD"})
+    assert [e["asset"] for e in p["avoid_assets"]] == ["DOGE/USD"] and p["avoid_assets"][0]["until"]
+
+
+def test_picture_bans_expire_and_legacy_strings_ignored():
+    import datetime as dt
+    from office import events
+    now = dt.datetime(2026, 1, 1, 12, tzinfo=dt.timezone.utc)
+    d = {"avoid_assets": ["BTC/USD", {"asset": "A", "reason": "r" * 6, "until": "2026-01-01T13:00"}, {"asset": "B", "reason": "r" * 6, "until": "2026-01-01T11:00"}]}
+    assert list(events.picture_bans(d, now)) == ["A"]

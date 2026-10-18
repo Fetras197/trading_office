@@ -1,0 +1,77 @@
+name: office
+
+# Облачный офис: один проход каждые 30–60 минут. Состояние (office.db, board.db, бюджет Gemini, кэши) лежит в ветке `state`.
+# Стоп-кран с телефона: Settings → Secrets and variables → Actions → Variables → OFFICE_HALT=1 (новых покупок нет, позиции под защитными стопами) или Disable workflow.
+# Расписание подобрано под бесплатный лимит минут (2000/мес для приватного репозитория): в часы биржи (12:00–21:30 UTC, будни) — каждые 30 минут, в остальное время — раз в час.
+on:
+  schedule:
+    - cron: "*/30 12-21 * * 1-5"
+    - cron: "0 0-11,22-23 * * 1-5"
+    - cron: "0 * * * 0,6"
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Не гонять pytest перед проходом"
+        type: boolean
+        default: false
+
+concurrency:
+  group: office            # два прохода одновременно = два писателя в SQLite и двойные ордера
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TO_STATE: ${{ github.workspace }}/state
+      OFFICE_TZ: Europe/Minsk
+      PYTHONUNBUFFERED: "1"
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      ALPACA_PAPER: "true"
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      OFFICE_HALT: ${{ vars.OFFICE_HALT }}
+      GEMINI_DAILY_BUDGET: ${{ vars.GEMINI_DAILY_BUDGET || '450' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Состояние из ветки state
+        id: restore
+        run: |
+          git clone --quiet --depth 1 --branch state "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
+          rm -rf state/.git
+          mkdir -p state/logs state/data_cache
+          ls -la state
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Зависимости
+        run: pip install -r requirements.txt
+
+      - name: Тесты (только при ручном запуске)
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip_tests }}
+        run: python -m pytest -q -x -p no:cacheprovider
+
+      - name: Проход офиса
+        run: python -m office cloud
+
+      - name: Сохранить состояние в ветку state
+        if: ${{ always() && steps.restore.outcome == 'success' }}
+        run: |
+          python -m office prune
+          cd state
+          git init -q -b state
+          git config user.name "office-bot"
+          git config user.email "office-bot@users.noreply.github.com"
+          git add -f office.db board.db logs data_cache
+          git commit -q -m "state $(date -u +%FT%TZ) run ${{ github.run_id }}"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state

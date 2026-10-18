@@ -6,7 +6,7 @@ import json
 import sqlite3
 import threading
 
-ANALYSTS = ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller", "lab", "smartmoney")
+ANALYSTS = ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller", "lab", "smartmoney", "decision")
 # Исследовательский отдел (v3): глобальные отчёты (asset='*' или тикер), ссылок на других не требуют; зал цитирует их из любого цикла
 RESEARCH = ("macro", "calendar", "newsdesk", "cryptodesk", "sectors", "portfolio_an", "picture", "regime", "postmortem", "factcheck")
 STANCES = ("agree", "dispute")

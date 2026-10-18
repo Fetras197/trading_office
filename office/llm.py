@@ -1,22 +1,21 @@
 """LLM-бэкенды. Системный промпт роли = тело файла .claude/agents/<role>.md. Ответ — один JSON-объект."""
+import hashlib
 import json
 import os
-import re
-import subprocess
-import tempfile
 import threading
 import time
 
 import requests
 
-from .config import AGENTS_DIR, DEFAULT_CLAUDE_MODEL, ROLE_BACKEND, ROLE_MODELS
+from . import config
+from .config import AGENTS_DIR, GEMINI_BG, GEMINI_HALL
 
 
 class LLMError(Exception):
     pass
 
 
-_EVENTS: dict[str, list] = {"claude": [], "gemini": []}   # (время, ok) — для режима экономии (it.py)
+_EVENTS: dict[str, list] = {"gemini": []}   # (время, ok) — давление лимитов
 _EV_LOCK = threading.Lock()
 
 
@@ -43,6 +42,71 @@ class LLMUnavailable(LLMError):
     """Лимит/квота исчерпаны или сервис недоступен: роль пропускается (abstain), цикл не падает."""
 
 
+# ---------- бюджет Gemini на сутки (UTC) и «пауза» после 429 ----------
+DAILY_BUDGET = int(os.environ.get("GEMINI_DAILY_BUDGET", 450))   # HTTP-запросов в сутки на все роли
+BG_SHARE, MISC_SHARE = 0.25, 0.05                                # фоновым отделам и мелочи — не больше этих долей; остальное (≥70%) — залу
+BUDGET_FILE = config.STATE_DIR / "logs" / "gemini_budget.json"
+_BUD_LOCK = threading.Lock()
+_DOWN = {"until": 0.0, "since": 0.0}      # Gemini ушёл на паузу после 429: пока она идёт, запросы не отправляются
+
+
+def role_group(role: str) -> str:
+    return "hall" if role in GEMINI_HALL else "bg" if role in GEMINI_BG else "misc"
+
+
+def _budget_load() -> dict:
+    today = time.strftime("%F", time.gmtime())
+    try:
+        b = json.loads(BUDGET_FILE.read_text())
+        if b.get("day") == today:
+            return b
+    except (OSError, ValueError):
+        pass
+    return {"day": today, "hall": 0, "bg": 0, "misc": 0}
+
+
+def budget_allow(role: str) -> bool:
+    b = _budget_load()
+    group = role_group(role)
+    if sum(b[k] for k in ("hall", "bg", "misc")) >= DAILY_BUDGET:
+        return False
+    return group == "hall" or b[group] < DAILY_BUDGET * (BG_SHARE if group == "bg" else MISC_SHARE)
+
+
+def budget_spend(role: str) -> None:
+    with _BUD_LOCK:
+        b = _budget_load()
+        b[role_group(role)] += 1
+        try:
+            BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            BUDGET_FILE.write_text(json.dumps(b))
+        except OSError:
+            pass
+
+
+def gemini_down() -> bool:
+    return time.time() < _DOWN["until"]
+
+
+def gemini_pause(seconds: float) -> None:
+    now = time.time()
+    if now >= _DOWN["until"]:
+        _DOWN["since"] = now
+    _DOWN["until"] = max(_DOWN["until"], now + seconds)
+
+
+def status() -> dict:
+    """Gemini на паузе / сколько запросов бюджета потрачено сегодня."""
+    b = _budget_load()
+    return {"gemini_down": gemini_down(), "since": _DOWN["since"],
+            "budget_used": sum(b[k] for k in ("hall", "bg", "misc")), "budget": DAILY_BUDGET}
+
+
+def reset_state() -> None:
+    """Для тестов."""
+    _DOWN.update(until=0.0, since=0.0)
+
+
 def load_agent(role: str) -> str:
     text = (AGENTS_DIR / f"{role}.md").read_text()
     return text.split("---", 2)[2].strip()  # без frontmatter
@@ -65,42 +129,6 @@ def _prompt(payload: dict) -> str:
 class _Limited:
     """Ограничитель параллелизма (лимиты API)."""
     sem = threading.Semaphore(3)
-
-
-class ClaudeBackend:
-    def __init__(self, model: str = "", timeout: int = 240):
-        self.model, self.timeout = model, timeout
-        self.cwd = tempfile.mkdtemp(prefix="to_llm_")  # нейтральная папка: не подхватываем CLAUDE.md проектов
-
-    def text(self, system: str | None, prompt: str, model: str = "") -> str:
-        cmd = ["claude", "-p", prompt, "--tools", "", "--output-format", "json", "--no-session-persistence",
-               "--disable-slash-commands", "--setting-sources", "", "--strict-mcp-config",  # без хуков/MCP/CLAUDE.md: 19с и $0.001 вместо 83с и $0.06
-               "--model", model or DEFAULT_CLAUDE_MODEL]
-        if system:
-            cmd += ["--system-prompt", system]
-        with _Limited.sem:
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout, cwd=self.cwd)
-            except subprocess.TimeoutExpired as ex:
-                raise LLMError("таймаут claude") from ex
-        try:
-            outer = json.loads(r.stdout)
-        except json.JSONDecodeError as ex:
-            if r.returncode != 0:
-                raise LLMError(f"claude rc={r.returncode}: {r.stderr[:200]}") from ex
-            raise LLMError(f"не JSON от claude: {r.stdout[:120]!r}") from ex
-        if outer.get("is_error") or r.returncode != 0:
-            msg = str(outer.get("result"))[:200]
-            if re.search(r"limit|quota|usage|credit|overloaded|rate", msg, re.I):
-                mark("claude", False)
-                raise LLMUnavailable(f"claude лимит: {msg}")
-            raise LLMError(f"claude error: {msg}")
-        mark("claude", True)
-        return outer.get("result", "")
-
-    def ask(self, role: str, payload: dict, system: str | None = None) -> dict:
-        model = self.model or ROLE_MODELS.get(role, DEFAULT_CLAUDE_MODEL)
-        return parse_json(self.text(system or load_agent(role), _prompt(payload), model))
 
 
 class GeminiBackend:
@@ -126,6 +154,10 @@ class GeminiBackend:
         key = os.environ.get("GEMINI_API_KEY")
         if not key:
             raise LLMError("нет GEMINI_API_KEY")
+        if gemini_down():
+            raise LLMUnavailable("gemini на паузе после 429")
+        if not budget_allow(role):
+            raise LLMUnavailable(f"gemini: суточный бюджет ({role_group(role)}) исчерпан")
         body = {"systemInstruction": {"parts": [{"text": system or load_agent(role)}]},
                 "contents": [{"role": "user", "parts": [{"text": _prompt(payload)}]}],
                 "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
@@ -135,6 +167,7 @@ class GeminiBackend:
                 time.sleep(delay)
                 with _Limited.sem:
                     self._pace()
+                    budget_spend(role)
                     try:
                         r = self.s.post(self.URL.format(model), params={"key": key}, json=body, timeout=self.timeout)
                     except requests.RequestException as ex:
@@ -147,6 +180,7 @@ class GeminiBackend:
             err = LLMUnavailable if r.status_code in (429, 503) else LLMError
             if err is LLMUnavailable:
                 mark("gemini", False)
+                gemini_pause(3 * 3600 if "PerDay" in r.text else 600 if r.status_code == 429 else 120)
             raise err(f"gemini {r.status_code}: {r.text[:150]}")
         mark("gemini", True)
         try:
@@ -155,13 +189,32 @@ class GeminiBackend:
             raise LLMError(f"gemini пустой/странный ответ: {r.text[:120]}") from ex
 
 
+CACHE_TTL = 5400   # 1,5 ч: одинаковый запрос (новости/макро без изменений) повторно не отправляем
+
+
 class RoleRouter:
-    """Аналитики → Gemini, остальные роли → Claude (ROLE_BACKEND)."""
-    def __init__(self, claude=None, gemini=None):
-        self.claude, self.gemini = claude or ClaudeBackend(), gemini or GeminiBackend()
+    """Все роли → Gemini. Кэш одинаковых запросов в памяти процесса. Лимит/бюджет исчерпаны → LLMUnavailable (роль пропускается, у фоновых отделов есть механический запасной путь)."""
+    def __init__(self, gemini=None, now_fn=time.time):
+        self.gemini, self.now = gemini or GeminiBackend(), now_fn
+        self._cache: dict[str, tuple[float, dict]] = {}
+        self._lock = threading.Lock()
+
+    def _key(self, role, payload, system):
+        return hashlib.sha1(json.dumps([role, payload, system], sort_keys=True, default=str).encode()).hexdigest()
 
     def ask(self, role, payload, system=None):
-        return (self.gemini if ROLE_BACKEND.get(role) == "gemini" else self.claude).ask(role, payload, system=system)
+        k, t = self._key(role, payload, system), self.now()
+        with self._lock:
+            hit = self._cache.get(k)
+        if hit and t - hit[0] < CACHE_TTL:
+            return hit[1]
+        out = self.gemini.ask(role, payload, system=system)
+        with self._lock:
+            self._cache[k] = (t, out)
+            if len(self._cache) > 400:
+                for old in sorted(self._cache, key=lambda x: self._cache[x][0])[:100]:
+                    del self._cache[old]
+        return out
 
 
 class FakeBackend:
@@ -175,4 +228,4 @@ class FakeBackend:
 
 
 def make_backend(name: str = "router"):
-    return {"router": RoleRouter, "claude": ClaudeBackend, "gemini": GeminiBackend}[name]()
+    return {"router": RoleRouter, "gemini": GeminiBackend}[name]()

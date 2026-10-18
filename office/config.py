@@ -5,7 +5,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = ROOT / ".claude" / "agents"
-DB_PATH = Path(os.environ.get("TO_DB", ROOT / "office.db"))
+STATE_DIR = Path(os.environ.get("TO_STATE", ROOT))  # облако: каталог состояния (ветка state); телефон: корень проекта
+DB_PATH = Path(os.environ.get("TO_DB", STATE_DIR / "office.db"))
+BOARD_PATH = Path(os.environ.get("TO_BOARD", STATE_DIR / "board.db"))
 STOP_FILE = ROOT / "STOP"
 RESTART_FILE = ROOT / "RESTART"
 TZ_NAME = os.environ.get("OFFICE_TZ", "Europe/Minsk")  # часовой пояс владельца: расписание и время в сообщениях
@@ -48,6 +50,17 @@ STOCK_CORE = ["SPY", "NVDA", "AAPL", "MSFT"]               # цикл в час�
 ASSETS = [make_asset(s) for s in CRYPTO_CORE + STOCK_CORE]
 
 
+# Не торгуем: ONDO (по решению владельца) и стейблкоины (цена ≈ 1 $, сигналов нет, только шум).
+STABLE_BASES = frozenset({"USDC", "USDT", "DAI", "PYUSD", "USDG", "TUSD", "USDP", "BUSD", "FDUSD", "USDS", "USD1"})
+EXCLUDED = frozenset({"ONDO/USD", "ONDOUSD"})
+MIN_TURNOVER = {"crypto": 10_000_000.0, "stock": 10_000_000.0}   # крипта: оборот за 24 ч по CoinGecko ($); акции: средний дневной оборот за 20 дней по барам Alpaca IEX ($)
+
+
+def excluded(symbol: str) -> bool:
+    s = symbol.upper().replace("-", "/")
+    return s in EXCLUDED or s.split("/")[0] in STABLE_BASES
+
+
 class _ByName(dict):
     def __missing__(self, k):
         return make_asset(k)
@@ -79,13 +92,12 @@ COSTS = {"crypto": Costs(fee=0.0025), "stock": Costs(fee=0.0)}  # Alpaca: кри
 
 START_CASH = 100_000.0  # только для бэктеста (как на paper-счёте)
 
-# Кто отвечает за роль: аналитики — Gemini, остальные — Claude (claude -p)
-ANALYST_ROLES = ("market", "news", "fundamentals", "quant", "buffett", "munger", "druckenmiller")
-# сбор данных/новости/проверка фактов/вычитка — Gemini; решения (картина дня, разборы сделок, ответы на вопросы) — Claude
-GEMINI_EXTRA = ("macro", "newsdesk", "cryptodesk", "sectors", "portfolio_an", "factcheck", "proofread", "smartmoney_an")
-ROLE_BACKEND = {r: "gemini" for r in ANALYST_ROLES + GEMINI_EXTRA}
-ROLE_MODELS = {"executor": "haiku"}  # остальные Claude-роли — DEFAULT_CLAUDE_MODEL
-DEFAULT_CLAUDE_MODEL = "sonnet"
+# Все LLM-роли — Gemini (claude -p в облаке недоступен). Дневной бюджет запросов — llm.DAILY_BUDGET.
+# Аналитики зала: главный потребитель бюджета; фоновые отделы — ограниченная доля; остальное (вычитка, пересказы) — мелочь.
+ANALYST_ROLES = ("market", "news", "fundamentals", "quant")
+GEMINI_EXTRA = ("macro", "newsdesk", "cryptodesk", "sectors", "portfolio_an", "factcheck", "proofread", "smartmoney_an", "picture", "postmortem", "weekly", "notify", "qa")
+GEMINI_HALL = frozenset(ANALYST_ROLES)
+GEMINI_BG = frozenset(GEMINI_EXTRA) - {"factcheck", "proofread", "notify", "qa"}
 
 
 def localnow():

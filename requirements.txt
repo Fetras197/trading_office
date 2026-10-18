@@ -1,5 +1,9 @@
 requests
 pandas
 numpy
-pytest
 ijson
+TA-Lib>=0.6.4
+yfinance
+tradingview-ta
+alpaca-py
+pytest

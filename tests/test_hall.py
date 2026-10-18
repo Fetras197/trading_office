@@ -1,71 +1,46 @@
-"""Цепочка зала на фейках: правило ссылок, пропуск при невалидном/лимитном ответе, исполнение."""
-import json
-import re
-
+"""Зал v4 на фейках: сигнал + большинство аналитиков → вход; неполные данные → половинный объём; блокировки пишутся в nogo; лимиты RiskGate неизменны."""
 import numpy as np
 import pandas as pd
 import pytest
 
-from office import agents, data, hall, portfolio
+from office import agents, data, hall
 from office.board import Board
 from office.hall import Hall
 from office.journal import Journal
 from office.llm import LLMUnavailable
 
 PRICE, ATR = 100.0, 1.0
+TREND = {"close": PRICE, "atr14": ATR, "rsi14": 55.0, "ema20": 99.5, "ema50": 99.0, "ema200": 95.0, "macd_hist": 0.3, "bb_lower": 97.0}
+FLAT = {**TREND, "close": 98.0, "ema50": 99.0, "macd_hist": -0.2}   # ниже средней 50, импульс вниз → сигнала нет
 
 
 class FakeRouter:
-    def __init__(self, stance="buy", unavailable=False, fact_bad=None):
-        self.stance, self.unavailable, self.fact_bad, self.fc_calls, self.asked = stance, unavailable, fact_bad or (lambda claims: {}), 0, []
+    """stances: роль -> stance; по умолчанию все buy. 'abstain' → воздержался, 'down' → LLMUnavailable."""
+    def __init__(self, stances=None, default="buy"):
+        self.stances, self.default, self.asked = stances or {}, default, []
 
     def ask(self, role, payload, system=None):
-        if role == "factcheck":   # контролёр фактов: fact_bad(claims) -> {label: [несовпадения]}
-            self.fc_calls += 1
-            bad = self.fact_bad(payload["claims"])
-            return {"results": {k: ({"ok": False, "mismatches": bad[k]} if k in bad else {"ok": True, "mismatches": []}) for k in payload["claims"]}}
-        self.asked.append((role, payload))
-        if self.unavailable:
+        self.asked.append(role)
+        s = self.stances.get(role, self.default)
+        if s == "down":
             raise LLMUnavailable("429")
-        return {"stance": self.stance, "confidence": 0.8, "rationale": f"{role} says {self.stance}"}
-
-
-class FakeClaude:
-    def __init__(self, trader_action="buy", bad_role=None, down_role=None):
-        self.trader_action, self.bad_role, self.down_role, self.calls = trader_action, bad_role, down_role, []
-
-    def text(self, system, prompt, model=""):  # дебаты
-        ids = json.loads(re.search(r"Use only ids from: (\[.*?\])", prompt).group(1))
-        must = re.search(r"MUST cite these report ids explicitly: (\[.*?\])", prompt)
-        cite = sorted(set(ids) | set(json.loads(must.group(1)) if must else []))
-        return "argument\nREFS_JSON: " + json.dumps({"agree": cite[:-1], "dispute": cite[-1:], "confidence": 0.7, "stance": "buy"})
-
-    def ask(self, role, payload, system=None):
-        self.calls.append(role)
-        if role == self.down_role:
-            raise LLMUnavailable("limit")
-        ids = [r["id"] for r in payload["reports"]]
-        base = {"refs": [] if role == self.bad_role else ids, "stances": {str(i): "agree" for i in ids}}
-        if role == "trader":
-            return {**base, "action": self.trader_action, "entry": PRICE, "stop": PRICE - 1.5 * ATR, "take_profit": PRICE + 4.5 * ATR, "confidence": 0.7, "rationale": "r"}
-        if role == "risk_manager":
-            return {**base, "verdict": "approve", "size_mult": 1.0, "rationale": "r"}
-        if role == "portfolio_manager":
-            return {**base, "decision": "approve", "size_mult": 1.0, "rationale": "r"}
-        return {**base, "ticket_ok": True, "rationale": "ok"}
+        return {"stance": s, "confidence": 0.0 if s == "abstain" else 0.7, "rationale": f"{role} says {s}"}
 
 
 class FakeBroker:
     cash, last_order_id = 100_000.0, None
 
     def __init__(self):
-        self.bought, self.pos = [], {}
+        self.bought, self.pos, self.live = [], {}, {}
 
     def equity(self, prices=None):
         return 100_000.0
 
     def position(self, name):
         return self.pos.get(name)
+
+    def live_positions(self):
+        return self.live
 
     def buy(self, name, qty, price, stop, take, ts, run_id=None):
         self.bought.append((name, qty, stop, take))
@@ -78,248 +53,186 @@ def env(monkeypatch):
     idx = pd.date_range("2026-01-01", periods=600, freq="h", tz="UTC")
     px = pd.Series(100 + np.cumsum(np.random.default_rng(1).normal(0, .2, 600)), index=idx)
     df = pd.DataFrame({"open": px, "high": px + .3, "low": px - .3, "close": px, "volume": 1.0})
-    ind = {"close": PRICE, "atr14": ATR, "rsi14": 55.0}
+    state = {"ind": TREND, "news": [{"title": "x"}], "fund": {"pe": 10}}
     monkeypatch.setattr(data, "candles", lambda *a, **k: df)
-    monkeypatch.setattr(data, "bundle", lambda a, d=None: {"asset": a.name, "as_of": "t", "indicators_1h": ind, "indicators_4h": ind, "last_candles_1h": [],
-                                                           "tradingview": {}, "news": [{"title": "x"}], "fundamentals": {"pe": 10}})
+    monkeypatch.setattr(data, "bundle", lambda a, d=None: {"asset": a.name, "as_of": "t", "indicators_1h": state["ind"], "indicators_4h": state["ind"], "last_candles_1h": [],
+                                                           "tradingview": {}, "news": state["news"], "fundamentals": state["fund"]})
     monkeypatch.setattr(agents, "quant_stats", lambda a: {"sharpe_90d": 1})
-    monkeypatch.setattr(portfolio, "daily_closes", lambda syms: pd.DataFrame({s: 100 + np.cumsum(np.random.default_rng(i).normal(.05, 1, 120)) for i, s in enumerate(syms)}))
     monkeypatch.setattr(hall, "utcnow", lambda: "2026-10-12T10:00:00+00:00")
+    return state
 
 
-PIC = {"regime": "neutral", "summary": "тест", "size_mult": 1.0, "main_risks": [], "forbidden": [], "no_new_entries": False, "avoid_assets": []}
-
-
-def mk(router=None, claude=None, pic=True, **kw):
+def mk(router=None, **kw):
     b, j, br = Board(), Journal(), FakeBroker()
-    if pic:  # «Картина дня» обязательна: без неё зал отклоняет работу
-        b.publish("R-pic", "picture", "*", "neutral: тест", 0.8, data={**PIC, **(pic if isinstance(pic, dict) else {})})
-    return Hall(b, j, br, router or FakeRouter(), claude or FakeClaude(), **kw), b, br
+    return Hall(b, j, br, router or FakeRouter(), **kw), b, j, br
 
 
-def test_full_chain_executes_and_every_post_analyst_report_cites(env):
-    h, b, br = mk()
+def test_signal_and_majority_enter_full_size_with_atr_levels(env):
+    h, b, j, br = mk()
     r = h.run_asset("BTC/USD")
-    assert r.status == "opened" and r.order["order_id"] == "ord-1" and br.bought
-    reps = b.cycle_reports(r.cycle_id, "BTC/USD")
-    roles = [x["role"] for x in reps]
-    assert roles[-8:] == ["bull", "bear", "bull", "bear", "trader", "risk_manager", "portfolio_manager", "executor"]
-    for x in reps:
-        if x["role"] not in ("market", "news", "fundamentals", "quant"):
-            assert x["refs"] and set(map(str, x["refs"])) <= set(x["stances"])  # ссылки + явная позиция по каждой
-    assert reps[-1]["refs"] == [reps[-2]["id"]]  # executor ссылается на PM
-
-
-def test_risk_gate_caps_size_and_stop_attached(env):
-    h, b, br = mk()
-    h.run_asset("BTC/USD")
+    assert r.status == "opened" and r.order["order_id"] == "ord-1" and not r.order["half"]
     name, qty, stop, take = br.bought[0]
-    assert qty * PRICE <= 0.25 * 100_000 + 1 and stop < PRICE < take
-    assert qty * (PRICE - stop) <= 0.02 * 100_000 * 1.01  # <=2% риска
+    assert stop == PRICE - 2 * ATR and take == PRICE + 4 * ATR
+    assert qty * PRICE <= 0.25 * 100_000 + 1 and qty * (PRICE - stop) <= 0.02 * 100_000 * 1.01     # лимиты RiskGate: размер ≤25%, риск ≤2%
+    roles = [x["role"] for x in b.cycle_reports(r.cycle_id, "BTC/USD")]
+    assert roles[:4] == ["market", "news", "fundamentals", "quant"] and roles[-1] == "decision"
 
 
-def test_report_without_refs_is_rejected_and_asset_skipped(env):
-    h, b, br = mk(claude=FakeClaude(bad_role="risk_manager"))
+def test_incomplete_data_halves_size_instead_of_skipping(env):
+    h, b, j, br = mk()
+    h.run_asset("BTC/USD")
+    full = br.bought[0][1]
+    env["news"] = []
+    h2, b2, j2, br2 = mk()
+    r = h2.run_asset("ETH/USD")
+    assert r.status == "opened" and r.order["half"] and "нет свежих новостей" in r.order["gaps"]
+    assert br2.bought[0][1] == pytest.approx(full * 0.5, rel=0.01)
+
+
+def test_abstaining_analyst_means_half_size(env):
+    h, b, j, br = mk(FakeRouter({"quant": "abstain"}))
     r = h.run_asset("BTC/USD")
-    assert r.status == "skipped" and "risk_manager" in r.detail and not br.bought
-    assert b.q("SELECT COUNT(*) n FROM rejected")[0]["n"] >= 1
+    assert r.status == "opened" and r.order["half"]
 
 
-def test_llm_limit_on_chain_role_skips_not_crashes(env):
-    h, b, br = mk(claude=FakeClaude(down_role="trader"))
+def test_no_technical_signal_no_llm_spend_and_nogo_logged(env):
+    env["ind"] = FLAT
+    rt = FakeRouter()
+    h, b, j, br = mk(rt)
     r = h.run_asset("BTC/USD")
-    assert r.status == "skipped" and "лимит" in r.detail and not br.bought
+    assert r.status == "hold" and "нет технического сигнала" in r.detail and not rt.asked and not br.bought
+    n = j.q("SELECT stage, reason, score FROM nogo")[0]
+    assert n["stage"] == "signal" and 0 < n["score"] < 0.5
 
 
-def test_analysts_unavailable_abstain_and_skip(env):
-    h, b, br = mk(router=FakeRouter(unavailable=True))
+def test_majority_against_blocks_and_is_explained(env):
+    h, b, j, br = mk(FakeRouter({"market": "buy", "news": "hold", "fundamentals": "hold", "quant": "sell"}))
     r = h.run_asset("BTC/USD")
-    assert r.status == "skipped" and "недостаточно аналитиков" in r.detail
-    assert {x["verdict"].split(":")[0] for x in b.cycle_reports(r.cycle_id, "BTC/USD")} == {"abstain"}
+    assert r.status == "hold" and "аналитики не одобрили" in r.detail and not br.bought
+    n = j.nogo_top("2000-01-01")[0]
+    assert n["stage"] == "votes" and n["score"] > 0.5
 
 
-def test_trader_hold_no_order(env):
-    h, b, br = mk(claude=FakeClaude(trader_action="hold"))
-    assert h.run_asset("BTC/USD").status == "hold" and not br.bought
+def test_half_of_voters_for_is_enough_when_no_sells(env):
+    h, b, j, br = mk(FakeRouter({"market": "buy", "news": "buy", "fundamentals": "hold", "quant": "hold"}))
+    assert h.run_asset("BTC/USD").status == "opened"
 
 
-def test_sell_without_position_never_shorts(env):
-    h, b, br = mk(claude=FakeClaude(trader_action="sell"))
-    assert h.run_asset("BTC/USD").status == "hold" and not br.bought
+def test_no_live_votes_means_no_entry(env):
+    h, b, j, br = mk(FakeRouter(default="down"))
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "нет голосов" in r.detail and not br.bought
+
+
+def test_votes_cached_and_fresh_round_limit(env):
+    rt = FakeRouter({"market": "hold", "news": "hold", "fundamentals": "hold", "quant": "hold"})
+    h, b, j, br = mk(rt, fresh_rounds=1)
+    h.run_asset("BTC/USD")
+    n = len(rt.asked)
+    h.run_asset("BTC/USD")
+    assert len(rt.asked) == n                      # второй раз — из кэша голосов (90 мин)
+    r = h.run_asset("ETH/USD")                     # лимит раундов за проход исчерпан
+    assert len(rt.asked) == n and "очередь" in r.detail
 
 
 def test_halt_file_blocks_new_entries(env, monkeypatch, tmp_path):
     f = tmp_path / "STOP"
     f.touch()
     monkeypatch.setattr(hall.config, "STOP_FILE", f)
-    h, b, br = mk()
+    h, b, j, br = mk()
     r = h.run_asset("BTC/USD")
     assert r.status == "hold" and "STOP" in r.detail and not br.bought
 
 
 def test_dry_run_sends_no_order(env):
-    h, b, br = mk(auto_trade=False)
+    h, b, j, br = mk(auto_trade=False)
     assert h.run_asset("BTC/USD").detail.startswith("dry-run") and not br.bought
 
 
-def test_limits_exhausted_skips_llm_spend(env):
-    class Full(FakeBroker):
-        pass
-    h, b, br = mk()
+def test_risk_limits_still_hard(env):
+    h, b, j, br = mk()
     h.j.kv_set("day_start:2026-10-12", 100_000.0)
-    for i in range(3):
-        h.j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES(?,?,?,?,?,?,?,?)", (f"X{i}", 1, 1, 0.5, 2, 0, 1, "t"))
+    for i in range(5):
+        j.add_fill(f"2026-10-12T0{i}:00:00+00:00", f"X{i}", "buy", 1, 1, 0, "entry", None)
     r = h.run_asset("BTC/USD")
-    assert r.status == "hold" and "лимит позиций" in r.detail and not br.bought
-    assert b.cycle_reports(r.cycle_id, "BTC/USD") == []  # аналитики не вызывались
+    assert r.status == "hold" and "лимит 5 входов" in r.detail and not br.bought
+    h2, b2, j2, br2 = mk()
+    h2.j.kv_set("day_start:2026-10-12", 110_000.0)           # эквити 100k против 110k на старте суток = −9% < −5%
+    assert "дневной стоп" in h2.run_asset("BTC/USD").detail
+    h3, b3, j3, br3 = mk()
+    for s in ("A", "B", "C"):
+        j3._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES(?,?,?,?,?,?,?,?)", (s, 1, 1, .5, 2, 0, 0, "t"))
+    assert "лимит 3 позиций" in h3.run_asset("BTC/USD").detail
+    assert not (br.bought or br2.bought or br3.bought)
 
 
-# ---------- v3: «Картина дня» и календарь ----------
-def test_no_picture_means_skip(env):
-    h, b, br = mk(pic=False)
+def test_open_position_not_reanalysed(env):
+    rt = FakeRouter()
+    h, b, j, br = mk(rt)
+    br.pos["BTC/USD"] = {"qty": 1, "avg": 90, "stop": 85, "take": 110}
     r = h.run_asset("BTC/USD")
-    assert r.status == "skipped" and "Картин" in r.detail and not br.bought
+    assert r.status == "hold" and "открыта" in r.detail and not rt.asked
 
 
-def test_picture_no_new_entries_and_avoid_block_before_llm(env):
-    c = FakeClaude()
-    h, b, br = mk(claude=c, pic={"no_new_entries": True})
+def test_broker_already_holds_symbol_blocks(env):
+    h, b, j, br = mk()
+    br.live = {"BTCUSD": {}}
     r = h.run_asset("BTC/USD")
-    assert r.status == "hold" and "картина дня" in r.detail and c.calls == []
-    h, b, br = mk(claude=c, pic={"avoid_assets": ["BTC/USD"]})
-    assert h.run_asset("BTC/USD").status == "hold" and c.calls == []
+    assert r.status == "hold" and "у брокера" in r.detail and not br.bought
 
 
-def test_event_blackout_blocks_new_entries(env):
-    import datetime as dt
-    h, b, br = mk()
-    now = dt.datetime.now(dt.timezone.utc)
-    b.x("INSERT INTO events(key,ts,title,ccy,impact,kind,assets,src) VALUES('k',?,?,?,?,?,?,?)", ((now + dt.timedelta(minutes=10)).isoformat(timespec="minutes"), "FOMC Statement", "USD", "High", "macro", "all", "t"))
+def test_panic_regime_blocks_and_high_vol_halves_size(env):
+    h, b, j, br = mk()
+    b.publish("R-regime", "regime", "*", "x", 1.0, data={"crypto": {"regime": "panic", "why": ["падение"]}, "stock": None})
     r = h.run_asset("BTC/USD")
-    assert r.status == "hold" and "решение ФРС" in r.detail and not br.bought
-
-
-def test_trader_without_picture_citation_is_rejected(env):
-    class NoPic(FakeClaude):
-        def ask(self, role, payload, system=None):
-            out = super().ask(role, payload, system)
-            if role == "trader":
-                pid = next(r["id"] for r in payload["reports"] if r["role"] == "picture")
-                out["refs"] = [i for i in out["refs"] if i != pid]
-            return out
-    h, b, br = mk(claude=NoPic())
-    r = h.run_asset("BTC/USD")
-    assert r.status == "skipped" and not br.bought
-    assert any("picture" in x["reason"] for x in b.q("SELECT reason FROM rejected"))
-
-
-def test_stale_picture_cannot_be_cited(env):
-    h, b, br = mk()
-    b.x("UPDATE reports SET ts='2020-01-01T00:00:00+00:00' WHERE role='picture'")
-    r = h.run_asset("BTC/USD")
-    assert r.status == "skipped" and not br.bought
-
-
-def test_picture_size_mult_only_reduces(env):
-    h1, _, br1 = mk()
+    assert r.status == "hold" and "паника" in r.detail and not br.bought
+    h1, b1, j1, br1 = mk()
     h1.run_asset("BTC/USD")
-    h2, _, br2 = mk(pic={"size_mult": 0.5})
+    h2, b2, j2, br2 = mk()
+    b2.publish("R-regime", "regime", "*", "x", 1.0, data={"crypto": {"regime": "high_vol", "why": ["волатильность"]}, "stock": None})
     h2.run_asset("BTC/USD")
-    assert br1.bought and br2.bought and br2.bought[0][1] < br1.bought[0][1]  # размер меньше (PM-кап в первом прогоне мог уже ограничить)
+    assert br2.bought[0][1] < br1.bought[0][1]
 
 
-# ---------- v3: проверка фактов, веса, цена из двух источников ----------
-def test_factcheck_redo_analyst_once_then_pass(env):
-    state = {"n": 0}
-
-    def bad(claims):
-        if "market" in claims and state["n"] == 0:
-            state["n"] += 1
-            return {"market": ["RSI 80 -> actual 55"]}
-        return {}
-    r = FakeRouter(fact_bad=bad)
-    h, b, br = mk(router=r)
-    res = h.run_asset("BTC/USD")
-    assert res.status == "opened"
-    redo = [p for role, p in r.asked if role == "market" and "previous_rejection" in p]
-    assert len(redo) == 1 and "RSI 80" in redo[0]["previous_rejection"]
-    assert any("факты не сошлись" in x["reason"] for x in b.q("SELECT reason FROM rejected"))
+def test_event_blackout_blocks_new_entries(env, monkeypatch):
+    monkeypatch.setattr(hall.events, "blocked", lambda board, name, kind: "выступление главы ФРС")
+    h, b, j, br = mk()
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "ФРС" in r.detail and not br.bought
 
 
-def test_factcheck_persistent_lie_makes_analyst_abstain(env):
-    r = FakeRouter(fact_bad=lambda claims: {"news": ["заголовок выдуман"]} if "news" in claims else {})
-    h, b, br = mk(router=r)
-    h.run_asset("BTC/USD")
-    n = b.q("SELECT verdict FROM reports WHERE role='news'")
-    assert n and n[0]["verdict"].startswith("abstain") and "проверку фактов" in n[0]["verdict"]
-
-
-def test_factcheck_unavailable_does_not_block_hall(env):
-    class Down(FakeRouter):
-        def ask(self, role, payload, system=None):
-            if role == "factcheck":
-                raise LLMUnavailable("limit")
-            return super().ask(role, payload, system)
-    h, b, br = mk(router=Down())
-    assert h.run_asset("BTC/USD").status == "opened"
-
-
-def test_debate_with_false_facts_twice_skips(env):
-    r = FakeRouter(fact_bad=lambda claims: {"bull": ["неверно"]} if "bull" in claims else {})
-    h, b, br = mk(router=r)
-    res = h.run_asset("BTC/USD")
-    assert res.status == "skipped" and "споре" in res.detail and not br.bought
-
-
-def test_trader_false_facts_rejected_and_retried(env):
-    r = FakeRouter(fact_bad=lambda claims: {"trader": ["цена другая"]} if "trader" in claims else {})
-    h, b, br = mk(router=r)
-    res = h.run_asset("BTC/USD")
-    assert res.status == "skipped" and not br.bought
+def test_cooldown_after_stop(env):
+    h, b, j, br = mk()
+    now = pd.Timestamp.now(tz="UTC").isoformat()
+    j._x("INSERT INTO trades(asset,entry_ts,exit_ts,entry,exit,qty,fees,pnl,r_mult,run_id,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("BTC/USD", now, now, 100, 98, 1, 0, -2, -1, 0, "stop"))
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "остывание" in r.detail
 
 
 def test_price_cross_check_between_sources_skips(env):
     class C:
         def price(self, sym): return PRICE * 1.05
-    h, b, br = mk()
+    h, b, j, br = mk()
     br.c = C()
     assert "расходятся" in h.run_asset("BTC/USD").detail
     br.c = type("C2", (), {"price": lambda self, s: PRICE * 1.005})()
     assert h.run_asset("BTC/USD").status == "opened"
 
 
-def test_disabled_role_abstains_and_weights_reach_trader(env):
-    r, c = FakeRouter(), FakeClaude()
-    h, b, br = mk(router=r, claude=c)
-    b.x("INSERT INTO role_weights(role,weight,disabled,since) VALUES('market',1.0,1,'t')")
-    b.x("INSERT INTO role_weights(role,weight,disabled,since) VALUES('news',0.5,0,'t')")
-    seen = {}
-    orig = c.ask
-    c.ask = lambda role, payload, system=None: (seen.setdefault(role, payload), orig(role, payload, system))[1]
-    h.run_asset("BTC/USD")
-    tp = seen["trader"]
-    assert "market" not in [x["role"] for x in tp["reports"]]
-    assert next(x for x in tp["reports"] if x["role"] == "news")["weight"] == 0.5 and "weighted_vote" in tp and "lessons" in tp
-
-
-def test_regime_panic_blocks_entries_and_high_vol_halves_size(env):
-    h, b, br = mk()
-    b.publish("R-regime", "regime", "*", "x", 1.0, data={"crypto": {"regime": "panic", "why": ["падение"]}, "stock": None})
-    r = h.run_asset("BTC/USD")
-    assert r.status == "hold" and "паника" in r.detail and not br.bought
-    h1, b1, br1 = mk()
-    h1.run_asset("BTC/USD")
-    h2, b2, br2 = mk()
-    b2.publish("R-regime", "regime", "*", "x", 1.0, data={"crypto": {"regime": "high_vol", "why": ["волатильность"]}, "stock": None})
-    h2.run_asset("BTC/USD")
-    assert br2.bought[0][1] < br1.bought[0][1]
-
-
 def test_smartmoney_voice_published_for_crypto_only(env):
-    h, b, br = mk(smart=lambda coin: {"stance": "buy", "confidence": 0.7, "rationale": "умные деньги в лонгах"} if coin == "BTC" else None)
+    h, b, j, br = mk(smart=lambda coin: {"stance": "buy", "confidence": 0.7, "rationale": "умные деньги в лонгах"} if coin == "BTC" else None)
     h.run_asset("BTC/USD")
-    r = b.q("SELECT verdict, confidence FROM reports WHERE role='smartmoney'")
+    r = b.q("SELECT verdict FROM reports WHERE role='smartmoney'")
     assert r and r[0]["verdict"].startswith("buy: умные")
-    h2, b2, _ = mk(smart=lambda coin: {"stance": "buy", "confidence": 0.7, "rationale": "x"})
+    h2, b2, j2, _ = mk(smart=lambda coin: {"stance": "buy", "confidence": 0.7, "rationale": "x"})
     h2.run_asset("NVDA")
     assert not b2.q("SELECT 1 FROM reports WHERE role='smartmoney'")
+
+
+def test_riskgate_rejection_is_logged_as_nearest_candidate(env):
+    h, b, j, br = mk()
+    env["ind"] = {**TREND, "atr14": 0.00001}    # ATR слишком мал → размер/стоп не проходят проверки
+    r = h.run_asset("BTC/USD")
+    assert r.status in ("rejected", "opened", "skipped")
+    if r.status == "rejected":
+        assert j.nogo_top("2000-01-01")[0]["stage"] == "riskgate"

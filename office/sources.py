@@ -3,6 +3,7 @@
 Yahoo chart (VIX, DXY, доходности, индексы, сектора), NY Fed (EFFR), BLS v1 (CPI, безработица), Faireconomy (календарь), Polymarket gamma,
 OKX public (funding, OI, ликвидации — Binance futures/Bybit из региона недоступны), alternative.me (индекс страха и жадности)."""
 import datetime as dt
+import io
 import json
 import time
 from zoneinfo import ZoneInfo
@@ -39,8 +40,40 @@ def _get_json(url, **kw):
 YAHOO_MACRO = {"VIX": "^VIX", "DXY": "DX-Y.NYB", "US10Y": "^TNX", "US5Y": "^FVX", "US3M": "^IRX", "SPX": "^GSPC", "GOLD": "GC=F", "OIL": "CL=F"}
 
 
+FRED = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+FRED_MAP = {"^VIX": "VIXCLS", "DX-Y.NYB": "DTWEXBGS", "^TNX": "DGS10", "^FVX": "DGS5", "^IRX": "DGS3MO", "^GSPC": "SP500", "CL=F": "DCOILWTICO"}  # DXY → широкий индекс доллара ФРС (другой масштаб, динамика та же)
+_FRED_START = {"5d": 14, "1mo": 45, "3mo": 120, "6mo": 220, "1y": 400, "2y": 760}
+
+
+def fred_series(sid: str, days: int = 220) -> pd.Series:
+    """Запасной источник макро: FRED CSV без ключа (данные с запозданием в 1 рабочий день)."""
+    start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    for i in range(3):   # FRED режет «браузерный» User-Agent (зависание/HTTP2-сброс): ходим с дефолтным python-requests и повторяем
+        try:
+            r = requests.get(FRED, params={"id": sid, "cosd": start}, timeout=25)
+            r.raise_for_status()
+            break
+        except requests.RequestException:
+            if i == 2:
+                raise
+            time.sleep(2)
+    df = pd.read_csv(io.StringIO(r.text))
+    s = pd.to_numeric(df.iloc[:, 1], errors="coerce")
+    s.index = pd.to_datetime(df.iloc[:, 0])
+    s = s.dropna()
+    if s.empty:
+        raise ValueError(f"FRED {sid}: пусто")
+    return s
+
+
 def yahoo_close(sym: str, rng: str = "6mo") -> pd.Series:
-    return data.stock_candles(sym, "1d", rng)["close"].dropna()
+    """Дневные закрытия: Yahoo → бары Alpaca (ETF/акции) → FRED (индексы, доходности, нефть)."""
+    try:
+        return data.stock_candles(sym, "1d", rng)["close"].dropna()
+    except Exception:  # noqa: BLE001
+        if sym not in FRED_MAP:
+            raise
+        return fred_series(FRED_MAP[sym], _FRED_START.get(rng, 220))
 
 
 def _chg(s: pd.Series, n: int) -> float | None:
@@ -70,7 +103,18 @@ def effr() -> dict:
 
 
 def bls_macro() -> dict:
-    """CPI (all items, NSA) y/y и безработица, BLS v1 без ключа (лимит 25 запросов/сутки на IP -> кэш 12 ч)."""
+    """CPI (all items, NSA) y/y и безработица. BLS v1 без ключа (25 запросов/сутки на IP, из облака часто режется) → запасной FRED (CPIAUCNS, UNRATE)."""
+    try:
+        return _bls()
+    except Exception:  # noqa: BLE001
+        cpi, un = fred_series("CPIAUCNS", 500), fred_series("UNRATE", 120)
+        last = cpi.index[-1]
+        prev = cpi[cpi.index.to_period("M") == last.to_period("M") - 12]
+        return {"cpi_period": f"{last:%Y-%m}", "cpi_yoy": round(float(cpi.iloc[-1] / prev.iloc[-1] - 1), 4) if len(prev) else None,
+                "unemployment_period": f"{un.index[-1]:%Y-%m}", "unemployment": float(un.iloc[-1]), "src": "FRED"}
+
+
+def _bls() -> dict:
     r = requests.post("https://api.bls.gov/publicAPI/v1/timeseries/data/", json={"seriesid": ["CUUR0000SA0", "LNS14000000"]}, headers=UA, timeout=30).json()
     ser = {s["seriesID"]: [d for d in s["data"] if d["value"].replace(".", "", 1).isdigit()] for s in r["Results"]["series"]}  # у BLS бывают пропуски ("-")
     cpi, un = ser["CUUR0000SA0"], ser["LNS14000000"]
