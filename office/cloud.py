@@ -216,8 +216,7 @@ class Office:
         if os.environ.get("OFFICE_HALT", "").strip() in ("1", "true", "yes"):
             config.STOP_FILE.touch()
         for name in filter(None, (x.strip() for x in os.environ.get("OFFICE_FORCE_JOBS", "").split(","))):   # ручной запуск: принудительно выполнить задания отдела сейчас
-            self.j.kv_set(f"job:{name}:last", None)
-            self.j.kv_set(f"job:{name}:attempt", None)
+            self.sched.trigger(name)
         if self.j.kv_get("cloud_started") is None:
             self.j.kv_set("cloud_started", utcnow())
             self.notify("☁️ Офис переехал в облако (GitHub Actions): проход каждые 30–60 минут, телефон больше не нужен. Сообщения о сделках, сводки и отчёты приходят сюда.")

@@ -30,7 +30,10 @@ def _wiki(url: str, col: str) -> list[str]:
 def universe(alpaca_client, max_age_h: float = 24 * 7) -> dict:
     """{'crypto': [...BTC/USD], 'stock': [...]}; кэш data_cache/universe.json (обновление раз в неделю, при сбое — старый кэш)."""
     if CACHE.exists() and time.time() - CACHE.stat().st_mtime < max_age_h * 3600:
-        return _clean(json.loads(CACHE.read_text()))
+        try:
+            return _clean(json.loads(CACHE.read_text()))
+        except ValueError:  # битый/пустой кэш — перекачиваем
+            pass
     try:
         cr = alpaca_client._req("GET", "/assets", params={"asset_class": "crypto", "status": "active"})
         crypto = sorted(a["symbol"] for a in cr if a["symbol"].endswith("/USD") and a.get("tradable", True))
@@ -55,7 +58,10 @@ def _clean(u: dict) -> dict:
 def crypto_volumes(max_age_h: float = 6) -> dict[str, float]:
     """Оборот за 24 ч в $ по тикеру ('BTC') — агрегат рынка (CoinGecko, топ-250 по капитализации; запасной — Binance 24hr). Кэш в state. {} если источники недоступны."""
     if VOL_CACHE.exists() and time.time() - VOL_CACHE.stat().st_mtime < max_age_h * 3600:
-        return json.loads(VOL_CACHE.read_text())
+        try:
+            return json.loads(VOL_CACHE.read_text())
+        except ValueError:
+            pass
     out: dict[str, float] = {}
     try:
         for page in (1, 2):
@@ -75,7 +81,10 @@ def crypto_volumes(max_age_h: float = 6) -> dict[str, float]:
         VOL_CACHE.parent.mkdir(parents=True, exist_ok=True)
         VOL_CACHE.write_text(json.dumps(out))
         return out
-    return json.loads(VOL_CACHE.read_text()) if VOL_CACHE.exists() else {}
+    try:
+        return json.loads(VOL_CACHE.read_text()) if VOL_CACHE.exists() else {}
+    except ValueError:
+        return {}
 
 
 def liquid(sym: str, df: pd.DataFrame | None, cvol: dict[str, float]) -> bool:

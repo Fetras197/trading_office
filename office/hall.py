@@ -118,6 +118,8 @@ class Hall:
 
     def _cross_price(self, asset, price):
         """Цена из свечей против снапшота Alpaca (независимый источник): расхождение > 1,5% — данные ненадёжны."""
+        if price <= 0:
+            raise Skip(f"нулевая цена в свечах ({price})")
         cl = getattr(self.broker, "c", None)
         if cl is None or not hasattr(cl, "price"):
             return
@@ -125,7 +127,7 @@ class Hall:
             other = cl.price(asset.alpaca)
         except Exception:  # noqa: BLE001 — второй источник недоступен: не блокируем
             return
-        if factcheck.price_gap(price, other) > 0.015:
+        if price > 0 and other > 0 and factcheck.price_gap(price, other) > 0.015:
             raise Skip(f"цены источников расходятся ({price:.6g} против {other:.6g})")
 
     # ---------- основной проход ----------
@@ -247,5 +249,5 @@ class Hall:
             self.j.kv_set(f"partial_at:{asset.name}", None)
             self.j.kv_set(f"partial_done:{asset.name}", None)
             self.j.kv_set(f"init_stop:{asset.name}", stop)
-            order = {**o, "order_id": self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"], "half": bool(gaps), "gaps": gaps, "tech": tech.kind}
+            order = {**o, "order_id": o.get("order_id") or self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"], "half": bool(gaps), "gaps": gaps, "tech": tech.kind}
             return Result(asset.name, "opened", f"qty={v.qty} stop={stop:.6g} take={take:.6g}" + (" (половинный объём)" if gaps else ""), cid, order)

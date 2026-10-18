@@ -5,7 +5,7 @@ import talib as ta
 
 
 def _f(x):
-    return None if x is None or x != x else round(float(x), 6)
+    return None if x is None or x != x else float(f"{float(x):.8g}")   # значащие цифры, а не знаки после запятой: у PEPE/SHIB цена ~1e-6, ATR при round(…, 6) обращался в 0
 
 
 def snapshot(df: pd.DataFrame) -> dict:

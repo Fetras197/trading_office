@@ -102,10 +102,10 @@ def test_candidates_restored_from_previous_pass_without_excluded(monkeypatch, tm
     assert o.candidates == ["DOGE/USD", "LINK/USD"]
 
 
-def test_force_jobs_env_resets_schedule_memory(monkeypatch, tmp_path):
-    monkeypatch.setenv("OFFICE_FORCE_JOBS", "macro, news")
+def test_force_jobs_env_triggers_jobs_even_if_not_bootstrapped(monkeypatch, tmp_path):
+    monkeypatch.setenv("OFFICE_FORCE_JOBS", "evening, news")
     o, _ = mk(monkeypatch, tmp_path)
-    o.j.kv_set("job:macro:last", "2026-10-18T09:00:00+03:00")
-    o.j.kv_set("job:crypto:last", "2026-10-18T09:00:00+03:00")
+    o.sched.run_due = lambda: None
     o.run_once()
-    assert o.j.kv_get("job:macro:last") is None and o.j.kv_get("job:news:last") is None and o.j.kv_get("job:crypto:last")
+    assert o.sched._triggers == {"evening", "news"}
+    assert o.sched.is_due(next(j for j in o.sched.jobs if j.name == "evening"), __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
