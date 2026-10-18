@@ -1,0 +1,38 @@
+name: keepalive
+
+# GitHub отключает расписание, если в репозитории 60 дней не было активности. Раз в неделю коммитим в master краткий журнал офиса
+# и заодно повторно включаем workflow office (на случай, если он всё же был отключён).
+on:
+  schedule:
+    - cron: "17 18 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: keepalive
+
+jobs:
+  journal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Состояние
+        run: git clone --quiet --depth 1 --branch state "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
+      - name: Журнал недели
+        run: python3 scripts/weekly_journal.py state journal
+      - name: Коммит в master
+        run: |
+          rm -rf state
+          git config user.name "office-bot"
+          git config user.email "office-bot@users.noreply.github.com"
+          git add journal
+          git commit -q -m "journal: неделя $(date -u +%G-W%V)" || echo "нечего коммитить"
+          git push -q origin HEAD:${{ github.event.repository.default_branch }}
+      - name: Включить office, если выключен
+        run: gh workflow enable office.yml || true
+        env:
+          GH_TOKEN: ${{ github.token }}

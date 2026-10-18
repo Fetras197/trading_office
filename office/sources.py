@@ -5,6 +5,7 @@ OKX public (funding, OI, ликвидации — Binance futures/Bybit из р�
 import datetime as dt
 import io
 import json
+import re
 import time
 from zoneinfo import ZoneInfo
 
@@ -66,14 +67,19 @@ def fred_series(sid: str, days: int = 220) -> pd.Series:
     return s
 
 
-def yahoo_close(sym: str, rng: str = "6mo") -> pd.Series:
-    """Дневные закрытия: Yahoo → бары Alpaca (ETF/акции) → FRED (индексы, доходности, нефть)."""
+def yahoo_close_src(sym: str, rng: str = "6mo") -> tuple[pd.Series, str]:
+    """Дневные закрытия и имя источника: Yahoo → бары Alpaca (ETF/акции) → FRED (индексы, доходности, нефть)."""
     try:
-        return data.stock_candles(sym, "1d", rng)["close"].dropna()
+        r = data.stock_candles(sym, "1d", rng)
+        return r["close"].dropna(), ("Yahoo Finance" if data.LAST_STOCK_SRC["src"] == "yahoo" else "Alpaca")
     except Exception:  # noqa: BLE001
         if sym not in FRED_MAP:
             raise
-        return fred_series(FRED_MAP[sym], _FRED_START.get(rng, 220))
+        return fred_series(FRED_MAP[sym], _FRED_START.get(rng, 220)), "FRED"
+
+
+def yahoo_close(sym: str, rng: str = "6mo") -> pd.Series:
+    return yahoo_close_src(sym, rng)[0]
 
 
 def _chg(s: pd.Series, n: int) -> float | None:
@@ -85,8 +91,8 @@ def market_levels() -> dict:
     out = {}
     for k, sym in YAHOO_MACRO.items():
         try:
-            s = yahoo_close(sym)
-            row = {"last": round(float(s.iloc[-1]), 3), "chg_1d": _chg(s, 1), "chg_5d": _chg(s, 5), "chg_20d": _chg(s, 20)}
+            s, src = yahoo_close_src(sym)
+            row = {"last": round(float(s.iloc[-1]), 3), "chg_1d": _chg(s, 1), "chg_5d": _chg(s, 5), "chg_20d": _chg(s, 20), "src": src, "asof": str(s.index[-1])[:10]}
             if k == "SPX" and len(s) >= 50:
                 row["above_sma50"] = bool(s.iloc[-1] > s.tail(50).mean())
             out[k] = row
@@ -94,12 +100,13 @@ def market_levels() -> dict:
             out[k] = {"error": type(e).__name__}
     if all("last" in out.get(k, {}) for k in ("US10Y", "US3M")):
         out["curve_10y_3m"] = round(out["US10Y"]["last"] - out["US3M"]["last"], 3)
+        out["curve_src"] = "расчёт: US10Y минус US3M"
     return out
 
 
 def effr() -> dict:
     j = _get_json("https://markets.newyorkfed.org/api/rates/unsecured/effr/last/1.json")["refRates"][0]
-    return {"effr": j["percentRate"], "target_from": j["targetRateFrom"], "target_to": j["targetRateTo"], "date": j["effectiveDate"]}
+    return {"effr": j["percentRate"], "target_from": j["targetRateFrom"], "target_to": j["targetRateTo"], "date": j["effectiveDate"], "src": "NY Fed"}
 
 
 def bls_macro() -> dict:
@@ -122,12 +129,12 @@ def _bls() -> dict:
     last = cpi[0]
     prev_year = vals.get((str(int(last["year"]) - 1), last["period"]))
     return {"cpi_period": f"{last['year']}-{last['period'][1:]}", "cpi_yoy": round(float(last["value"]) / prev_year - 1, 4) if prev_year else None,
-            "unemployment_period": f"{un[0]['year']}-{un[0]['period'][1:]}", "unemployment": float(un[0]["value"])}
+            "unemployment_period": f"{un[0]['year']}-{un[0]['period'][1:]}", "unemployment": float(un[0]["value"]), "src": "BLS"}
 
 
 def fear_greed() -> dict:
     j = _get_json("https://api.alternative.me/fng/?limit=2")["data"]
-    return {"value": int(j[0]["value"]), "label": j[0]["value_classification"], "prev": int(j[1]["value"]) if len(j) > 1 else None}
+    return {"value": int(j[0]["value"]), "label": j[0]["value_classification"], "prev": int(j[1]["value"]) if len(j) > 1 else None, "src": "alternative.me"}
 
 
 def polymarket(queries=("fed decision", "bitcoin"), per_query: int = 3, markets_per_event: int = 5) -> list[dict]:
@@ -243,3 +250,61 @@ def earnings_events(symbols: list[str]) -> list[dict]:
             out.append({"ts": start.isoformat(timespec="minutes"), "until": (start + dt.timedelta(hours=34)).isoformat(timespec="minutes"),
                         "title": f"Отчёт компании {s}", "ccy": "USD", "impact": "High", "kind": "earnings", "assets": s, "src": "yfinance"})
     return out
+
+
+# ---------------- источники каждой цифры (для «Картины дня») ----------------
+LEVEL_RU = {"VIX": "VIX (индекс страха)", "DXY": "индекс доллара", "US10Y": "доходность 10-летних облигаций США, %", "US5Y": "доходность 5-летних облигаций США, %",
+            "US3M": "доходность 3-месячных векселей США, %", "SPX": "S&P 500", "GOLD": "золото", "OIL": "нефть WTI"}
+
+
+def figures(d: dict) -> list[dict]:
+    """Плоский список макро-цифр с источником и датой: {label, value, unit, src, asof, nums}. Единственный разрешённый источник чисел для текстов «Картины дня».
+    nums — все числа, которые можно цитировать (уровень, изменения в %, вероятности)."""
+    out = []
+    lv = d.get("levels") or {}
+    for k, ru in LEVEL_RU.items():
+        r = lv.get(k) or {}
+        if "last" in r:
+            nums = [r["last"]] + [100 * r[c] for c in ("chg_1d", "chg_5d", "chg_20d") if r.get(c) is not None]
+            out.append({"label": ru, "value": r["last"], "src": r.get("src", "?"), "asof": r.get("asof", ""), "nums": nums})
+    if "curve_10y_3m" in lv:
+        out.append({"label": "разница доходностей 10 лет и 3 месяца, п.п.", "value": lv["curve_10y_3m"], "src": lv.get("curve_src", "расчёт"), "asof": "", "nums": [lv["curve_10y_3m"]]})
+    f = d.get("fed") or {}
+    if "effr" in f:
+        out.append({"label": "ставка ФРС (EFFR), %", "value": f["effr"], "src": f.get("src", "NY Fed"), "asof": f.get("date", ""), "nums": [f["effr"], f["target_from"], f["target_to"]]})
+    c = d.get("inflation_labor") or {}
+    if c.get("cpi_yoy") is not None:
+        out.append({"label": "инфляция CPI за год, %", "value": round(100 * c["cpi_yoy"], 2), "src": c.get("src", "BLS"), "asof": c.get("cpi_period", ""), "nums": [100 * c["cpi_yoy"]]})
+    if c.get("unemployment") is not None:
+        out.append({"label": "безработица, %", "value": c["unemployment"], "src": c.get("src", "BLS"), "asof": c.get("unemployment_period", ""), "nums": [c["unemployment"]]})
+    g = d.get("fear_greed") or {}
+    if "value" in g:
+        out.append({"label": "индекс страха и жадности (крипта)", "value": g["value"], "src": g.get("src", "alternative.me"), "asof": "", "nums": [g["value"], g.get("prev") or 0]})
+    for e in (d.get("prediction_markets") or [])[:4]:
+        for m in e.get("markets", [])[:3]:
+            out.append({"label": f"Polymarket: {m['question'][:60]}", "value": round(100 * m["yes"], 1), "src": "Polymarket", "asof": e.get("ends", ""), "nums": [100 * m["yes"]]})
+    return out
+
+
+def figures_text(figs: list[dict], limit: int = 9) -> str:
+    """Строка «Данные и источники» — собрана кодом, не LLM."""
+    parts = [f"{f['label']}: {f['value']:g} ({f['src']}{', ' + f['asof'] if f['asof'] else ''})" for f in figs[:limit]]
+    return "; ".join(parts)
+
+
+_NUM = re.compile(r"(?<![\w.])(\d+(?:[.,]\d+)?)(\s*%)?")
+
+
+def unsourced_numbers(text: str, figs: list[dict], extra: str = "") -> list[str]:
+    """Числа в тексте LLM (десятичные или с %), которых нет среди цифр с источником и во входных данных (допуск 2% или 0,06): кандидаты в выдумку."""
+    allowed = [abs(x) for f in figs for x in f["nums"]]
+    allowed += [float(t.replace(",", ".")) for t in re.findall(r"\d+(?:[.,]\d+)?", extra)]   # числа из остальных входных данных (календарь, счёт) — тоже не выдумка
+    bad = []
+    for m in _NUM.finditer(text):
+        raw = m.group(1)
+        if not ("," in raw or "." in raw or m.group(2)):
+            continue
+        x = float(raw.replace(",", "."))
+        if not any(abs(x - a) <= max(0.06, 0.02 * a) for a in allowed):
+            bad.append(raw + (m.group(2) or "").strip())
+    return bad

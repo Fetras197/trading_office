@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from . import agents, config, data, entry, events, factcheck, indicators, regime
 from .alpaca import AlpacaError
 from .config import COSTS, Limits, make_asset
+from .board import PICTURE_MAX_AGE_H
 from .llm import LLMError, LLMUnavailable, budget_allow
 from .risk import RiskGate
 
@@ -71,7 +72,8 @@ class Hall:
             p["quant"] = {"error": f"unavailable: {type(e).__name__}"}
         if asset.kind == "crypto":
             p["fundamentals"]["derivatives"] = b.get("derivatives")
-        q = {"decision": f"open a small LONG position in {asset.name} now? Stop {entry.STOP_ATR:g}*ATR below, take-profit {entry.TAKE_ATR:g}*ATR above, horizon ~24h. "
+        sl, tp = entry.levels(100.0, 1.0, "trend", asset.kind)
+        q = {"decision": f"open a small LONG position in {asset.name} now? Stop {100 - sl:g}*ATR below, take-profit {tp - 100:g}*ATR above, horizon ~24-72h. "
                          "buy = risk/reward from your domain looks favourable; hold = no edge; sell = expect decline; abstain = your data is missing."}
         return {k: {**v, "question": q} for k, v in p.items()}
 
@@ -111,6 +113,12 @@ class Hall:
         if entry.count_votes(analysts).live:
             self.j.kv_set(f"votes:{asset.name}", {"t": now, "analysts": analysts})
         return analysts, "fresh"
+
+    def _ban(self, asset) -> str:
+        """Действующий запрет «Картины дня» по активу с конкретной причиной ('' если нет). Запрет без причины и срока не действует."""
+        pic = self.board.latest("picture", max_age_h=PICTURE_MAX_AGE_H)
+        e = events.picture_bans(pic["data"]).get(asset.name) if pic else None
+        return f"{e['reason']} (до {e['until'][:16].replace('T', ' ')} UTC)" if e else ""
 
     def _publish_votes(self, cid, asset, analysts, price):
         for r in analysts:
@@ -205,21 +213,29 @@ class Hall:
             raise Skip(f"нет данных: {type(e).__name__}") from e
         analysts, src = self._votes(asset, b)
         votes = entry.count_votes(analysts)
-        if not votes.live:
-            why = {"queue": "очередь аналитиков: за проход разбирается ограниченное число активов (бюджет Gemini)",
-                   "budget": "дневной бюджет Gemini исчерпан"}.get(src, "нет голосов аналитиков (Gemini недоступен или все воздержались)")
-            return hold("votes", why, votes, score=0.5 + 0.25)
-        self._publish_votes(cid, asset, analysts, price)
-        if not entry.majority(votes):
-            return hold("votes", f"аналитики не одобрили: «за» {votes.buy}, «против» {votes.sell}, сомневаются {votes.hold} (нужно «за» не меньше половины и больше «против»)", votes)
+        if votes.live:
+            self._publish_votes(cid, asset, analysts, price)
+        council = entry.majority(votes)
+        gaps = entry.data_gaps(b, votes)
+        if not council:
+            # режим «только технический сигнал»: аналитики не одобрили (или голосов нет) — входим половинным объёмом, если совет не наложил запрет с конкретной причиной
+            ban = self._ban(asset)
+            if not entry.TECH_ONLY or ban:
+                why = (f"запрет совета: {ban}" if ban else
+                       {"queue": "очередь аналитиков: за проход разбирается ограниченное число активов (бюджет Gemini)", "budget": "дневной бюджет Gemini исчерпан"}.get(src) if not votes.live else
+                       f"аналитики не одобрили: «за» {votes.buy}, «против» {votes.sell}, сомневаются {votes.hold}")
+                return hold("ban" if ban else "votes", why or "нет голосов аналитиков", votes, score=0.9 if ban else None)
+            gaps = [("аналитики не одобрили" if votes.live else "нет голосов аналитиков") + ", вход по техническому сигналу"] + gaps
 
         # --- решение: размер ---
-        gaps = entry.data_gaps(b, votes)
+        if tech.kind in entry.COUNTER:
+            gaps.append("сделка против тренда")
         mult = entry.HALF if gaps else 1.0
         mult = min(mult, regime.SIZE_MULT.get(rname, 1.0))
-        stop, take = entry.levels(price, atr)
-        why = f"сигнал «{ 'тренд' if tech.kind == 'trend' else 'отскок' }», «за» {votes.buy} из {votes.live}" + (f"; половинный объём: {'; '.join(gaps)}" if gaps else "")
-        self.board.publish(cid, "decision", asset.name, f"buy: {why}", 0.6, data={"tech": tech.kind, "votes": votes.__dict__, "gaps": gaps, "size_mult": mult, "stop": stop, "take": take, "price": price})
+        stop, take = entry.levels(price, atr, tech.kind, asset.kind)
+        mode = "council" if council else "tech_only"
+        why = f"сигнал «{entry.TECH_RU[tech.kind]}», «за» {votes.buy} из {votes.live}" + (f"; половинный объём: {'; '.join(gaps)}" if gaps else "")
+        self.board.publish(cid, "decision", asset.name, f"buy: {why}", 0.6, data={"tech": tech.kind, "mode": mode, "votes": votes.__dict__, "gaps": gaps, "size_mult": mult, "stop": stop, "take": take, "price": price})
 
         # --- RiskGate (код) + исполнение: под локом и со свежим состоянием счёта ---
         with self.exec_lock:
@@ -249,5 +265,5 @@ class Hall:
             self.j.kv_set(f"partial_at:{asset.name}", None)
             self.j.kv_set(f"partial_done:{asset.name}", None)
             self.j.kv_set(f"init_stop:{asset.name}", stop)
-            order = {**o, "order_id": o.get("order_id") or self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"], "half": bool(gaps), "gaps": gaps, "tech": tech.kind}
+            order = {**o, "order_id": o.get("order_id") or self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"], "half": mult < 1.0, "gaps": gaps, "tech": tech.kind, "mode": mode}
             return Result(asset.name, "opened", f"qty={v.qty} stop={stop:.6g} take={take:.6g}" + (" (половинный объём)" if gaps else ""), cid, order)

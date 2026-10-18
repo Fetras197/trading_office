@@ -1,3 +1,5 @@
+import pytest
+
 from office import entry
 from office.views import nogo_lines
 from office.journal import Journal
@@ -37,9 +39,24 @@ def test_gaps_cause_half_size_conditions():
     assert any("мало голосов" in g for g in entry.data_gaps({"news": [1], "fundamentals": {"pe": 1}}, entry.Votes(1, 0, 1)))
 
 
-def test_levels_rr_is_two():
+def test_levels_rr_is_two_and_crypto_levels_wide_and_inside_gate():
+    from office.risk import RiskGate
     stop, take = entry.levels(100, 2)
     assert (100 - stop) * 2 == take - 100
+    s2, t2 = entry.levels(100, 1, "revert", "crypto")
+    assert (100 - s2) * 2 == pytest.approx(t2 - 100) and 100 - s2 <= RiskGate().l.max_stop_atr - 0.1       # внутри диапазона стопа RiskGate (≤4 ATR)
+    assert entry.levels(100, 1, "support", "stock") == (98.5, 103.0)
+
+
+def test_sideways_and_falling_market_patterns():
+    down = {**BASE, "close": 90.0, "ema20": 92.0, "ema50": 95.0, "ema200": 100.0, "macd_hist": -1.0, "rsi14": 30.0, "bb_lower": 89.8, "low_50": 89.5, "atr14": 1.0}
+    t = entry.technical(down)
+    assert t.signal and t.kind == "support"                                  # у минимума 50 свечей, RSI низкий
+    far = entry.technical({**down, "low_50": 80.0})                          # от поддержки далеко, но цена на 2 ATR ниже EMA20 и у нижней полосы
+    assert far.signal and far.kind == "revert"
+    assert not entry.technical({**down, "low_50": 80.0, "rsi14": 50.0}).signal
+    assert not entry.technical({**down, "rsi14": 60.0, "low_50": 80.0}).signal
+    assert "support" in entry.COUNTER and "revert" in entry.COUNTER and entry.TECH_RU["support"] == "отскок от поддержки"
 
 
 def test_nogo_top_picks_best_per_asset_excludes_bought_and_formats():

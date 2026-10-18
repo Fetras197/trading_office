@@ -27,3 +27,4 @@ vendor/
 logs/
 RESTART
 NO_LAB
+state/

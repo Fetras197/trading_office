@@ -20,6 +20,13 @@ def _tz_hhmm(ts: str) -> str:
     return f"{local(ts):%H:%M}"
 
 
+def when_text(ts: str, now: dt.datetime | None = None) -> str:
+    """Срок с датой, если не сегодня: «до 10:21» при обновлении в 10:21 читалось как нулевой запрет, хотя срок — сутки (до 10:21 завтра)."""
+    t, n = local(ts), (now or dt.datetime.now(dt.timezone.utc)).astimezone(ZoneInfo(config.TZ_NAME))
+    days = (t.date() - n.date()).days
+    return f"{t:%H:%M}" if days == 0 else f"завтра {t:%H:%M}" if days == 1 else f"{t:%d.%m %H:%M}"
+
+
 def events_lines(evs: list[dict], limit: int = 8) -> list[str]:
     out = []
     for e in evs[:limit]:
@@ -46,9 +53,11 @@ def picture_text(pic: dict | None, reg: dict | None = None) -> str:
     if d.get("forbidden") or bans:
         lines.append("Сегодня нельзя:")
         lines += [f"• {f}" for f in d.get("forbidden", [])]
-        lines += [f"• не покупать {name(a)} до {_tz_hhmm(e['until'])} — {e['reason']}" for a, e in bans.items()]
+        lines += [f"• не покупать {name(a)} до {when_text(e['until'])} — {e['reason']}" for a, e in bans.items()]
     sm = d.get("size_mult", 1.0)
     lines.append("Новые покупки запрещены" if d.get("no_new_entries") else f"Размер новых позиций: {num(sm * 100)}% от обычного" if sm < 1 else "Новые покупки разрешены в обычном размере")
+    if d.get("data_sources"):
+        lines.append("Данные и источники: " + d["data_sources"])
     if d.get("mechanical"):
         lines.append("Картина составлена по правилам: аналитики были недоступны.")
     return "\n".join(l for l in lines if l)

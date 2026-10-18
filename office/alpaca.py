@@ -9,6 +9,7 @@ import requests
 from .config import BY_NAME, COSTS
 
 PAPER_HOST = "paper-api.alpaca.markets"
+DUST_USD = 1.0   # позиции дешевле 1 $ — «пыль» после продажи с комиссией в активе (ONDO: 0,00000087 шт.): не позиция, в отчётах и планах не показываем
 
 
 class AlpacaError(Exception):
@@ -103,7 +104,8 @@ class AlpacaClient:
         """Цифры результата ровно как у брокера: equity, cash, last_equity (закрытие прошлого дня), позиции с unrealized_pl."""
         a = self.account()
         pos = [{"symbol": p["symbol"], "qty": float(p["qty"]), "avg": float(p["avg_entry_price"]), "price": float(p["current_price"]),
-                "value": float(p["market_value"]), "pl": float(p["unrealized_pl"]), "plpc": float(p["unrealized_plpc"])} for p in self.positions()]
+                "value": float(p["market_value"]), "pl": float(p["unrealized_pl"]), "plpc": float(p["unrealized_plpc"])}
+               for p in self.positions() if abs(float(p.get("market_value") or 0)) >= DUST_USD]
         return {"equity": float(a["equity"]), "cash": float(a["cash"]), "last_equity": float(a.get("last_equity") or a["equity"]), "positions": pos}
 
     def orders(self, **params):
@@ -346,7 +348,7 @@ class AlpacaBroker:
             self.sell(a.name, p["avg"], time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), "no_stop")
             raise AlpacaError(f"защиту {a.name} поставить не удалось — позиция закрыта по рынку ({e})") from e
 
-    DUST_USD = 1.0   # Alpaca оставляет «пыль» после продажи с комиссией в активе (ONDO: 0,00000087 шт.) — это не позиция
+    DUST_USD = DUST_USD
 
     def live_positions(self) -> dict:
         return {p["symbol"]: p for p in self.c.positions() if abs(float(p.get("market_value") or 0)) >= self.DUST_USD}

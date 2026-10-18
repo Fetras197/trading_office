@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from office import agents, data, hall, indicators
+from office import agents, data, entry, hall, indicators
 from office.board import Board
 from office.hall import Hall
 from office.journal import Journal
@@ -73,7 +73,7 @@ def test_signal_and_majority_enter_full_size_with_atr_levels(env):
     r = h.run_asset("BTC/USD")
     assert r.status == "opened" and r.order["order_id"] == "ord-1" and not r.order["half"]
     name, qty, stop, take = br.bought[0]
-    assert stop == PRICE - 2 * ATR and take == PRICE + 4 * ATR
+    assert stop == pytest.approx(PRICE - 3.8 * ATR) and take == pytest.approx(PRICE + 7.6 * ATR)     # крипта: широкие уровни (издержки)
     assert qty * PRICE <= 0.25 * 100_000 + 1 and qty * (PRICE - stop) <= 0.02 * 100_000 * 1.01     # лимиты RiskGate: размер ≤25%, риск ≤2%
     roles = [x["role"] for x in b.cycle_reports(r.cycle_id, "BTC/USD")]
     assert roles[:4] == ["market", "news", "fundamentals", "quant"] and roles[-1] == "decision"
@@ -107,12 +107,45 @@ def test_no_technical_signal_no_llm_spend_and_nogo_logged(env, monkeypatch):
     assert n["stage"] == "signal" and 0 < n["score"] < 0.5
 
 
-def test_majority_against_blocks_and_is_explained(env):
+def ban(board, asset, reason="крупные ликвидации лонгов", hours=6):
+    import datetime as dt
+    until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=hours)).isoformat(timespec="minutes")
+    board.publish("R-pic", "picture", "*", "neutral: тест", 0.8, data={"regime": "neutral", "summary": "т", "avoid_assets": [{"asset": asset, "reason": reason, "until": until}]})
+
+
+def test_council_against_but_signal_enters_half_size_tech_only(env):
     h, b, j, br = mk(FakeRouter({"market": "buy", "news": "hold", "fundamentals": "hold", "quant": "sell"}))
     r = h.run_asset("BTC/USD")
-    assert r.status == "hold" and "аналитики не одобрили" in r.detail and not br.bought
+    assert r.status == "opened" and r.order["mode"] == "tech_only" and r.order["half"] and "аналитики не одобрили" in r.order["gaps"][0]
+    h2, b2, j2, br2 = mk()
+    h2.run_asset("BTC/USD")
+    assert br.bought[0][1] == pytest.approx(br2.bought[0][1] * 0.5, rel=0.01)
+    assert b.q("SELECT data FROM reports WHERE role='decision'")
+
+
+def test_concrete_picture_ban_blocks_tech_only_but_not_council(env):
+    h, b, j, br = mk(FakeRouter({"market": "hold", "news": "hold", "fundamentals": "hold", "quant": "hold"}))
+    ban(b, "BTC/USD")
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "запрет совета" in r.detail and "ликвидации" in r.detail and not br.bought
     n = j.nogo_top("2000-01-01")[0]
-    assert n["stage"] == "votes" and n["score"] > 0.5
+    assert n["stage"] == "ban" and n["score"] == 0.9
+    h2, b2, j2, br2 = mk()                          # аналитики «за» — полноценный вход, запрет совета не мешает одобренному входу
+    ban(b2, "BTC/USD")
+    assert h2.run_asset("BTC/USD").status == "opened"
+    h3, b3, j3, br3 = mk(FakeRouter({"market": "hold", "news": "hold", "fundamentals": "hold", "quant": "hold"}))
+    ban(b3, "BTC/USD", hours=-1)                    # запрет истёк — не действует
+    assert h3.run_asset("BTC/USD").status == "opened"
+    h4, b4, j4, br4 = mk(FakeRouter({"market": "hold", "news": "hold", "fundamentals": "hold", "quant": "hold"}))
+    ban(b4, "ETH/USD")                              # запрет по другому активу
+    assert h4.run_asset("BTC/USD").status == "opened"
+
+
+def test_tech_only_switch_restores_strict_council(env, monkeypatch):
+    monkeypatch.setattr(entry, "TECH_ONLY", False)
+    h, b, j, br = mk(FakeRouter({"market": "hold", "news": "hold", "fundamentals": "hold", "quant": "sell"}))
+    r = h.run_asset("BTC/USD")
+    assert r.status == "hold" and "аналитики не одобрили" in r.detail and not br.bought
 
 
 def test_half_of_voters_for_is_enough_when_no_sells(env):
@@ -120,13 +153,17 @@ def test_half_of_voters_for_is_enough_when_no_sells(env):
     assert h.run_asset("BTC/USD").status == "opened"
 
 
-def test_no_live_votes_means_no_entry(env):
+def test_no_live_votes_enters_half_size_without_ban_and_blocked_with_ban(env):
     h, b, j, br = mk(FakeRouter(default="down"))
     r = h.run_asset("BTC/USD")
-    assert r.status == "hold" and "нет голосов" in r.detail and not br.bought
+    assert r.status == "opened" and r.order["half"] and "нет голосов аналитиков" in r.order["gaps"][0]
+    h2, b2, j2, br2 = mk(FakeRouter(default="down"))
+    ban(b2, "BTC/USD")
+    assert h2.run_asset("BTC/USD").status == "hold"
 
 
-def test_votes_cached_and_fresh_round_limit(env):
+def test_votes_cached_and_fresh_round_limit(env, monkeypatch):
+    monkeypatch.setattr(entry, "TECH_ONLY", False)
     rt = FakeRouter({"market": "hold", "news": "hold", "fundamentals": "hold", "quant": "hold"})
     h, b, j, br = mk(rt, fresh_rounds=1)
     h.run_asset("BTC/USD")

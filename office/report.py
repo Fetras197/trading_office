@@ -20,6 +20,8 @@ FAMILY_RU = {"sma_cross": "пересечение средних", "rsi_revert":
              "bb_revert": "возврат от нижней границы", "bb_breakout": "выход за верхнюю границу", "adx_trend": "сильный тренд",
              "stoch_revert": "возврат после падения", "atr_breakout": "выход из канала волатильности", "roc_momentum": "устойчивый рост",
              "ema_pullback": "откат в растущем тренде"}
+TECH_PHRASE = {"trend": "растущий тренд, импульс подтверждает", "bounce": "отскок от перепроданности при целом долгом тренде",
+               "support": "цена у поддержки (минимум последних дней), отскок против тренда", "revert": "цена сильно ниже средней, ожидаем возврат к ней (против тренда)"}
 MINUS = "−"
 LATIN = re.compile(r"[A-Za-z]")
 
@@ -118,7 +120,9 @@ def trade_message(board, res) -> str:
     ph = phrases(items)
     dec = last.get("decision", {}).get("data", {})
     why = [f"• {ROLE_RU[r]}: {ph[r]} ({STANCE_RU[last[r]['data']['stance']]})" for r in order]
-    why.insert(0, "• Технический сигнал: " + ("отскок от перепроданности при целом долгом тренде" if o.get("tech") == "bounce" else "растущий тренд, импульс подтверждает"))
+    why.insert(0, "• Технический сигнал: " + TECH_PHRASE.get(o.get("tech"), "растущий тренд, импульс подтверждает"))
+    if o.get("mode") == "tech_only":
+        why.insert(1, "• Аналитики не одобрили вход, но запрета от совета нет — вход только по техническому сигналу")
     if o.get("half"):
         why.append("• Объём вдвое меньше обычного: " + "; ".join(o.get("gaps") or dec.get("gaps") or ["данные неполные"]))
     lines = [f"🟢 Покупка {name(res.asset)} (демо-счёт)", f"Цена входа: {price(entry)}", f"Стоп-лосс: {price(stop)} ({pct(stop / entry - 1)})",

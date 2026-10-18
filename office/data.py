@@ -61,17 +61,22 @@ def yahoo_candles(ticker: str, interval: str = "1h", rng: str = "60d") -> pd.Dat
     return _norm(df.dropna(), "ts", "s")
 
 
+LAST_STOCK_SRC = {"src": "yahoo"}   # какой источник дал последние свечи акций (для пометки источника цифр)
+
+
 def stock_candles(ticker: str, interval: str = "1h", rng: str = "60d") -> pd.DataFrame:
     """Yahoo; облачные IP он часто режет (429/пусто) → запасной источник: бары Alpaca (IEX, бесплатно, нужны ключи). Индексы (^VIX) только на Yahoo."""
     try:
         df = yahoo_candles(ticker, interval, rng)
         if len(df):
+            LAST_STOCK_SRC["src"] = "yahoo"
             return df
     except Exception:  # noqa: BLE001
         pass
     if ticker.startswith("^") or "=" in ticker or interval not in _ALPACA_TF:
         raise ValueError(f"нет данных {ticker}")
-    r = alpaca_bars([ticker], "stock", days=_rng_days(rng) * (1 if interval == "1d" else 1), timeframe=_ALPACA_TF[interval])
+    LAST_STOCK_SRC["src"] = "alpaca"
+    r = alpaca_bars([ticker], "stock", days=_rng_days(rng), timeframe=_ALPACA_TF[interval])
     if ticker not in r or r[ticker].empty:
         raise ValueError(f"нет данных {ticker}")
     return r[ticker]
