@@ -150,14 +150,16 @@ class Office:
     # ---------- задачи прохода ----------
     def watch(self):
         """Сверка с брокером + эквити-снапшот; закрытия стопом/тейком -> Telegram."""
-        prices = {}
+        prices, highs = {}, {}
         for n in self.j.positions():
             try:
                 a = config.BY_NAME[n]
-                prices[n] = float(data.candles(a, "1h", **({"limit": 5} if a.kind == "crypto" else {"rng": "5d"}))["close"].iloc[-1])
+                df = data.candles(a, "1h", **({"limit": 8} if a.kind == "crypto" else {"rng": "5d"}))
+                prices[n] = float(df["close"].iloc[-1])
+                highs[n] = float(df["high"].tail(4).max())   # максимум за последние ~4 часа: касание тейка между проходами
             except Exception:  # noqa: BLE001
                 pass
-        for name, ev in self.broker.sync(prices, utcnow()):
+        for name, ev in self.broker.sync(prices, utcnow(), highs):
             t = self.j.q("SELECT entry, qty FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
             cost = t[0]["entry"] * t[0]["qty"] if t else 0
             self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"], ev.get("offline", False)))

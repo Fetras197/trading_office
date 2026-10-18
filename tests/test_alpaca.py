@@ -166,3 +166,50 @@ def test_orphans_skip_dust():
     b, c, j = mk()
     c._pos = [{"symbol": "ONDOUSD", "market_value": "0.0000009"}, {"symbol": "NVDA", "market_value": "500"}]
     assert b.orphans() == ["NVDA"]
+
+
+LIVE = [{"symbol": "BTCUSD", "market_value": "1000"}]
+
+
+def test_live_crypto_position_without_stop_order_gets_stop_reinstalled():
+    b, c, j = mk()
+    b.buy("BTC/USD", 10, 100.0, 95.0, 110.0, "t0")
+    c._pos, c._orders = LIVE, []                      # заявка стопа пропала
+    n = len(c.submitted)
+    assert b.sync({"BTC/USD": 100.0}, "t1") == []
+    s = c.submitted[n]
+    assert s["type"] == "stop_limit" and s["side"] == "sell" and float(s["stop_price"]) == 95.0 and "BTC/USD" in j.positions()
+
+
+def test_live_crypto_position_with_stop_order_is_left_alone():
+    b, c, j = mk()
+    b.buy("BTC/USD", 10, 100.0, 95.0, 110.0, "t0")
+    c._pos, c._orders = LIVE, [{"id": "s1", "side": "sell", "type": "stop_limit", "qty": "9.975"}]
+    n = len(c.submitted)
+    b.sync({"BTC/USD": 100.0}, "t1")
+    assert len(c.submitted) == n
+
+
+def test_take_touched_between_passes_sells_at_market_and_cancels_stop_order():
+    b, c, j = mk()
+    b.buy("BTC/USD", 10, 100.0, 95.0, 110.0, "t0")
+    c._pos, c._orders = LIVE, [{"id": "s1", "side": "sell", "type": "stop_limit", "qty": "9.975"}]
+    c.order = lambda oid: {"id": oid, "status": "filled", "filled_avg_price": "108", "filled_qty": "9.975"}
+    ev = b.sync({"BTC/USD": 108.0}, "t1", {"BTC/USD": 111.0})       # цена на проходе 108 < тейка 110, но максимум свечей 111 ≥ тейка
+    assert ev[0][1]["reason"] == "take" and "s1" in c.cancelled and not j.positions()
+
+
+def test_take_touch_below_entry_costs_does_not_sell():
+    b, c, j = mk()
+    b.buy("BTC/USD", 10, 100.0, 95.0, 110.0, "t0")
+    c._pos, c._orders = LIVE, [{"id": "s1", "side": "sell", "type": "stop_limit", "qty": "9.975"}]
+    assert b.sync({"BTC/USD": 100.1}, "t1", {"BTC/USD": 111.0}) == [] and j.positions()
+
+
+def test_stop_limit_gap_unfilled_order_is_replaced_by_market_sell():
+    b, c, j = mk()
+    b.buy("BTC/USD", 10, 100.0, 95.0, 110.0, "t0")
+    c._pos, c._orders = LIVE, [{"id": "s1", "side": "sell", "type": "stop_limit", "qty": "9.975"}]
+    c.order = lambda oid: {"id": oid, "status": "filled", "filled_avg_price": "93", "filled_qty": "9.975"}
+    ev = b.sync({"BTC/USD": 93.0}, "t1")                           # цена 93 ниже лимита стопа 94,05: stop_limit не исполнился
+    assert ev[0][1]["reason"] == "stop" and "s1" in c.cancelled and not j.positions()

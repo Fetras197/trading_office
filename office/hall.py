@@ -225,7 +225,7 @@ class Hall:
                        {"queue": "очередь аналитиков: за проход разбирается ограниченное число активов (бюджет Gemini)", "budget": "дневной бюджет Gemini исчерпан"}.get(src) if not votes.live else
                        f"аналитики не одобрили: «за» {votes.buy}, «против» {votes.sell}, сомневаются {votes.hold}")
                 return hold("ban" if ban else "votes", why or "нет голосов аналитиков", votes, score=0.9 if ban else None)
-            gaps = [("аналитики не одобрили" if votes.live else "нет голосов аналитиков") + ", вход по техническому сигналу"] + gaps
+            gaps = [("аналитики не одобрили" if votes.live else "нет голосов аналитиков")] + gaps
 
         # --- решение: размер ---
         if tech.kind in entry.COUNTER:

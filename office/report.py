@@ -124,7 +124,7 @@ def trade_message(board, res) -> str:
     if o.get("mode") == "tech_only":
         why.insert(1, "• Аналитики не одобрили вход, но запрета от совета нет — вход только по техническому сигналу")
     if o.get("half"):
-        why.append("• Объём вдвое меньше обычного: " + "; ".join(o.get("gaps") or dec.get("gaps") or ["данные неполные"]))
+        why.append("• Размер позиции уменьшен вдвое: " + "; ".join(o.get("gaps") or dec.get("gaps") or ["данные неполные"]))
     lines = [f"🟢 Покупка {name(res.asset)} (демо-счёт)", f"Цена входа: {price(entry)}", f"Стоп-лосс: {price(stop)} ({pct(stop / entry - 1)})",
              f"Тейк-профит: {price(take)} ({pct(take / entry - 1)})",
              f"Сумма: {usd(notional)} · риск: {usd(risk)}" + (f" ({num(risk / eq * 100, 1)}% счёта)" if eq else ""), "", "Почему купили:"] + why

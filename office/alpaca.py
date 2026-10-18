@@ -358,7 +358,7 @@ class AlpacaBroker:
         mine = {_sym(self.assets[n].alpaca) for n in self.j.positions()}
         return [s for s in self.live_positions() if s not in mine]
 
-    def sync(self, prices: dict, ts):
+    def sync(self, prices: dict, ts, highs: dict | None = None):
         """Сверка с Alpaca (источник истины): закрытые у брокера позиции → в журнал с ценой и временем из истории ордеров; крипто-тейк исполняется здесь.
         Возвращает [(имя, {price, pnl, reason, offline})]; offline=True — закрылась задолго до этой сверки (пока офис был выключен)."""
         import datetime as dt
@@ -385,6 +385,39 @@ class AlpacaBroker:
                         pass
                 reason = "take" if px >= p["avg"] and p["take"] and px >= p["take"] * 0.998 else "stop"
                 events.append((name, {**self._book_close(name, px, fill_ts, reason), "offline": offline}))
-            elif a.kind == "crypto" and p["take"] and prices.get(name, 0) >= p["take"]:
-                events.append((name, self.sell(name, prices[name], ts, "take")))
+            else:
+                ev = self._guard_live(name, p, a, prices.get(name), (highs or {}).get(name), ts)
+                if ev:
+                    events.append((name, ev))
         return events
+
+    STOP_LIMIT_GAP = 0.99   # лимит защитного stop_limit крипты стоит на 1% ниже стопа
+
+    def _guard_live(self, name, p, a, px, high, ts):
+        """Живая позиция на проходе (раз в 30–60 мин). Alpaca не даёт для крипты две заявки продажи на один объём (проверено: 403 insufficient balance) и запрещает OCO,
+        поэтому на брокере стоит ТОЛЬКО защитный stop_limit, а тейк — по цене на проходе:
+        · тейк: цена на проходе ≥ тейка ИЛИ максимум свечей между проходами коснулся тейка, а цена всё ещё выше входа с издержками → продажа по рынку (заявка стопа при этом отменяется в sell());
+        · стоп-разрыв: цена ушла ниже лимита stop_limit (заявка не исполнилась) → продажа по рынку;
+        · иначе — убедиться, что защитная заявка на месте, и поставить её, если пропала."""
+        if a.kind == "crypto" and px:
+            fee = 2 * (COSTS["crypto"].fee + COSTS["crypto"].slippage)
+            if p["take"] and (px >= p["take"] or (high and high >= p["take"] and px > p["avg"] * (1 + fee))):
+                return self.sell(name, px, ts, "take")
+            if p["stop"] and px <= p["stop"] * self.STOP_LIMIT_GAP:
+                return self.sell(name, px, ts, "stop")
+        self.ensure_protection(name, p, a)
+        return None
+
+    def ensure_protection(self, name, p=None, a=None) -> str:
+        """Есть ли у позиции защитная заявка на брокере (stop/stop_limit); нет — ставим (крипта: stop_limit, акции: OCO стоп+тейк). Возвращает 'ok' | 'reinstalled'."""
+        p, a = p or self.position(name), a or self.assets[name]
+        if any(o.get("type") in ("stop", "stop_limit") for o in self._open_sells(a)):
+            return "ok"
+        live = self.c.position(a.alpaca)
+        qty = float(live["qty_available"]) if live else 0.0
+        if qty <= 0:
+            return "ok"
+        oid = self._install_stop(a, qty, p["stop"], p["take"])
+        if a.kind == "crypto":
+            self.j.kv_set(f"stop_oid:{name}", oid)
+        return "reinstalled"

@@ -53,7 +53,7 @@ def test_trade_message_template_and_no_latin(monkeypatch):
     m = norm(report.trade_message(b, res))
     assert m.startswith("🟢 Покупка BTC (демо-счёт)\nЦена входа: 0,517 $\nСтоп-лосс: 0,503 $ (−2,6%)\nТейк-профит: 0,542 $ (+4,8%)\nСумма: 15 018 $ · риск: 397 $ (0,4% счёта)")
     assert "• Технический анализ: тренд сильный (за)" in m and "• Квант-аналитик: тренд сильный (сомневается)" in m
-    assert "• Технический сигнал: растущий тренд" in m and "• Объём вдвое меньше обычного: нет свежих новостей" in m
+    assert "• Технический сигнал: растущий тренд" in m and "• Размер позиции уменьшен вдвое: нет свежих новостей" in m
     assert "Спор быка" not in m and "Риск-менеджер" not in m
     assert not re.search(r"[A-Za-z#]", m.replace("BTC", ""))  # ни латиницы, ни номеров отчётов
 
@@ -148,3 +148,13 @@ def test_proofread_never_flips_meaning():
     pr._CACHE.clear()
     ok = "Все еще нет покупок, ждем решения"
     assert pr.proofread(ok, B("Всё ещё нет покупок, ждём решения")) == "Всё ещё нет покупок, ждём решения"
+
+
+def test_tech_only_message_says_position_halved_because_analysts_disapproved(monkeypatch):
+    b = Board()
+    b.publish("c", "market", "BTC/USD", "hold: x", 0.6, data={"stance": "hold"})
+    monkeypatch.setattr(report, "phrases", lambda items: {k: "оценка" for k in items})
+    res = SimpleNamespace(status="opened", asset="BTC/USD", cycle_id="c", order={"price": 82125.8, "qty": 0.1486, "stop": 79000.0, "take": 88000.0, "equity": 98000, "tech": "trend",
+                                                                                 "half": True, "mode": "tech_only", "gaps": ["аналитики не одобрили"]})
+    m = norm(report.trade_message(b, res))
+    assert "• Размер позиции уменьшен вдвое: аналитики не одобрили" in m and "Объём вдвое" not in m
