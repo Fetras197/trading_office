@@ -48,7 +48,7 @@ def test_close_message_compares_loss_with_planned_risk():
 
 def test_rules_fingerprint_pinned_and_freeze_counter():
     # Изменить правила входа/размера/блокировок можно только осознанно: обновить PINNED и сбросить счёт сделок (rules.register сделает это сам и сообщит владельцу).
-    PINNED = "14498830b459"
+    PINNED = "5aebe9730980"
     assert rules.fingerprint() == PINNED, f"правила изменились: {rules.fingerprint()} — счёт {rules.FREEZE_MIN_TRADES} сделок начнётся заново"
     j, sent = Journal(), []
     assert rules.register(j, sent.append, "2026-10-18T12:00:00+00:00") is False and not sent

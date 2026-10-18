@@ -119,7 +119,29 @@ def briefing_text(pic, reg, evs, view, jpos, cands) -> str:
 
 
 STAGE_RU = {"signal": "нет сигнала", "votes": "аналитики", "limits": "лимит риска", "regime": "режим рынка", "event": "событие", "cooldown": "остывание после стопа",
-            "halt": "пауза", "riskgate": "риск-гейт", "broker": "брокер", "data": "нет данных"}
+            "halt": "пауза", "riskgate": "риск-гейт", "desk": "отделы", "economics": "экономика сделки", "broker": "брокер", "data": "нет данных"}
+
+
+def desk_lines(rows: list[dict], title: str) -> list[str]:
+    """Отчёт по отделам: бюджет, позиции, сделки, прибыль после комиссий и комиссии — по каждому отделу отдельно."""
+    if not rows:
+        return []
+    out = [title]
+    tot_pnl = tot_fees = tot_tr = 0
+    for r in rows:
+        tot_pnl += r["pnl"]
+        tot_fees += r["fees"]
+        tot_tr += r["trades"]
+        if r["status"] != "active":
+            out.append(f"• {r['name']}: закрыт" + (f" — {r['trades']} сделок за период, {signed(r['pnl'])} $" if r["trades"] else ""))
+            continue
+        b = f"{num(r['share'] * 100)}%" + (f" ({usd(r['budget'])})" if r.get("budget") else "")
+        win = f", в плюс {r['wins']}" if r["trades"] else ""
+        un = f", не закрыто {signed(r['unrealized'])} $" if r["open"] else ""
+        out.append(f"• {r['name']}: бюджет {b}; открыто {r['open']} из 3; закрыто {r['trades']} {plural(r['trades'], 'сделка', 'сделки', 'сделок')}{win}; "
+                   f"прибыль после комиссий {signed(r['pnl'])} $ (комиссии {num(r['fees'], 2)} $){un}")
+    out.append(f"Итого по отделам: {tot_tr} {plural(tot_tr, 'сделка', 'сделки', 'сделок')}, {signed(tot_pnl)} $ после комиссий {num(tot_fees, 2)} $ (резерв 20% не торгуется)")
+    return out
 
 
 def nogo_lines(rows: list[dict]) -> list[str]:
@@ -132,12 +154,14 @@ def nogo_lines(rows: list[dict]) -> list[str]:
     return out
 
 
-def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None, rules_line: str = "") -> str:
+def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None, rules_line: str = "", desk_rows: list[dict] | None = None) -> str:
     day = view["equity"] / view["last_equity"] - 1 if view["last_equity"] else 0.0
     lines = ["🌙 Вечерний отчёт", f"Счёт: {usd(view['equity'])} ({pct(day, 2)} за день)", f"S&P 500 {pct(bench.get('SPY', 0))}, биткоин {pct(bench.get('BTC', 0))} за день",
              f"Покупок за день: {opened_today}, закрыто сделок: {len(trades_today)}"]
     for t in trades_today[:5]:
         lines.append(f"• {name(t['asset'])}: {signed(t['pnl'])} $ ({'по стопу' if t['exit_reason'] == 'stop' else 'по цели' if t['exit_reason'] == 'take' else 'по решению офиса'})")
+    if desk_rows:
+        lines += [""] + desk_lines(desk_rows, "🏢 Отделы за день:")
     if nogo is not None:
         lines += [""] + nogo_lines(nogo)
     lines += ["", shadow_text(shadow_rows)]

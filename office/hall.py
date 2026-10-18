@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import agents, config, data, entry, events, factcheck, indicators, regime, views
+from . import agents, config, data, desks, entry, events, factcheck, indicators, lab, regime, views
 from .alpaca import AlpacaError
 from .config import COSTS, Limits, make_asset
 from .board import PICTURE_MAX_AGE_H
@@ -42,6 +42,7 @@ class Hall:
         self.smart = smart   # coin -> {stance, confidence, rationale} | None (умные деньги)
         self.lab, self.notify, self.gate, self.auto_trade = lab, notify or (lambda t: None), RiskGate(limits), auto_trade
         self.exec_lock = threading.Lock()
+        self.stock_open = True   # Office выставляет на каждом проходе: акции вне часов биржи отделы не берут
         self.fresh_left = fresh_rounds   # сколько новых раундов аналитиков можно запустить за проход (бюджет Gemini)
         self._fresh_lock = threading.Lock()
 
@@ -172,23 +173,20 @@ class Hall:
             return Result(asset.name, "hold", "позиция уже открыта", cid)
         tech = entry.technical(ind)
 
-        if tech.signal:
-            sl, tk = entry.levels(price, atr, tech.kind, asset.kind)
-            self.j.add_signal(ts, asset.name, tech.kind, price, atr, sl, tk)
+        if tech.signal:   # вход для теневого портфеля «только технический сигнал»: те же стоп/тейк, что получил бы офис (с экономикой), но без отделов и голосов
+            p0 = entry.trade_plan(price, atr, tech.kind, asset.kind, COSTS[asset.kind])
+            if p0.ok:
+                self.j.add_signal(ts, asset.name, tech.kind, price, atr, p0.stop, p0.take)
 
         def hold(stage, why, votes=None, score=None):
             self.j.set_summary(run_id, f"{stage}: {why}")
             self._nogo(ts, asset, stage, why, tech, votes, score)
             return Result(asset.name, "hold", why, cid)
 
-        # --- блокировки: лимиты риска (RiskGate проверит ещё раз перед ордером) и защитные запреты ---
+        # --- блокировки: дневной стоп −5% счёта (общий) и защитные запреты; лимиты позиций/входов — по отделам ---
         l = self.gate.l
         if self.gate.trading_halted(acct["equity"], acct["day_start_equity"]):
             return hold("limits", f"дневной стоп {l.daily_stop:.0%} достигнут", score=0.95 if tech.signal else None)
-        if acct["entries_today"] >= l.max_trades_day:
-            return hold("limits", f"лимит {l.max_trades_day} входов в сутки исчерпан", score=0.95 if tech.signal else None)
-        if acct["open_positions"] >= l.max_positions:
-            return hold("limits", f"лимит {l.max_positions} позиций исчерпан", score=0.95 if tech.signal else None)
         if config.STOP_FILE.exists():
             return hold("halt", "включён режим паузы (STOP): новые входы запрещены")
         rg = regime.current(self.board, asset.kind)
@@ -205,10 +203,34 @@ class Hall:
                 t = t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
                 if (dt.datetime.now(dt.timezone.utc) - t).total_seconds() < entry.COOLDOWN_H * 3600:
                     return hold("cooldown", f"остывание: стоп по активу был меньше {entry.COOLDOWN_H:g} ч назад")
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
-        if not tech.signal:
+        patterns = []
+        if any(asset.name in (self.j.kv_get(f"labdesk:{d['id']}") or []) for d in desks.active(self.j) if d["kind"] == "lab"):
+            try:
+                sg = lab.signal_for(self.board, asset.name)
+            except Exception:  # noqa: BLE001 — лаборатория не критична
+                sg = None
+            if sg and sg.get("stance") == "buy":
+                patterns.append("lab")
+        if tech.signal:
+            patterns.append(tech.kind)
+        if not patterns:
             return hold("signal", "нет технического сигнала: " + ("; ".join(tech.notes[:2]) or "условия не выполнены"))
+
+        # --- отдел: первый подходящий со свободным лимитом (3 позиции, 5 входов/сутки, остаток бюджета) ---
+        desk, why_no = None, ""
+        for pat in patterns:
+            desk, why_no = desks.route(self.j, asset.name, pat, acct["equity"], ts[:10], self.stock_open)
+            if desk:
+                pattern = pat
+                break
+        if not desk:
+            return hold("desk", why_no, score=0.8)
+        # --- экономика: цель с комиссиями ≥ 2× риска с комиссиями (крипта ещё и ≥ 4× комиссии круга) ---
+        plan = entry.trade_plan(price, atr, pattern, asset.kind, COSTS[asset.kind])
+        if not plan.ok:
+            return hold("economics", plan.reason, score=0.85)
 
         # --- полный пакет данных и голоса аналитиков (Gemini) ---
         try:
@@ -232,14 +254,14 @@ class Hall:
             gaps = [("аналитики не одобрили" if votes.live else "нет голосов аналитиков")] + gaps
 
         # --- решение: размер ---
-        if tech.kind in entry.COUNTER:
+        if pattern in entry.COUNTER:
             gaps.append("сделка против тренда")
         mult = entry.HALF if gaps else 1.0
         mult = min(mult, regime.SIZE_MULT.get(rname, 1.0))
-        stop, take = entry.levels(price, atr, tech.kind, asset.kind)
+        stop, take = plan.stop, plan.take
         mode = "council" if council else "tech_only"
-        why = f"сигнал «{entry.TECH_RU[tech.kind]}», «за» {votes.buy} из {votes.live}" + (f"; половинный объём: {'; '.join(gaps)}" if gaps else "")
-        self.board.publish(cid, "decision", asset.name, f"buy: {why}", 0.6, data={"tech": tech.kind, "mode": mode, "votes": votes.__dict__, "gaps": gaps, "size_mult": mult, "stop": stop, "take": take, "price": price})
+        why = f"отдел «{desk['name']}», сигнал «{entry.TECH_RU[pattern]}», «за» {votes.buy} из {votes.live}" + (f"; половинный объём: {'; '.join(gaps)}" if gaps else "")
+        self.board.publish(cid, "decision", asset.name, f"buy: {why}", 0.6, data={"tech": pattern, "desk": desk["id"], "mode": mode, "votes": votes.__dict__, "gaps": gaps, "size_mult": mult, "stop": stop, "take": take, "price": price})
 
         # --- RiskGate (код) + исполнение: под локом и со свежим состоянием счёта ---
         with self.exec_lock:
@@ -249,9 +271,12 @@ class Hall:
             live = getattr(self.broker, "live_positions", lambda: {})()
             if asset.alpaca.replace("/", "") in live:
                 return hold("broker", "по активу уже есть позиция у брокера", votes, score=0.9)
-            v = self.gate.check_entry(kind=asset.kind, costs=COSTS[asset.kind], entry=price, stop=stop, atr=atr, equity=acct["equity"],
-                                      day_start_equity=acct["day_start_equity"], entries_today=acct["entries_today"],
-                                      open_positions=acct["open_positions"], cash=acct["cash"], has_position=bool(acct["position"]), size_mult=mult)
+            cap = desks.capacity(self.j, desk, acct["equity"], ts[:10])        # свежие лимиты отдела под локом исполнения
+            if not cap["ok"]:
+                return hold("desk", f"«{desk['name']}»: {cap['why']}", votes, score=0.9)
+            v = RiskGate(desks.limits_for(desk, acct["equity"])).check_entry(
+                kind=asset.kind, costs=COSTS[asset.kind], entry=price, stop=stop, atr=atr, equity=acct["equity"], day_start_equity=acct["day_start_equity"],
+                entries_today=cap["entries"], open_positions=cap["open"], cash=min(acct["cash"], cap["free"]), has_position=bool(acct["position"]), size_mult=mult)
             did = self.j.add_decision(run_id, ts, asset.name, "buy", price, stop, take, v.qty, "ok" if v.ok else "rejected", v.reason)
             if not v.ok:
                 self._nogo(ts, asset, "riskgate", v.reason, tech, votes, score=0.95)
@@ -259,7 +284,7 @@ class Hall:
             if not self.auto_trade:
                 return Result(asset.name, "hold", "dry-run: ордер не отправлен", cid)
             try:
-                o = self.broker.buy(asset.name, v.qty, price, stop, take, ts, run_id)
+                o = self.broker.buy(asset.name, v.qty, price, stop, take, ts, run_id, desk=desk["id"])
             except AlpacaError as e:
                 if "вручную" in str(e) or "СТОП НЕ ВСТАЛ" in str(e):
                     raise
@@ -269,5 +294,5 @@ class Hall:
             self.j.kv_set(f"partial_at:{asset.name}", None)
             self.j.kv_set(f"partial_done:{asset.name}", None)
             self.j.kv_set(f"init_stop:{asset.name}", stop)
-            order = {**o, "order_id": o.get("order_id") or self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"], "half": mult < 1.0, "gaps": gaps, "tech": tech.kind, "mode": mode}
-            return Result(asset.name, "opened", f"qty={v.qty} stop={stop:.6g} take={take:.6g}" + (" (половинный объём)" if gaps else ""), cid, order)
+            order = {**o, "order_id": o.get("order_id") or self.broker.last_order_id, "stop": stop, "take": take, "equity": acct["equity"], "half": mult < 1.0, "gaps": gaps, "tech": pattern, "mode": mode, "desk": desk["name"], "desk_id": desk["id"]}
+            return Result(asset.name, "opened", f"[{desk['name']}] qty={v.qty} stop={stop:.6g} take={take:.6g}" + (" (половинный объём)" if gaps else ""), cid, order)

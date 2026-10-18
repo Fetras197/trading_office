@@ -22,7 +22,7 @@ FAMILY_RU = {"sma_cross": "пересечение средних", "rsi_revert":
              "bb_revert": "возврат от нижней границы", "bb_breakout": "выход за верхнюю границу", "adx_trend": "сильный тренд",
              "stoch_revert": "возврат после падения", "atr_breakout": "выход из канала волатильности", "roc_momentum": "устойчивый рост",
              "ema_pullback": "откат в растущем тренде"}
-TECH_PHRASE = {"trend": "растущий тренд, импульс подтверждает", "bounce": "отскок от перепроданности при целом долгом тренде",
+TECH_PHRASE = {"lab": "стратегия, прошедшая лабораторию", "trend": "растущий тренд, импульс подтверждает", "bounce": "отскок от перепроданности при целом долгом тренде",
                "support": "цена у поддержки (минимум последних дней), отскок против тренда", "revert": "цена сильно ниже средней, ожидаем возврат к ней (против тренда)"}
 MINUS = "−"
 LATIN = re.compile(r"[A-Za-z]")
@@ -128,13 +128,13 @@ def trade_message(board, res) -> str:
         why.insert(1, "• Аналитики не одобрили вход, но запрета от совета нет — вход только по техническому сигналу")
     if o.get("half"):
         why.append("• Размер позиции уменьшен вдвое: " + "; ".join(o.get("gaps") or dec.get("gaps") or ["данные неполные"]))
-    lines = [f"🟢 Покупка {name(res.asset)} (демо-счёт)", f"Цена входа: {price(entry)}", f"Стоп-лосс: {price(stop)} ({pct(stop / entry - 1)})",
+    lines = [f"🟢 Покупка {name(res.asset)} (демо-счёт)", *([f"Отдел: {o['desk']}"] if o.get("desk") else []), f"Цена входа: {price(entry)}", f"Стоп-лосс: {price(stop)} ({pct(stop / entry - 1)})",
              f"Тейк-профит: {price(take)} ({pct(take / entry - 1)})",
              f"Сумма: {usd(notional)} · риск с комиссиями: {usd(risk)}" + (f" ({num(risk / eq * 100, 1)}% счёта)" if eq else ""), "", "Почему купили:"] + why
     return "\n".join(lines)
 
 
-def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: bool = False, planned_risk: float | None = None) -> str:
+def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: bool = False, planned_risk: float | None = None, desk: str | None = None) -> str:
     if offline and reason in ("stop", "take"):
         head = (f"🔴 Продажа {name(asset)} — сработал стоп-лосс (пока офис был выключен)" if reason == "stop"
                 else f"🟢 Продажа {name(asset)} — взят тейк-профит (пока офис был выключен)")
@@ -146,7 +146,7 @@ def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: 
         head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — по вашей команде"
     else:
         head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — по решению трейдера"
-    out = f"{head}\nРезультат: {signed(pnl)} $ ({pct(pnl_pct)})"
+    out = f"{head}\n" + (f"Отдел: {desk}\n" if desk and desk != "без отдела" else "") + f"Результат: {signed(pnl)} $ ({pct(pnl_pct)})"
     if reason == "stop" and planned_risk and planned_risk > 0 and pnl < 0:
         over = -pnl / planned_risk - 1
         out += f"\nЗаложенный риск с комиссиями: {usd(planned_risk)}; факт {usd(-pnl)}" + (f" — на {num(over * 100)}% больше заложенного" if over > 0.10 else " — в пределах заложенного")

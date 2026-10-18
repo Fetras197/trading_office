@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS outcomes(opinion_id INTEGER PRIMARY KEY, label INT, c
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS nogo(id INTEGER PRIMARY KEY, ts TEXT, asset TEXT, stage TEXT, reason TEXT, score REAL);
 CREATE INDEX IF NOT EXISTS ix_nogo_ts ON nogo(ts);
+CREATE TABLE IF NOT EXISTS desks(id TEXT PRIMARY KEY, name TEXT, kind TEXT, share REAL, status TEXT, opened TEXT, closed TEXT, strategy TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS desk_hist(id INTEGER PRIMARY KEY, ts TEXT, desk TEXT, event TEXT, share REAL, note TEXT);
 CREATE TABLE IF NOT EXISTS tech_signals(id INTEGER PRIMARY KEY, ts TEXT, asset TEXT, kind TEXT, price REAL, atr REAL, stop REAL, take REAL);
 """
 
@@ -31,6 +33,12 @@ class Journal:
         self.lock = threading.RLock()
         with self.lock:
             self.db.executescript(SCHEMA)
+            for t in ("positions", "fills", "trades"):   # миграция v5: отдел-владелец позиции/сделки
+                try:
+                    self.db.execute(f"ALTER TABLE {t} ADD COLUMN desk TEXT")
+                except sqlite3.OperationalError:
+                    pass
+            self.db.commit()
 
     def _x(self, sql, args=()):
         with self.lock:
@@ -70,14 +78,16 @@ class Journal:
         sets = ",".join(f"{k}=?" for k in kw)
         self._x(f"UPDATE decisions SET {sets} WHERE id=?", (*kw.values(), did))
 
-    def add_fill(self, ts, asset, side, qty, price, fee, reason, run_id):
-        self._x("INSERT INTO fills(ts,asset,side,qty,price,fee,reason,run_id) VALUES(?,?,?,?,?,?,?,?)",
-                (ts, asset, side, qty, price, fee, reason, run_id))
+    def add_fill(self, ts, asset, side, qty, price, fee, reason, run_id, desk=None):
+        self._x("INSERT INTO fills(ts,asset,side,qty,price,fee,reason,run_id,desk) VALUES(?,?,?,?,?,?,?,?,?)",
+                (ts, asset, side, qty, price, fee, reason, run_id, desk))
 
     def positions(self):
         return {r["asset"]: r for r in self.q("SELECT * FROM positions")}
 
-    def entries_on(self, day: str) -> int:
+    def entries_on(self, day: str, desk: str | None = None) -> int:
+        if desk:
+            return self.q("SELECT COUNT(*) n FROM fills WHERE side='buy' AND substr(ts,1,10)=? AND desk=?", (day, desk))[0]["n"]
         return self.q("SELECT COUNT(*) n FROM fills WHERE side='buy' AND substr(ts,1,10)=?", (day,))[0]["n"]
 
     def snap_equity(self, ts, equity):

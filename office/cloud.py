@@ -6,7 +6,7 @@ import datetime as dt
 import os
 import time
 
-from . import rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
+from . import desks, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
@@ -14,8 +14,8 @@ from .journal import Journal
 from .llm import RoleRouter
 from .risk import RiskGate
 
-MAX_ASSETS = 16          # активов за проход (кандидаты скринера + ядро): без сигнала актив стоит одну загрузку свечей
-FRESH_ROUNDS = 3        # новых раундов аналитиков за проход (бюджет Gemini)
+MAX_ASSETS = 24          # активов за проход (кандидаты скринера + ядро): без сигнала актив стоит одну загрузку свечей
+FRESH_ROUNDS = 5        # новых раундов аналитиков за проход (бюджет Gemini)
 WORKERS = 3
 
 
@@ -61,7 +61,7 @@ class Office:
                 J("picture", R.run_picture, at=["03:30", "07:30", "11:30", "15:30", "19:30", "23:30"], catchup_h=3),
                 J("briefing", self.briefing, at=["08:00"], catchup_h=3, bootstrap=False),
                 J("evening", self.evening, at=["21:00"], catchup_h=3, bootstrap=False),
-                J("weekly", self.weekly, at=["20:00"], weekday=6, catchup_h=6, bootstrap=False)]
+                J("weekly", self.weekly_with_council, at=["20:00"], weekday=6, catchup_h=6, bootstrap=False)]
 
     def pre_event_macro(self):
         """За час до важного события USD: обновить макро-анализ и картину дня (1 раз на событие)."""
@@ -111,6 +111,7 @@ class Office:
         cmp_ = views.compare_line(self.shadow.summary())
         if cmp_:
             text += "\n" + cmp_
+        text += "\n\n" + "\n".join(views.desk_lines(desks.stats(self.j, "", view), "🏢 Отделы с начала работы:"))
         self.notify(text.strip())
 
     def briefing(self):
@@ -126,7 +127,15 @@ class Office:
         opened = self.j.q("SELECT COUNT(*) n FROM fills WHERE side='buy' AND ts>=?", (since,))[0]["n"]
         lessons = [r["text"] for r in memory.recall(self.board, "lesson", days=1, limit=3)]
         self.notify(views.evening_text(self.client.account_view(), self.bench(), trades, opened, self.shadow.summary(), lessons, events.upcoming(self.board, 24),
-                                       {}, nogo=self.j.nogo_top(since, 3), rules_line=rules.line(rules.status(self.j))))
+                                       {}, nogo=self.j.nogo_top(since, 3), rules_line=rules.line(rules.status(self.j)),
+                                       desk_rows=desks.stats(self.j, since, self.client.account_view())))
+
+    def weekly_with_council(self):
+        """Воскресенье 20:00 по Минску: заседание совета директоров (бюджеты, закрытие отделов, новые отделы под лабораторию), затем недельный отчёт."""
+        since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat(timespec="seconds")
+        decisions = desks.council(self.j, self.board, self.client.account_view()["equity"], utcnow(), since)
+        self.notify("🏛 Совет директоров\n" + "\n".join(f"• {d}" for d in decisions))
+        self.weekly()
 
     def weekly(self):
         """Воскресенье 20:00 — недельное собрание (без предложений по весам: подтвердить «да» в облаке некому)."""
@@ -143,7 +152,8 @@ class Office:
                                                  "Use only the input data. Output ONE JSON: {\"insight\": \"...\"}").get("insight", ""))[:600]
         except Exception:  # noqa: BLE001 — итоги недели не должны зависеть от лимитов
             pass
-        self.notify(views.weekly_text(self.shadow.summary(since), trades, lessons, acc, [], {}, insight, realmoney.progress_line(realmoney.progress(self.board, self.j)) + "\n" + rules.line(rules.status(self.j))))
+        self.notify(views.weekly_text(self.shadow.summary(since), trades, lessons, acc, [], {}, insight, realmoney.progress_line(realmoney.progress(self.board, self.j)) + "\n" + rules.line(rules.status(self.j))
+                                       + "\n\n" + "\n".join(views.desk_lines(desks.stats(self.j, since, self.client.account_view()), "🏢 Отделы за неделю:"))))
 
     def run_review(self):
         """Разбор закрытых сделок — не больше 3 за проход."""
@@ -162,11 +172,11 @@ class Office:
             except Exception:  # noqa: BLE001
                 pass
         for name, ev in self.broker.sync(prices, utcnow(), highs):
-            t = self.j.q("SELECT entry, qty FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
+            t = self.j.q("SELECT entry, qty, desk FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
             cost = t[0]["entry"] * t[0]["qty"] if t else 0
             init = self.j.kv_get(f"init_stop:{name}")
             planned = RiskGate.planned_risk(config.COSTS[config.BY_NAME[name].kind], t[0]["entry"], init, t[0]["qty"]) if t and init else None
-            self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"], ev.get("offline", False), planned))
+            self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"], ev.get("offline", False), planned, desks.name_of(self.j, (t[0].get("desk") if t else None))))
         for sym in self.broker.orphans():   # на брокере есть позиция, которой нет в журнале (например, вторая копия офиса) — не игнорируем
             if self.j.kv_get(f"orphan:{sym}") is None:
                 self.j.kv_set(f"orphan:{sym}", utcnow())
@@ -178,13 +188,17 @@ class Office:
             self.j.kv_set("start_equity", eq)
 
     def screen(self):
+        """Сканер рынка (без LLM): весь ликвидный список Alpaca → 10–20 кандидатов для отделов; список крупной крипты запоминается для маршрутизации."""
         self.stock_open = bool(self.client.clock().get("is_open"))
-        held = set(self.j.positions())
-        top = screener.scan(self.board, self.client, self.stock_open, top_n=10, exclude=held | set(config.CRYPTO_CORE + config.STOCK_CORE))
+        self.hall.stock_open = self.stock_open
+        majors: list[str] = []
+        top = screener.scan(self.board, self.client, self.stock_open, exclude=set(self.j.positions()), majors_out=majors)
+        if majors:
+            self.j.kv_set("major_crypto", majors)
         self.candidates = [r["symbol"] for r in top]
 
     def targets(self) -> list[str]:
-        """Кого разбирать в этом проходе: сначала кандидаты скринера (самые «горячие»), затем ядро. Открытые позиции ведёт manage.py."""
+        """Кого разбирать в этом проходе: кандидаты сканера по убыванию оценки, затем ядро крипты. Открытые позиции ведёт manage.py независимо от сканера."""
         held = set(self.j.positions())
         core = list(config.CRYPTO_CORE) + (list(config.STOCK_CORE) if self.stock_open else [])
         out = []
@@ -223,6 +237,8 @@ class Office:
             config.STOP_FILE.touch()
         for name in filter(None, (x.strip() for x in os.environ.get("OFFICE_FORCE_JOBS", "").split(","))):   # ручной запуск: принудительно выполнить задания отдела сейчас
             self.sched.trigger(name)
+        desks.seed(self.j, utcnow())
+        self.hall.stock_open = self.stock_open
         rules.register(self.j, self.notify)
         if self.j.kv_get("cloud_started") is None:
             self.j.kv_set("cloud_started", utcnow())

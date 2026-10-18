@@ -188,7 +188,7 @@ def test_office_wiring_without_running_anything():
     names = [j.name for j in s.sched.jobs]
     assert set(names) == {"events", "regime", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "realmoney", "shadow", "review", "summary", "picture", "briefing", "evening", "weekly"}
     assert names.index("events") < names.index("macro") < names.index("picture")   # порядок первичного наполнения: картина дня — последняя среди исследований
-    assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []} and s.hall.fresh_left == 3
+    assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []} and s.hall.fresh_left == 5
 
 
 def test_polymarket_parsing_sorted_and_closed_markets_dropped(monkeypatch):

@@ -159,7 +159,7 @@ class AlpacaBroker:
             time.sleep(1)
         return self.c.order(oid)
 
-    def buy(self, name, qty, ref_price, stop, take, ts, run_id=None):
+    def buy(self, name, qty, ref_price, stop, take, ts, run_id=None, desk=None):
         a = self.assets[name]
         if self.position(name):
             raise AlpacaError(f"позиция {name} уже открыта")
@@ -205,16 +205,16 @@ class AlpacaBroker:
                 if mo["status"] == "filled":
                     raise AlpacaError(f"защитный стоп не встал ({e}) — позиция немедленно закрыта") from e
                 # закрытие не подтверждено: позицию обязательно ведём в журнале, иначе она «потеряется» без стопа
-                self._record_open(name, fq, price, stop, take, fee_usd, ts, run_id, None)
+                self._record_open(name, fq, price, stop, take, fee_usd, ts, run_id, None, desk)
                 raise AlpacaError(f"СТОП НЕ ВСТАЛ и закрытие не подтверждено ({mo['status']}) — проверь позицию {a.alpaca} вручную") from e
-        self._record_open(name, fq, price, stop, take, fee_usd, ts, run_id, stop_oid)
+        self._record_open(name, fq, price, stop, take, fee_usd, ts, run_id, stop_oid, desk)
         return {"price": price, "qty": fq, "fee": fee_usd}
 
-    def _record_open(self, name, qty, price, stop, take, fee_usd, ts, run_id, stop_oid):
-        self.j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES(?,?,?,?,?,?,?,?)",
-                  (name, qty, price, stop, take, fee_usd, run_id, ts))
+    def _record_open(self, name, qty, price, stop, take, fee_usd, ts, run_id, stop_oid, desk=None):
+        self.j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts,desk) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (name, qty, price, stop, take, fee_usd, run_id, ts, desk))
         self.j.kv_set(f"stop_oid:{name}", stop_oid)
-        self.j.add_fill(ts, name, "buy", qty, price, fee_usd, "entry", run_id)
+        self.j.add_fill(ts, name, "buy", qty, price, fee_usd, "entry", run_id, desk)
 
     def sell(self, name, ref_price, ts, reason="signal"):
         """Закрыть существующий лонг (только полностью)."""
@@ -244,9 +244,9 @@ class AlpacaBroker:
         pnl = (price - p["avg"]) * p["qty"] - fees
         risk = p["qty"] * (p["avg"] - p["stop"])
         self.j._x("DELETE FROM positions WHERE asset=?", (name,))
-        self.j._x("INSERT INTO trades(asset,entry_ts,exit_ts,entry,exit,qty,fees,pnl,r_mult,run_id,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                  (name, p["opened_ts"], ts, p["avg"], price, p["qty"], fees, pnl, pnl / risk if risk > 0 else None, p["run_id"], reason))
-        self.j.add_fill(ts, name, "sell", p["qty"], price, exit_fee, reason, p["run_id"])
+        self.j._x("INSERT INTO trades(asset,entry_ts,exit_ts,entry,exit,qty,fees,pnl,r_mult,run_id,exit_reason,desk) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (name, p["opened_ts"], ts, p["avg"], price, p["qty"], fees, pnl, pnl / risk if risk > 0 else None, p["run_id"], reason, p.get("desk")))
+        self.j.add_fill(ts, name, "sell", p["qty"], price, exit_fee, reason, p["run_id"], p.get("desk"))
         return {"price": price, "pnl": pnl, "reason": reason}
 
     # ---------- сопровождение позиции (3.2): стоп только вверх, частичная фиксация ----------
@@ -341,10 +341,10 @@ class AlpacaBroker:
         entry_fee = p["fees"] * sell_q / p["qty"] if p["qty"] else 0.0
         pnl = (px - p["avg"]) * sell_q - entry_fee - exit_fee
         risk = sell_q * (p["avg"] - p["stop"])
-        self.j._x("INSERT INTO trades(asset,entry_ts,exit_ts,entry,exit,qty,fees,pnl,r_mult,run_id,exit_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                  (name, p["opened_ts"], ts, p["avg"], px, sell_q, entry_fee + exit_fee, pnl, pnl / risk if risk > 0 else None, p["run_id"], reason))
+        self.j._x("INSERT INTO trades(asset,entry_ts,exit_ts,entry,exit,qty,fees,pnl,r_mult,run_id,exit_reason,desk) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (name, p["opened_ts"], ts, p["avg"], px, sell_q, entry_fee + exit_fee, pnl, pnl / risk if risk > 0 else None, p["run_id"], reason, p.get("desk")))
         self.j._x("UPDATE positions SET qty=?, fees=?, stop=? WHERE asset=?", (rest, p["fees"] - entry_fee, max(new_stop, p["stop"]), name))
-        self.j.add_fill(ts, name, "sell", sell_q, px, exit_fee, reason, p["run_id"])
+        self.j.add_fill(ts, name, "sell", sell_q, px, exit_fee, reason, p["run_id"], p.get("desk"))
         return {"price": px, "pnl": pnl, "qty": sell_q}
 
     def _reprotect(self, a, p, qty, stop):

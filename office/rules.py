@@ -6,18 +6,20 @@ weights.propose/apply и лаборатория выключены). Отпеч�
 import hashlib
 import inspect
 
-from . import config, entry, events
+from . import config, desks, entry, events
 
 FREEZE_MIN_TRADES = 20
-VERSION = "v4.2"
+VERSION = "v5.0"
 
 
 def snapshot() -> dict:
     """Всё, что определяет вход, размер, выход и блокировки."""
     return {"entry": {k: getattr(entry, k) for k in ("STOP_ATR", "TAKE_ATR", "HALF", "MIN_LIVE_FULL", "RSI_MAX", "RSI_MIN_TREND", "RSI_BOUNCE", "COOLDOWN_H", "CT_STOP_ATR", "CT_TAKE_ATR",
-                                                      "CRYPTO_STOP_ATR", "CRYPTO_TAKE_ATR", "TECH_ONLY")},
+                                                      "CRYPTO_STOP_ATR", "CRYPTO_TAKE_ATR", "TECH_ONLY", "MIN_REWARD_RISK", "MIN_TARGET_FEES", "MAX_TAKE_ATR")},
+            "desks": {k: getattr(desks, k) for k in ("BASE_SHARE", "RESERVE", "MIN_SHARE", "MAX_SHARE", "STEP", "MAX_POSITIONS", "MAX_ENTRIES_DAY", "CLOSE_AFTER_TRADES", "POSITION_CAP", "ORDER")},
+            "desk_specs": {k: [v["patterns"], v["assets"]] for k, v in desks.BUILTIN.items()},
             "counter": list(entry.COUNTER), "events": [events.PRE_MIN, events.POST_MIN], "limits": vars(config.Limits()), "turnover": dict(config.MIN_TURNOVER),
-            "code": [inspect.getsource(f) for f in (entry.technical, entry.majority, entry.data_gaps, entry.levels)]}
+            "code": [inspect.getsource(f) for f in (entry.technical, entry.majority, entry.data_gaps, entry.levels, entry.trade_plan, desks.route, desks.eligible, desks.limits_for, desks.council)]}
 
 
 def fingerprint(snap: dict | None = None) -> str:

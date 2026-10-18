@@ -15,7 +15,7 @@ CT_STOP_ATR, CT_TAKE_ATR = 1.5, 3.0    # акции, против тренда: 
 CRYPTO_STOP_ATR, CRYPTO_TAKE_ATR = 3.8, 7.6
 TECH_ONLY = True                       # режим «только технический сигнал» (см. выше)
 COUNTER = ("support", "revert")        # шаблоны против тренда: всегда половинный объём
-TECH_RU = {"trend": "тренд", "bounce": "отскок в росте", "support": "отскок от поддержки", "revert": "возврат к средней"}
+TECH_RU = {"lab": "стратегия лаборатории", "trend": "тренд", "bounce": "отскок в росте", "support": "отскок от поддержки", "revert": "возврат к средней"}
 HALF = 0.5                             # множитель объёма при неполных данных
 MIN_LIVE_FULL = 3                      # меньше стольких живых голосов — данные считаются неполными
 RSI_MAX, RSI_MIN_TREND, RSI_BOUNCE = 75.0, 45.0, 38.0
@@ -120,3 +120,47 @@ def proximity(tech: Tech, votes: Votes | None) -> float:
     if votes is None or not votes.live:
         return t
     return t + 0.5 * min(1.0, votes.share / 0.5) * (1.0 if votes.buy >= votes.sell else 0.6)
+
+
+# ---------- экономика сделки (v5): цель должна окупать издержки ----------
+MIN_REWARD_RISK = 2.0      # цель с комиссиями ≥ 2× риска с комиссиями (все активы)
+MIN_TARGET_FEES = 4.0      # крипта: цель (грязная) ≥ 4× комиссии круга
+MAX_TAKE_ATR = 16.0        # дальше этого тейк не ищем — сделка не стоит риска
+
+
+@dataclass
+class Plan:
+    ok: bool
+    stop: float = 0.0
+    take: float = 0.0
+    risk_unit: float = 0.0       # убыток на единицу до стопа С комиссиями и проскальзыванием
+    reward_unit: float = 0.0     # прибыль на единицу при тейке ПОСЛЕ комиссий и проскальзывания
+    fees_unit: float = 0.0       # комиссии круга (вход+выход) на единицу
+    reason: str = ""
+
+
+def _units(price: float, stop: float, take: float, costs) -> tuple[float, float, float]:
+    eff = price * (1 + costs.slippage)
+    risk = eff * (1 + costs.fee) - stop * (1 - costs.slippage) * (1 - costs.fee)
+    reward = take * (1 - costs.slippage) * (1 - costs.fee) - eff * (1 + costs.fee)
+    return risk, reward, costs.fee * (price + take)
+
+
+def trade_plan(price: float, atr: float, pattern: str, asset_kind: str, costs) -> Plan:
+    """Стоп и тейк + проверка экономики. Крипта: стоп 3,8 ATR; тейк — не ближе 7,6 ATR и такой, чтобы цель с комиссиями была ≥ 2× риска с комиссиями
+    И цель (грязная) ≥ 4× комиссии круга; ищется шагом 0,25 ATR до MAX_TAKE_ATR, иначе отказ. Акции/ETF: уровни 2/4 ATR (против тренда 1,5/3), комиссия 0 — действует только правило 2× (тейк при необходимости отодвигается так же)."""
+    if not atr > 1e-9:   # 0/NaN/ничтожный ATR: тейк не сдвигается, цикл не кончится
+        return Plan(False, reason="экономика сделки не сходится: ATR нулевой")
+    stop, take = levels(price, atr, pattern, asset_kind)
+    step = 0.25 * atr
+    while True:
+        risk, reward, fees = _units(price, stop, take, costs)
+        ok_rr = reward >= MIN_REWARD_RISK * risk
+        ok_fee = asset_kind != "crypto" or (take - price) >= MIN_TARGET_FEES * fees
+        if ok_rr and ok_fee:
+            return Plan(True, stop, take, risk, reward, fees)
+        if (take - price) / atr >= MAX_TAKE_ATR:
+            why = (f"цель с комиссиями {reward / risk:.1f}× риска (нужно ≥ {MIN_REWARD_RISK:g}×)" if not ok_rr else
+                   f"цель всего {(take - price) / fees:.1f}× комиссии круга (нужно ≥ {MIN_TARGET_FEES:g}×)")
+            return Plan(False, stop, take, risk, reward, fees, "экономика сделки не сходится: " + why + (f"; тейк дальше {MAX_TAKE_ATR:g} ATR не ищем"))
+        take += step

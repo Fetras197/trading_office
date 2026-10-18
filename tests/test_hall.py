@@ -3,8 +3,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from office import agents, data, entry, hall, indicators
+from office import agents, data, desks, entry, hall, indicators
 from office.board import Board
+from office.config import COSTS
 from office.hall import Hall
 from office.journal import Journal
 from office.llm import LLMUnavailable
@@ -42,8 +43,9 @@ class FakeBroker:
     def live_positions(self):
         return self.live
 
-    def buy(self, name, qty, price, stop, take, ts, run_id=None):
+    def buy(self, name, qty, price, stop, take, ts, run_id=None, desk=None):
         self.bought.append((name, qty, stop, take))
+        self.desks = getattr(self, "desks", []) + [desk]
         self.last_order_id = "ord-1"
         return {"price": price, "qty": qty, "fee": 0.0}
 
@@ -65,6 +67,7 @@ def env(monkeypatch):
 
 def mk(router=None, **kw):
     b, j, br = Board(), Journal(), FakeBroker()
+    desks.seed(j, "2026-10-12T00:00:00+00:00")
     return Hall(b, j, br, router or FakeRouter(), **kw), b, j, br
 
 
@@ -73,8 +76,11 @@ def test_signal_and_majority_enter_full_size_with_atr_levels(env):
     r = h.run_asset("BTC/USD")
     assert r.status == "opened" and r.order["order_id"] == "ord-1" and not r.order["half"]
     name, qty, stop, take = br.bought[0]
-    assert stop == pytest.approx(PRICE - 3.8 * ATR) and take == pytest.approx(PRICE + 7.6 * ATR)     # крипта: широкие уровни (издержки)
-    assert qty * PRICE <= 0.25 * 100_000 + 1 and qty * (PRICE - stop) <= 0.02 * 100_000 * 1.01     # лимиты RiskGate: размер ≤25%, риск ≤2%
+    assert stop == pytest.approx(PRICE - 3.8 * ATR) and take >= PRICE + 7.6 * ATR     # крипта: широкие уровни, тейк подобран экономикой
+    pl = entry.trade_plan(PRICE, ATR, "trend", "crypto", COSTS["crypto"])
+    assert take == pytest.approx(pl.take) and pl.reward_unit >= 2 * pl.risk_unit and (pl.take - PRICE) >= 4 * pl.fees_unit      # цель с комиссиями ≥ 2× риска и ≥ 4× комиссии
+    assert qty * PRICE <= 0.5 * 0.20 * 100_000 + 1 and qty * (PRICE - stop) <= 0.02 * 100_000 * 1.01     # потолок позиции = половина бюджета отдела (10% счёта), риск ≤2%
+    assert br.desks == ["majors"]                                                        # BTC → «Крупная крипта»
     roles = [x["role"] for x in b.cycle_reports(r.cycle_id, "BTC/USD")]
     assert roles[:4] == ["market", "news", "fundamentals", "quant"] and roles[-1] == "decision"
 
@@ -188,21 +194,27 @@ def test_dry_run_sends_no_order(env):
     assert h.run_asset("BTC/USD").detail.startswith("dry-run") and not br.bought
 
 
-def test_risk_limits_still_hard(env):
+def test_risk_limits_still_hard_and_now_per_desk(env):
     h, b, j, br = mk()
     h.j.kv_set("day_start:2026-10-12", 100_000.0)
-    for i in range(5):
-        j.add_fill(f"2026-10-12T0{i}:00:00+00:00", f"X{i}", "buy", 1, 1, 0, "entry", None)
+    for i in range(5):                                                                     # 5 входов за сутки в обоих подходящих отделах → вход невозможен
+        for d in ("majors", "trend"):
+            j.add_fill(f"2026-10-12T0{i}:00:00+00:00", f"X{i}/USD", "buy", 1, 1, 0, "entry", None, d)
     r = h.run_asset("BTC/USD")
-    assert r.status == "hold" and "лимит 5 входов" in r.detail and not br.bought
+    assert r.status == "hold" and "лимит 5 входов в сутки отдела" in r.detail and not br.bought
+    h1, b1, j1, br1 = mk()                                                                 # а пять входов в ЧУЖОМ отделе не мешают
+    for i in range(5):
+        j1.add_fill(f"2026-10-12T0{i}:00:00+00:00", f"X{i}/USD", "buy", 1, 1, 0, "entry", None, "trend")
+    assert h1.run_asset("BTC/USD").status == "opened"
     h2, b2, j2, br2 = mk()
-    h2.j.kv_set("day_start:2026-10-12", 110_000.0)           # эквити 100k против 110k на старте суток = −9% < −5%
+    h2.j.kv_set("day_start:2026-10-12", 110_000.0)                                         # дневной стоп −5% — по счёту, для всех отделов сразу
     assert "дневной стоп" in h2.run_asset("BTC/USD").detail
     h3, b3, j3, br3 = mk()
-    for s in ("A", "B", "C"):
-        j3._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES(?,?,?,?,?,?,?,?)", (s, 1, 1, .5, 2, 0, 0, "t"))
-    assert "лимит 3 позиций" in h3.run_asset("BTC/USD").detail
-    assert not (br.bought or br2.bought or br3.bought)
+    for s_ in ("A/USD", "B/USD", "C/USD"):
+        j3._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts,desk) VALUES(?,?,?,?,?,?,?,?,?)", (s_, 1, 1, .5, 2, 0, 0, "t", "majors"))
+    r3 = h3.run_asset("BTC/USD")                                                           # «Крупная крипта» полна → сигнал уходит в «Тренд» (перелив)
+    assert r3.status == "opened" and br3.desks == ["trend"]
+    assert not (br.bought or br2.bought)
 
 
 def test_open_position_not_reanalysed(env):
@@ -268,10 +280,9 @@ def test_smartmoney_voice_published_for_crypto_only(env):
     assert not b2.q("SELECT 1 FROM reports WHERE role='smartmoney'")
 
 
-def test_riskgate_rejection_is_logged_as_nearest_candidate(env):
+def test_economics_rejection_logged_when_costs_eat_the_target(env):
     h, b, j, br = mk()
-    env["ind"] = {**TREND, "atr14": 0.00001}    # ATR слишком мал → размер/стоп не проходят проверки
+    env["ind"] = {**TREND, "atr14": 0.00001}    # ATR ничтожно мал относительно цены → цель с комиссиями не окупает риск, тейк дальше 16 ATR не ищем
     r = h.run_asset("BTC/USD")
-    assert r.status in ("rejected", "opened", "skipped")
-    if r.status == "rejected":
-        assert j.nogo_top("2000-01-01")[0]["stage"] == "riskgate"
+    assert r.status == "hold" and "экономика сделки не сходится" in r.detail and not br.bought
+    assert j.nogo_top("2000-01-01")[0]["stage"] == "economics"

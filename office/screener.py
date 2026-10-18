@@ -1,7 +1,7 @@
-"""Скринер без LLM (каждые 15 мин): все крипто-пары Alpaca (USD) + S&P 500 + NASDAQ-100. TA-Lib по дневным барам:
-моментум (ROC20, RSI14), объём vs средний (SMA20), пробой 20-дневных уровней, бонус за сигнал approved-стратегии лаборатории.
-Итог — top-N кандидатов в board.candidates; полный цикл зала запускается только по ним (+ открытые позиции)."""
-import io
+"""Сканер рынка без нейросетей. Каждый проход проверяет ВЕСЬ доступный список Alpaca: все USD-пары крипты и все торгуемые акции/ETF, прошедшие фильтр оборота.
+Тяжёлая часть — недельный кэш ликвидного универсума (снапшоты Alpaca по всем акциям/ETF → оборот ≥ порога по 20 дневным барам); каждый проход — дневные бары по ликвидному
+универсуму (TA-Lib): оценка «тренд» (моментум, объём, пробой) и оценка «разворот» (RSI, расстояние до минимума 20 дн. и до средней). Итог — 10–20 кандидатов для отделов:
+до 8 по тренду, до 8 по развороту и крупная крипта (топ по обороту). Акции — только в часы биржи. Ни одного вызова LLM."""
 import json
 import time
 
@@ -14,21 +14,38 @@ from . import config, data, lab
 
 CACHE = config.STATE_DIR / "data_cache" / "universe.json"
 VOL_CACHE = config.STATE_DIR / "data_cache" / "crypto_volume.json"
-UA = {"User-Agent": "Mozilla/5.0 (trading_office)"}
-WIKI = {"sp500": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
-        "ndx": ("https://stockanalysis.com/list/nasdaq-100-stocks/", "Symbol")}  # Википедия убрала таблицу состава NDX
+EXCHANGES = {"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"}
+SNAP_MIN_TURNOVER = 3_000_000.0   # грубый предфильтр по двум последним дням (IEX); точный — по 20 дневным барам
+N_TREND, N_REVERSAL, N_MAX, N_MIN, N_MAJORS = 8, 8, 20, 10, 5
 
 
-def _wiki(url: str, col: str) -> list[str]:
-    html = requests.get(url, headers=UA, timeout=30).text
-    for t in pd.read_html(io.StringIO(html)):
-        if col in t.columns:
-            return [str(s).strip().replace("-", ".") for s in t[col].dropna()]
-    raise ValueError("нет таблицы " + col)
+def _alpaca_headers() -> dict:
+    import os
+    return {"APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY") or os.environ.get("ALPACA_KEY_ID", ""),
+            "APCA-API-SECRET-KEY": os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("ALPACA_SECRET", "")}
+
+
+def stock_assets(alpaca_client) -> list[str]:
+    """Все торгуемые акции и ETF Alpaca на основных биржах (без варрантов/классов с точкой)."""
+    st = alpaca_client._req("GET", "/assets", params={"asset_class": "us_equity", "status": "active"})
+    return sorted(a["symbol"] for a in st if a.get("tradable") and a.get("exchange") in EXCHANGES and a["symbol"].isalpha() and len(a["symbol"]) <= 5)
+
+
+def snapshot_turnover(symbols: list[str]) -> dict[str, float]:
+    """Оборот $ по снапшотам Alpaca (среднее двух последних дневных баров), пачками по 800 символов."""
+    out = {}
+    for i in range(0, len(symbols), 800):
+        r = requests.get("https://data.alpaca.markets/v2/stocks/snapshots", params={"symbols": ",".join(symbols[i:i + 800]), "feed": "iex"}, headers=_alpaca_headers(), timeout=60)
+        r.raise_for_status()
+        for sym, sn in r.json().items():
+            bars = [b for b in (sn.get("dailyBar"), sn.get("prevDailyBar")) if b]
+            if bars:
+                out[sym] = float(np.mean([b["c"] * b["v"] for b in bars]))
+    return out
 
 
 def universe(alpaca_client, max_age_h: float = 24 * 7) -> dict:
-    """{'crypto': [...BTC/USD], 'stock': [...]}; кэш data_cache/universe.json (обновление раз в неделю, при сбое — старый кэш)."""
+    """{'crypto': [...BTC/USD], 'stock': [...акции и ETF с оборотом ≥ порога]}; кэш data_cache/universe.json (неделя, при сбое — старый кэш)."""
     if CACHE.exists() and time.time() - CACHE.stat().st_mtime < max_age_h * 3600:
         try:
             return _clean(json.loads(CACHE.read_text()))
@@ -37,16 +54,24 @@ def universe(alpaca_client, max_age_h: float = 24 * 7) -> dict:
     try:
         cr = alpaca_client._req("GET", "/assets", params={"asset_class": "crypto", "status": "active"})
         crypto = sorted(a["symbol"] for a in cr if a["symbol"].endswith("/USD") and a.get("tradable", True))
-        st = alpaca_client._req("GET", "/assets", params={"asset_class": "us_equity", "status": "active"})
-        ok = {a["symbol"] for a in st if a.get("tradable")}
-        stocks = sorted((set(_wiki(*WIKI["sp500"])) | set(_wiki(*WIKI["ndx"]))) & ok)
-        u = {"crypto": crypto, "stock": stocks}
+        syms = stock_assets(alpaca_client)
+        turn = snapshot_turnover(syms)
+        short = [s for s in syms if turn.get(s, 0) >= SNAP_MIN_TURNOVER]
+        liquid_ok = []
+        for i in range(0, len(short), 150):
+            for sym, df in data.alpaca_bars(short[i:i + 150], "stock", days=40).items():
+                if liquid(sym, df, {}):
+                    liquid_ok.append(sym)
+        u = {"crypto": crypto, "stock": sorted(liquid_ok)}
         CACHE.parent.mkdir(parents=True, exist_ok=True)
         CACHE.write_text(json.dumps(u))
         return _clean(u)
     except Exception:  # noqa: BLE001
         if CACHE.exists():
-            return _clean(json.loads(CACHE.read_text()))
+            try:
+                return _clean(json.loads(CACHE.read_text()))
+            except ValueError:
+                pass
         raise
 
 
@@ -112,7 +137,22 @@ def score(m: dict, lab_long: bool = False) -> float:
     return float(s)
 
 
-def scan(board, alpaca_client, stocks_open: bool, top_n: int = 5, exclude: set | None = None) -> list[dict]:
+def reversal_score(df: pd.DataFrame) -> float:
+    """Оценка «разворота» по дневным барам: перепроданность (RSI), близость к минимуму 20 дней, отклонение вниз от средней 20 дней (в ATR). 0..1."""
+    if len(df) < 40:
+        return 0.0
+    c, h, l = (df[k].to_numpy(float) for k in ("close", "high", "low"))
+    atr = float(ta.ATR(h, l, c)[-1])
+    if not atr or atr != atr:
+        return 0.0
+    rsi = float(ta.RSI(c)[-1])
+    near_low = (c[-1] - l[-20:].min()) / atr
+    below = (c[-20:].mean() - c[-1]) / atr
+    return float(0.4 * np.clip((45 - rsi) / 25, 0, 1) + 0.3 * np.clip((1.5 - near_low) / 1.5, 0, 1) + 0.3 * np.clip(below / 3, 0, 1))
+
+
+def scan(board, alpaca_client, stocks_open: bool, top_n: int = N_MAX, exclude: set | None = None, majors_out: list | None = None) -> list[dict]:
+    """Кандидаты для отделов: 10–20 символов. Записывает board.candidates (score = лучшая из оценок, data: оценки и подсказка отдела). exclude — не включать (открытые позиции)."""
     u = universe(alpaca_client)
     bars = {}
     for kind, syms in (("crypto", u["crypto"]), ("stock", u["stock"] if stocks_open else [])):
@@ -137,11 +177,28 @@ def scan(board, alpaca_client, stocks_open: bool, top_n: int = 5, exclude: set |
                 lab_long = bool(sg and sg["stance"] == "buy")
             except Exception:  # noqa: BLE001
                 pass
-        rows.append({"symbol": sym, "score": score(m, lab_long), "lab_long": lab_long, **m})
-    rows.sort(key=lambda r: -r["score"])
+        rows.append({"symbol": sym, "trend": score(m, lab_long), "reversal": reversal_score(df), "lab_long": lab_long, **m})
+    skip = exclude or set()
+    rows = [r for r in rows if r["symbol"] not in skip]
+    # крупная крипта: топ по обороту (рынок), а не по сигналам
+    crypto_rows = sorted((r for r in rows if "/" in r["symbol"]), key=lambda r: -cvol.get(r["symbol"].split("/")[0], 0.0))
+    majors = [r["symbol"] for r in crypto_rows[:N_MAJORS]] or list(config.CRYPTO_CORE)
+    if majors_out is not None:
+        majors_out[:] = majors
+    pick: dict[str, dict] = {}
+    for key, n in (("trend", N_TREND), ("reversal", N_REVERSAL)):
+        for r in sorted(rows, key=lambda r: -r[key])[:n]:
+            pick.setdefault(r["symbol"], {**r, "why": key})
+    for r in crypto_rows[:N_MAJORS]:
+        pick.setdefault(r["symbol"], {**r, "why": "majors"})
+    for r in sorted(rows, key=lambda r: -r["trend"]):                       # добор до минимума
+        if len(pick) >= N_MIN:
+            break
+        pick.setdefault(r["symbol"], {**r, "why": "trend"})
+    top = sorted(pick.values(), key=lambda r: -max(r["trend"], r["reversal"]))[:max(top_n, N_MIN)]
     ts = pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds")
     board.x("DELETE FROM candidates")
-    top = [r for r in rows if r["symbol"] not in (exclude or set())][:top_n]
     for i, r in enumerate(top, 1):
+        r["score"] = max(r["trend"], r["reversal"])
         board.x("INSERT INTO candidates(ts,symbol,score,rank,data) VALUES(?,?,?,?,?)", (ts, r["symbol"], r["score"], i, json.dumps(r)))
     return top
