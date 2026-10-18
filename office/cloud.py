@@ -13,7 +13,7 @@ from .hall import Hall, Result, utcnow
 from .journal import Journal
 from .llm import RoleRouter
 
-MAX_ASSETS = 10          # активов за проход (core + top-5 скринера)
+MAX_ASSETS = 16          # активов за проход (кандидаты скринера + ядро): без сигнала актив стоит одну загрузку свечей
 FRESH_ROUNDS = 3        # новых раундов аналитиков за проход (бюджет Gemini)
 WORKERS = 3
 
@@ -27,7 +27,7 @@ class Office:
         self.broker = AlpacaBroker(self.client, self.j)
         self.notify = notify
         self.router = router or RoleRouter()
-        self.candidates: list[str] = []
+        self.candidates: list[str] = [r["symbol"] for r in self.board.q("SELECT symbol FROM candidates ORDER BY rank") if not config.excluded(r["symbol"])]   # итог скринера прошлого прохода
         self.stock_open = False
         self.research = research.Research(self.board, self.j, self.client, self.router, self.scope, notify=notify)
         self.research.on_urgent = self.urgent
@@ -174,7 +174,7 @@ class Office:
     def screen(self):
         self.stock_open = bool(self.client.clock().get("is_open"))
         held = set(self.j.positions())
-        top = screener.scan(self.board, self.client, self.stock_open, exclude=held | set(config.CRYPTO_CORE + config.STOCK_CORE))
+        top = screener.scan(self.board, self.client, self.stock_open, top_n=10, exclude=held | set(config.CRYPTO_CORE + config.STOCK_CORE))
         self.candidates = [r["symbol"] for r in top]
 
     def targets(self) -> list[str]:
@@ -215,6 +215,9 @@ class Office:
         """Один проход облачного офиса."""
         if os.environ.get("OFFICE_HALT", "").strip() in ("1", "true", "yes"):
             config.STOP_FILE.touch()
+        for name in filter(None, (x.strip() for x in os.environ.get("OFFICE_FORCE_JOBS", "").split(","))):   # ручной запуск: принудительно выполнить задания отдела сейчас
+            self.j.kv_set(f"job:{name}:last", None)
+            self.j.kv_set(f"job:{name}:attempt", None)
         if self.j.kv_get("cloud_started") is None:
             self.j.kv_set("cloud_started", utcnow())
             self.notify("☁️ Офис переехал в облако (GitHub Actions): проход каждые 30–60 минут, телефон больше не нужен. Сообщения о сделках, сводки и отчёты приходят сюда.")

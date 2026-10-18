@@ -14,6 +14,10 @@ on:
         description: "Не гонять pytest перед проходом"
         type: boolean
         default: false
+      force_jobs:
+        description: "Принудительно выполнить задания отдела сейчас (через запятую: macro,news,crypto,sectors,portfolio,picture,evening,briefing,summary)"
+        type: string
+        default: ""
 
 concurrency:
   group: office            # два прохода одновременно = два писателя в SQLite и двойные ордера
@@ -37,6 +41,7 @@ jobs:
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ secrets.TG_CHAT }}
       OFFICE_HALT: ${{ vars.OFFICE_HALT }}
+      OFFICE_FORCE_JOBS: ${{ inputs.force_jobs }}
       GEMINI_DAILY_BUDGET: ${{ vars.GEMINI_DAILY_BUDGET || '450' }}
     steps:
       - uses: actions/checkout@v4

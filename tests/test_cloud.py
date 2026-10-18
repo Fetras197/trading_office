@@ -91,3 +91,21 @@ def test_prune_board_drops_lab_and_old_reports(tmp_path):
     db = sqlite3.connect(p)
     assert db.execute("SELECT COUNT(*) FROM strategies").fetchone()[0] == 0
     assert [r[0] for r in db.execute("SELECT role FROM reports")] == ["macro"]
+
+
+def test_candidates_restored_from_previous_pass_without_excluded(monkeypatch, tmp_path):
+    b = Board()
+    for i, s in enumerate(["DOGE/USD", "ONDO/USD", "USDC/USD", "LINK/USD"], 1):
+        b.x("INSERT INTO candidates(ts,symbol,score,rank,data) VALUES('t',?,1,?,'{}')", (s, i))
+    monkeypatch.setattr(config, "STOP_FILE", tmp_path / "STOP")
+    o = Office(board=b, journal=Journal(), client=C(), hall=FakeHall(), notify=lambda t: None, router=object())
+    assert o.candidates == ["DOGE/USD", "LINK/USD"]
+
+
+def test_force_jobs_env_resets_schedule_memory(monkeypatch, tmp_path):
+    monkeypatch.setenv("OFFICE_FORCE_JOBS", "macro, news")
+    o, _ = mk(monkeypatch, tmp_path)
+    o.j.kv_set("job:macro:last", "2026-10-18T09:00:00+03:00")
+    o.j.kv_set("job:crypto:last", "2026-10-18T09:00:00+03:00")
+    o.run_once()
+    assert o.j.kv_get("job:macro:last") is None and o.j.kv_get("job:news:last") is None and o.j.kv_get("job:crypto:last")

@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import agents, config, data, entry, events, factcheck, regime
+from . import agents, config, data, entry, events, factcheck, indicators, regime
 from .alpaca import AlpacaError
 from .config import COSTS, Limits, make_asset
 from .llm import LLMError, LLMUnavailable, budget_allow
@@ -142,16 +142,15 @@ class Hall:
             return Result(asset.name, "error", f"{type(e).__name__}: {e}"[:200], cid)
 
     def _run(self, asset, cid, ts) -> Result:
-        try:
+        try:   # дёшево: свечи + индикаторы; тяжёлый пакет (новости, фундаментал, TradingView) — только если есть сигнал
             df = data.candles(asset, "1h", **({"limit": 500} if asset.kind == "crypto" else {"rng": "60d"}))
             if len(df) < 210:
                 raise Skip(f"мало свечей ({len(df)})")
-            b = data.bundle(asset, df)
+            ind = indicators.snapshot(df)
         except Skip:
             raise
         except Exception as e:  # noqa: BLE001
             raise Skip(f"нет данных: {type(e).__name__}") from e
-        ind = b["indicators_1h"]
         price, atr = ind["close"], ind["atr14"]
         if not atr:
             raise Skip("нет ATR")
@@ -197,7 +196,11 @@ class Hall:
         if not tech.signal:
             return hold("signal", "нет технического сигнала: " + ("; ".join(tech.notes[:2]) or "условия не выполнены"))
 
-        # --- голоса аналитиков (Gemini) ---
+        # --- полный пакет данных и голоса аналитиков (Gemini) ---
+        try:
+            b = data.bundle(asset, df)
+        except Exception as e:  # noqa: BLE001
+            raise Skip(f"нет данных: {type(e).__name__}") from e
         analysts, src = self._votes(asset, b)
         votes = entry.count_votes(analysts)
         if not votes.live:

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from office import agents, data, hall
+from office import agents, data, hall, indicators
 from office.board import Board
 from office.hall import Hall
 from office.journal import Journal
@@ -55,6 +55,7 @@ def env(monkeypatch):
     df = pd.DataFrame({"open": px, "high": px + .3, "low": px - .3, "close": px, "volume": 1.0})
     state = {"ind": TREND, "news": [{"title": "x"}], "fund": {"pe": 10}}
     monkeypatch.setattr(data, "candles", lambda *a, **k: df)
+    monkeypatch.setattr(indicators, "snapshot", lambda d: state["ind"])
     monkeypatch.setattr(data, "bundle", lambda a, d=None: {"asset": a.name, "as_of": "t", "indicators_1h": state["ind"], "indicators_4h": state["ind"], "last_candles_1h": [],
                                                            "tradingview": {}, "news": state["news"], "fundamentals": state["fund"]})
     monkeypatch.setattr(agents, "quant_stats", lambda a: {"sharpe_90d": 1})
@@ -95,8 +96,9 @@ def test_abstaining_analyst_means_half_size(env):
     assert r.status == "opened" and r.order["half"]
 
 
-def test_no_technical_signal_no_llm_spend_and_nogo_logged(env):
+def test_no_technical_signal_no_llm_spend_and_nogo_logged(env, monkeypatch):
     env["ind"] = FLAT
+    monkeypatch.setattr(data, "bundle", lambda *a, **k: pytest.fail("тяжёлый пакет данных без сигнала не нужен"))
     rt = FakeRouter()
     h, b, j, br = mk(rt)
     r = h.run_asset("BTC/USD")
