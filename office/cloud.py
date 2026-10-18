@@ -6,12 +6,13 @@ import datetime as dt
 import os
 import time
 
-from . import accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
+from . import rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
 from .journal import Journal
 from .llm import RoleRouter
+from .risk import RiskGate
 
 MAX_ASSETS = 16          # активов за проход (кандидаты скринера + ядро): без сигнала актив стоит одну загрузку свечей
 FRESH_ROUNDS = 3        # новых раундов аналитиков за проход (бюджет Gemini)
@@ -33,7 +34,8 @@ class Office:
         self.research.on_urgent = self.urgent
         self.hall = hall or Hall(self.board, self.j, self.broker, self.router, notify=notify, smart=smartmoney.signal_for, fresh_rounds=FRESH_ROUNDS)
         self.manager = manage.Manager(self.broker, self.j, self.client, notify)
-        self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"], lab_fn=lambda: lab.shadow_signals(self.board), start_fn=lambda: self.j.kv_get("start_equity"))
+        self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"], lab_fn=lambda: lab.shadow_signals(self.board), start_fn=lambda: self.j.kv_get("start_equity"), journal=self.j,
+                                   candles_fn=lambda n: data.candles(config.BY_NAME[n], "1h", **({"limit": 500} if "/" in n else {"rng": "60d"})))
         self.sched = scheduler.Scheduler(self.j, self.jobs())
 
     # ---------- расписание исследовательского отдела (порядок = порядок первичного наполнения) ----------
@@ -124,7 +126,7 @@ class Office:
         opened = self.j.q("SELECT COUNT(*) n FROM fills WHERE side='buy' AND ts>=?", (since,))[0]["n"]
         lessons = [r["text"] for r in memory.recall(self.board, "lesson", days=1, limit=3)]
         self.notify(views.evening_text(self.client.account_view(), self.bench(), trades, opened, self.shadow.summary(), lessons, events.upcoming(self.board, 24),
-                                       {}, nogo=self.j.nogo_top(since, 3)))
+                                       {}, nogo=self.j.nogo_top(since, 3), rules_line=rules.line(rules.status(self.j))))
 
     def weekly(self):
         """Воскресенье 20:00 — недельное собрание (без предложений по весам: подтвердить «да» в облаке некому)."""
@@ -141,7 +143,7 @@ class Office:
                                                  "Use only the input data. Output ONE JSON: {\"insight\": \"...\"}").get("insight", ""))[:600]
         except Exception:  # noqa: BLE001 — итоги недели не должны зависеть от лимитов
             pass
-        self.notify(views.weekly_text(self.shadow.summary(since), trades, lessons, acc, [], {}, insight, realmoney.progress_line(realmoney.progress(self.board, self.j))))
+        self.notify(views.weekly_text(self.shadow.summary(since), trades, lessons, acc, [], {}, insight, realmoney.progress_line(realmoney.progress(self.board, self.j)) + "\n" + rules.line(rules.status(self.j))))
 
     def run_review(self):
         """Разбор закрытых сделок — не больше 3 за проход."""
@@ -162,7 +164,9 @@ class Office:
         for name, ev in self.broker.sync(prices, utcnow(), highs):
             t = self.j.q("SELECT entry, qty FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
             cost = t[0]["entry"] * t[0]["qty"] if t else 0
-            self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"], ev.get("offline", False)))
+            init = self.j.kv_get(f"init_stop:{name}")
+            planned = RiskGate.planned_risk(config.COSTS[config.BY_NAME[name].kind], t[0]["entry"], init, t[0]["qty"]) if t and init else None
+            self.notify(report.close_message(name, ev["pnl"], ev["pnl"] / cost if cost else 0.0, ev["reason"], ev.get("offline", False), planned))
         for sym in self.broker.orphans():   # на брокере есть позиция, которой нет в журнале (например, вторая копия офиса) — не игнорируем
             if self.j.kv_get(f"orphan:{sym}") is None:
                 self.j.kv_set(f"orphan:{sym}", utcnow())
@@ -219,6 +223,7 @@ class Office:
             config.STOP_FILE.touch()
         for name in filter(None, (x.strip() for x in os.environ.get("OFFICE_FORCE_JOBS", "").split(","))):   # ручной запуск: принудительно выполнить задания отдела сейчас
             self.sched.trigger(name)
+        rules.register(self.j, self.notify)
         if self.j.kv_get("cloud_started") is None:
             self.j.kv_set("cloud_started", utcnow())
             self.notify("☁️ Офис переехал в облако (GitHub Actions): проход каждые 30–60 минут, телефон больше не нужен. Сообщения о сделках, сводки и отчёты приходят сюда.")

@@ -6,7 +6,9 @@ import re
 import subprocess
 
 from . import config, proofread, telegram
+from .config import COSTS, make_asset
 from .llm import GeminiBackend, LLMError
+from .risk import RiskGate
 
 ROLE_RU = {"market": "Технический анализ", "news": "Новости", "fundamentals": "Фундаментальный анализ", "quant": "Квант-аналитик",
            "buffett": "Баффетт", "munger": "Мангер", "druckenmiller": "Друкенмиллер", "lab": "Лаборатория стратегий", "smartmoney": "Умные деньги"}
@@ -106,7 +108,8 @@ def trade_message(board, res) -> str:
         return close_message(res.asset, res.order.get("pnl", 0.0), res.order.get("pnl_pct", 0.0), "signal")
     o = res.order
     entry, stop, take, qty = o["price"], o["stop"], o["take"], o["qty"]
-    notional, risk, eq = entry * qty, max(entry - stop, 0) * qty, o.get("equity") or 0
+    kind = make_asset(res.asset).kind
+    notional, risk, eq = entry * qty, RiskGate.planned_risk(COSTS[kind], entry, stop, qty), o.get("equity") or 0
     reps = board.cycle_reports(res.cycle_id, res.asset)
     last = {}
     for r in reps:
@@ -127,11 +130,11 @@ def trade_message(board, res) -> str:
         why.append("• Размер позиции уменьшен вдвое: " + "; ".join(o.get("gaps") or dec.get("gaps") or ["данные неполные"]))
     lines = [f"🟢 Покупка {name(res.asset)} (демо-счёт)", f"Цена входа: {price(entry)}", f"Стоп-лосс: {price(stop)} ({pct(stop / entry - 1)})",
              f"Тейк-профит: {price(take)} ({pct(take / entry - 1)})",
-             f"Сумма: {usd(notional)} · риск: {usd(risk)}" + (f" ({num(risk / eq * 100, 1)}% счёта)" if eq else ""), "", "Почему купили:"] + why
+             f"Сумма: {usd(notional)} · риск с комиссиями: {usd(risk)}" + (f" ({num(risk / eq * 100, 1)}% счёта)" if eq else ""), "", "Почему купили:"] + why
     return "\n".join(lines)
 
 
-def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: bool = False) -> str:
+def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: bool = False, planned_risk: float | None = None) -> str:
     if offline and reason in ("stop", "take"):
         head = (f"🔴 Продажа {name(asset)} — сработал стоп-лосс (пока офис был выключен)" if reason == "stop"
                 else f"🟢 Продажа {name(asset)} — взят тейк-профит (пока офис был выключен)")
@@ -143,7 +146,11 @@ def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: 
         head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — по вашей команде"
     else:
         head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — по решению трейдера"
-    return f"{head}\nРезультат: {signed(pnl)} $ ({pct(pnl_pct)})"
+    out = f"{head}\nРезультат: {signed(pnl)} $ ({pct(pnl_pct)})"
+    if reason == "stop" and planned_risk and planned_risk > 0 and pnl < 0:
+        over = -pnl / planned_risk - 1
+        out += f"\nЗаложенный риск с комиссиями: {usd(planned_risk)}; факт {usd(-pnl)}" + (f" — на {num(over * 100)}% больше заложенного" if over > 0.10 else " — в пределах заложенного")
+    return out
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:

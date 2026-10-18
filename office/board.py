@@ -25,6 +25,7 @@ CREATE INDEX IF NOT EXISTS ix_mem ON memory(kind, asset, id);
 CREATE TABLE IF NOT EXISTS lab_trial(key TEXT PRIMARY KEY, symbol TEXT, name TEXT, tf TEXT, params TEXT, start TEXT, status TEXT, live_ret REAL, bh_ret REAL,
   live_trades INT, live_dd REAL, bh_dd REAL, updated TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS shadow_pos(name TEXT, asset TEXT, qty REAL, entry REAL, opened TEXT, PRIMARY KEY(name, asset));
+CREATE TABLE IF NOT EXISTS shadow_trades(name TEXT, asset TEXT, opened TEXT, closed TEXT, entry REAL, exit REAL, qty REAL, pnl REAL, reason TEXT);
 CREATE TABLE IF NOT EXISTS shadow_eq(ts TEXT, name TEXT, equity REAL, cash REAL);
 CREATE INDEX IF NOT EXISTS ix_sheq ON shadow_eq(name, ts);
 CREATE TABLE IF NOT EXISTS role_weights(role TEXT PRIMARY KEY, weight REAL, disabled INT DEFAULT 0, since TEXT);
@@ -49,6 +50,11 @@ class Board:
             for col in ("tf TEXT", "kind TEXT", "p REAL", "mt INT"):  # миграция: таймфрейм, вид актива, p-значение OOS и итог поправки на множественное тестирование
                 try:
                     self.db.execute(f"ALTER TABLE strategies ADD COLUMN {col}")
+                except sqlite3.OperationalError:
+                    pass
+            for col in ("stop REAL", "take REAL"):   # теневой портфель с реальными стопами/тейками (tech2)
+                try:
+                    self.db.execute(f"ALTER TABLE shadow_pos ADD COLUMN {col}")
                 except sqlite3.OperationalError:
                     pass
             self.db.execute("UPDATE strategies SET kind=CASE WHEN symbol LIKE '%/%' THEN 'crypto' ELSE 'stock' END WHERE kind IS NULL")

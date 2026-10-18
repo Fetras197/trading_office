@@ -3,7 +3,6 @@ import datetime as dt
 import subprocess
 import sys
 
-import pytest
 
 from office import research, sources, views
 from office.alpaca import AlpacaClient

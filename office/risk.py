@@ -44,5 +44,11 @@ class RiskGate:
             return Verdict(False, reason="размер позиции ниже минимума")
         return Verdict(True, qty=qty, reason="ok")
 
+    @staticmethod
+    def planned_risk(costs: Costs, entry: float, stop: float, qty: float) -> float:
+        """Заложенный убыток до стопа в $ ВМЕСТЕ с комиссиями и проскальзыванием (та же формула, по которой гейт считает размер). Именно эта цифра показывается в сообщениях."""
+        eff = entry * (1 + costs.slippage)
+        return max(eff * (1 + costs.fee) - stop * (1 - costs.slippage) * (1 - costs.fee), 0.0) * qty
+
     def trading_halted(self, equity, day_start_equity) -> bool:
         return day_start_equity > 0 and equity / day_start_equity - 1 <= self.l.daily_stop

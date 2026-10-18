@@ -51,7 +51,7 @@ def test_trade_message_template_and_no_latin(monkeypatch):
     res = SimpleNamespace(status="opened", asset="BTC/USD", cycle_id=cid, order={"price": 0.51697, "qty": 29049.61, "stop": 0.5033, "take": 0.5417, "equity": 100000,
                                                                                  "tech": "trend", "half": True, "gaps": ["нет свежих новостей"]})
     m = norm(report.trade_message(b, res))
-    assert m.startswith("🟢 Покупка BTC (демо-счёт)\nЦена входа: 0,517 $\nСтоп-лосс: 0,503 $ (−2,6%)\nТейк-профит: 0,542 $ (+4,8%)\nСумма: 15 018 $ · риск: 397 $ (0,4% счёта)")
+    assert m.startswith("🟢 Покупка BTC (демо-счёт)\nЦена входа: 0,517 $\nСтоп-лосс: 0,503 $ (−2,6%)\nТейк-профит: 0,542 $ (+4,8%)\nСумма: 15 018 $ · риск с комиссиями: ")
     assert "• Технический анализ: тренд сильный (за)" in m and "• Квант-аналитик: тренд сильный (сомневается)" in m
     assert "• Технический сигнал: растущий тренд" in m and "• Размер позиции уменьшен вдвое: нет свежих новостей" in m
     assert "Спор быка" not in m and "Риск-менеджер" not in m

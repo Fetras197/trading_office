@@ -7,7 +7,10 @@ import sys
 from pathlib import Path
 
 state, out = Path(sys.argv[1]), Path(sys.argv[2])
+from zoneinfo import ZoneInfo
+
 now = dt.datetime.now(dt.timezone.utc)
+msk = now.astimezone(ZoneInfo("Europe/Minsk"))
 since = (now - dt.timedelta(days=7)).isoformat(timespec="seconds")
 db = sqlite3.connect(state / "office.db")
 q = lambda sql, a=(): db.execute(sql, a).fetchall()  # noqa: E731
@@ -21,8 +24,8 @@ try:
 except (OSError, ValueError):
     budget = {}
 iso = now.isocalendar()
-lines = [f"# Журнал офиса — неделя {iso.year}-W{iso.week:02d}", "", f"Сформирован {now:%Y-%m-%d %H:%M} UTC (автоматически, workflow keepalive).", "",
-         f"- Эквити: {eq[0][1]:,.2f} $ на {eq[0][0][:16]}" if eq else "- Эквити: нет данных"]
+lines = [f"# Журнал офиса — неделя {iso.year}-W{iso.week:02d}", "", f"Сформирован {msk:%Y-%m-%d %H:%M} по Минску (автоматически, workflow keepalive).", "",
+         f"- Эквити: {eq[0][1]:,.2f} $ на {dt.datetime.fromisoformat(eq[0][0]).astimezone(ZoneInfo('Europe/Minsk')):%d.%m %H:%M} по Минску" if eq else "- Эквити: нет данных"]
 if eq and eq0 and eq0[0][0]:
     lines.append(f"- За 7 дней: {eq[0][1] / eq0[0][0] - 1:+.2%}")
 lines += [f"- Покупок: {buys}; закрыто сделок: {len(trades)}, итог {sum(t[1] for t in trades):+.2f} $",

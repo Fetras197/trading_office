@@ -4,10 +4,11 @@
 import datetime as dt
 import json
 
-from .config import COSTS, make_asset
+from .config import COSTS, Limits, make_asset
+from .risk import RiskGate
 
-NAMES = {"office": "Весь офис", "spy": "Держать S&P 500", "btc": "Держать биткоин", "tech": "Только технический анализ", "lab": "Только стратегии лаборатории"}
-SIGNAL_ROLE = {"tech": "market", "lab": "lab"}
+NAMES = {"office": "Весь офис", "spy": "Держать S&P 500", "btc": "Держать биткоин", "tech2": "Только технический сигнал (стопы, размер и комиссии как у офиса)", "lab": "Только стратегии лаборатории"}
+SIGNAL_ROLE = {"lab": "lab"}
 MAX_POS, WEIGHT, SIGNAL_MAX_AGE_H, MIN_CONF = 3, 0.25, 3, 0.5
 HOLD_ASSET = {"spy": "SPY", "btc": "BTC/USD"}
 
@@ -22,8 +23,12 @@ def _now():
 
 
 class Shadow:
-    def __init__(self, board, price_fn, equity_fn, now_fn=_now, lab_fn=None, start_fn=None):
+    TECH = "tech2"
+    COOLDOWN_H = 4.0
+
+    def __init__(self, board, price_fn, equity_fn, now_fn=_now, lab_fn=None, start_fn=None, journal=None, candles_fn=None):
         self.b, self.price, self.equity, self.now, self.lab_fn, self.start_fn = board, price_fn, equity_fn, now_fn, lab_fn, start_fn   # start_fn: стартовый капитал офиса (журнал)
+        self.j, self.candles_fn, self.gate = journal, candles_fn, RiskGate(Limits())   # journal: таблица tech_signals; candles_fn(asset)->1h DataFrame для симуляции стопов/тейков
 
     # ---- состояние ----
     def _cash(self, name):
@@ -66,6 +71,62 @@ class Shadow:
         except Exception:  # noqa: BLE001
             return float(fallback) if fallback else None
 
+    # ---- «только технический сигнал»: те же стопы, тейки, размер (RiskGate, ×0,5 — без одобрения аналитиков) и комиссии, что у офиса ----
+    def _tech_exits(self, name, cash, ts):
+        for a, p in list(self._positions(name).items()):
+            if not p.get("stop") or not self.candles_fn:
+                continue
+            try:
+                df = self.candles_fn(a)
+            except Exception:  # noqa: BLE001 — нет свечей: позиция остаётся до следующего шага
+                continue
+            df = df[df.index > dt.datetime.fromisoformat(p["opened"])]
+            c = COSTS[make_asset(a).kind]
+            for t, bar in df.iterrows():
+                lvl, why = (p["stop"], "stop") if bar["low"] <= p["stop"] else (p["take"], "take") if p["take"] and bar["high"] >= p["take"] else (None, None)   # в одной свече стоп раньше тейка (консервативно)
+                if lvl:
+                    px = lvl * (1 - c.slippage)
+                    proceeds = p["qty"] * px * (1 - c.fee)
+                    cost = p["qty"] * p["entry"]
+                    self.b.x("DELETE FROM shadow_pos WHERE name=? AND asset=?", (name, a))
+                    self.b.x("INSERT INTO shadow_trades(name,asset,opened,closed,entry,exit,qty,pnl,reason) VALUES(?,?,?,?,?,?,?,?,?)",
+                             (name, a, p["opened"], t.isoformat(timespec="seconds"), p["entry"], px, p["qty"], proceeds - cost, why))
+                    cash += proceeds
+                    break
+        return cash
+
+    def _tech_step(self, name, cash, ts):
+        if not self.j:
+            return cash
+        cash = self._tech_exits(name, cash, ts)
+        last = self.j.kv_get("shadow_sig_id")
+        if last is None:   # старт нового портфеля: прошлые сигналы не берём
+            self.j.kv_set("shadow_sig_id", (self.j.q("SELECT COALESCE(MAX(id),0) m FROM tech_signals")[0]["m"]))
+            return cash
+        day = ts[:10]
+        for sg in self.j.q("SELECT * FROM tech_signals WHERE id>? ORDER BY id", (last,)):
+            self.j.kv_set("shadow_sig_id", sg["id"])
+            pos = self._positions(name)
+            a = sg["asset"]
+            kind = make_asset(a).kind
+            recent_stop = self.b.q("SELECT closed FROM shadow_trades WHERE name=? AND asset=? AND reason='stop' ORDER BY rowid DESC LIMIT 1", (name, a))
+            if recent_stop and (dt.datetime.fromisoformat(sg["ts"]) - dt.datetime.fromisoformat(recent_stop[0]["closed"])).total_seconds() < self.COOLDOWN_H * 3600:
+                continue   # то же остывание после стопа, что у офиса
+            eq = cash + sum(p["qty"] * (self._px(x, p["entry"]) or p["entry"]) for x, p in pos.items())
+            day0 = self.b.q("SELECT equity FROM shadow_eq WHERE name=? AND ts>=? ORDER BY ts, rowid LIMIT 1", (name, day))
+            entries = (self.b.q("SELECT COUNT(*) n FROM shadow_pos WHERE name=? AND opened>=?", (name, day))[0]["n"]
+                       + self.b.q("SELECT COUNT(*) n FROM shadow_trades WHERE name=? AND opened>=?", (name, day))[0]["n"])
+            mult = 0.5   # технический сигнал без одобрения аналитиков = половинный объём (и против тренда тоже)
+            v = self.gate.check_entry(kind=kind, costs=COSTS[kind], entry=sg["price"], stop=sg["stop"], atr=sg["atr"], equity=eq, day_start_equity=day0[0]["equity"] if day0 else eq,
+                                      entries_today=entries, open_positions=len(pos), cash=cash, has_position=a in pos, size_mult=mult)
+            if not v.ok:
+                continue
+            c = COSTS[kind]
+            eff = sg["price"] * (1 + c.slippage)
+            self.b.x("INSERT OR REPLACE INTO shadow_pos(name,asset,qty,entry,opened,stop,take) VALUES(?,?,?,?,?,?,?)", (name, a, v.qty, eff, sg["ts"], sg["stop"], sg["take"]))
+            cash -= v.qty * eff * (1 + c.fee)
+        return cash
+
     # ---- шаг (раз в час и после цикла) ----
     def step(self) -> dict:
         ts, eq_office = self.now().isoformat(timespec="seconds"), float(self.equity())
@@ -77,7 +138,7 @@ class Shadow:
         self.b.x("INSERT INTO shadow_eq(ts,name,equity,cash) VALUES(?,?,?,?)", (ts, "office", eq_office, eq_office))   # cash офиса не важен: считаем по equity
         if not first:
             start = self.b.q("SELECT equity FROM shadow_eq WHERE name='office' ORDER BY ts, rowid LIMIT 1")[0]["equity"]
-        for name in ("spy", "btc", "tech", "lab"):
+        for name in ("spy", "btc", self.TECH, "lab"):
             cash = self._cash(name)
             if cash is None:                       # старт теневого портфеля: тот же капитал, что был у офиса в начале наблюдения
                 cash = start
@@ -88,6 +149,9 @@ class Shadow:
                         continue
                     cash = self._buy(name, HOLD_ASSET[name], cash, px, cash)
             pos = self._positions(name)
+            if name == self.TECH:
+                cash = self._tech_step(name, cash, ts)
+                pos = self._positions(name)
             if name in SIGNAL_ROLE:
                 want = self.signals(name)
                 for a, p in list(pos.items()):

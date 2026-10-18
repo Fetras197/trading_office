@@ -195,6 +195,9 @@ FF = ["https://nfs.faireconomy.media/ff_calendar_thisweek.json", "https://nfs.fa
 CRYPTO_NOTES = []  # событий крипты без бесплатного API нет: экспирация опционов Deribit считается в коде (deribit_expiry)
 
 
+KEY_US_EVENT = re.compile(r"\b(CPI|PPI|PCE|FOMC|Federal Funds Rate|Non-Farm|Unemployment Rate|Average Hourly Earnings|Powell|Fed Chair)\b", re.I)
+
+
 def faireconomy_events() -> list[dict]:
     out = []
     for url in FF:
@@ -210,8 +213,9 @@ def faireconomy_events() -> list[dict]:
             except (KeyError, ValueError):
                 continue
             ccy = r.get("country", "")
-            out.append({"ts": ts.isoformat(timespec="minutes"), "title": r["title"], "ccy": ccy, "impact": r["impact"], "kind": "macro",
-                        "assets": "all" if ccy == "USD" and r["impact"] == "High" else "", "forecast": r.get("forecast", ""), "previous": r.get("previous", ""), "src": "faireconomy"})
+            key = ccy == "USD" and bool(KEY_US_EVENT.search(r["title"]))   # инфляция, ставка ФРС, занятость — всегда «важное», даже если лента дала Medium
+            out.append({"ts": ts.isoformat(timespec="minutes"), "title": r["title"], "ccy": ccy, "impact": "High" if key else r["impact"], "kind": "macro",
+                        "assets": "all" if ccy == "USD" and (r["impact"] == "High" or key) else "", "forecast": r.get("forecast", ""), "previous": r.get("previous", ""), "src": "faireconomy"})
     return out
 
 

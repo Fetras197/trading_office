@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import agents, config, data, entry, events, factcheck, indicators, regime
+from . import agents, config, data, entry, events, factcheck, indicators, regime, views
 from .alpaca import AlpacaError
 from .config import COSTS, Limits, make_asset
 from .board import PICTURE_MAX_AGE_H
@@ -118,7 +118,7 @@ class Hall:
         """Действующий запрет «Картины дня» по активу с конкретной причиной ('' если нет). Запрет без причины и срока не действует."""
         pic = self.board.latest("picture", max_age_h=PICTURE_MAX_AGE_H)
         e = events.picture_bans(pic["data"]).get(asset.name) if pic else None
-        return f"{e['reason']} (до {e['until'][:16].replace('T', ' ')} UTC)" if e else ""
+        return f"{e['reason']} (до {views.when_text(e['until'])} по Минску)" if e else ""
 
     def _publish_votes(self, cid, asset, analysts, price):
         for r in analysts:
@@ -171,6 +171,10 @@ class Hall:
             self.j.set_summary(run_id, "hold: позиция открыта")
             return Result(asset.name, "hold", "позиция уже открыта", cid)
         tech = entry.technical(ind)
+
+        if tech.signal:
+            sl, tk = entry.levels(price, atr, tech.kind, asset.kind)
+            self.j.add_signal(ts, asset.name, tech.kind, price, atr, sl, tk)
 
         def hold(stage, why, votes=None, score=None):
             self.j.set_summary(run_id, f"{stage}: {why}")

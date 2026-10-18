@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS outcomes(opinion_id INTEGER PRIMARY KEY, label INT, c
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS nogo(id INTEGER PRIMARY KEY, ts TEXT, asset TEXT, stage TEXT, reason TEXT, score REAL);
 CREATE INDEX IF NOT EXISTS ix_nogo_ts ON nogo(ts);
+CREATE TABLE IF NOT EXISTS tech_signals(id INTEGER PRIMARY KEY, ts TEXT, asset TEXT, kind TEXT, price REAL, atr REAL, stop REAL, take REAL);
 """
 
 
@@ -96,3 +97,7 @@ class Journal:
                 seen.add(r["asset"])
                 out.append(r)
         return out[:n]
+
+    def add_signal(self, ts, asset, kind, price, atr, stop, take):
+        """Технический сигнал на покупку (до любых блокировок/голосов) — вход для теневого портфеля «только технический сигнал»."""
+        self._x("INSERT INTO tech_signals(ts,asset,kind,price,atr,stop,take) VALUES(?,?,?,?,?,?,?)", (ts, asset, kind, price, atr, stop, take))

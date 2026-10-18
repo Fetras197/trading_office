@@ -132,7 +132,7 @@ def nogo_lines(rows: list[dict]) -> list[str]:
     return out
 
 
-def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None) -> str:
+def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None, rules_line: str = "") -> str:
     day = view["equity"] / view["last_equity"] - 1 if view["last_equity"] else 0.0
     lines = ["🌙 Вечерний отчёт", f"Счёт: {usd(view['equity'])} ({pct(day, 2)} за день)", f"S&P 500 {pct(bench.get('SPY', 0))}, биткоин {pct(bench.get('BTC', 0))} за день",
              f"Покупок за день: {opened_today}, закрыто сделок: {len(trades_today)}"]
@@ -142,7 +142,9 @@ def evening_text(view, bench, trades_today: list[dict], opened_today: int, shado
         lines += [""] + nogo_lines(nogo)
     lines += ["", shadow_text(shadow_rows)]
     if lessons:
-        lines += ["", "Уроки дня:"] + [f"• {l}" for l in lessons[:3]]
+        lines += ["", "Уроки дня (только запись в журнал, правила от них не меняются):"] + [f"• {l}" for l in lessons[:3]]
+    if rules_line:
+        lines += ["", rules_line]
     if evs:
         lines += ["", "Завтра в календаре:"] + events_lines(evs, 4)
     if labst.get("trial") or labst.get("live"):

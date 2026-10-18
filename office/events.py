@@ -1,5 +1,5 @@
 """Календарь событий (1.2): макро (Faireconomy), отчёты компаний, экспирация опционов. Таблица events в board.db.
-Гейт `blocked`: за 30 мин до и 30 мин после события высокой важности новые входы по связанным активам запрещены (до вызова LLM).
+Гейт `blocked`: за 60 мин до и 60 мин после события высокой важности новые входы по связанным активам запрещены (до вызова LLM).
 Связанные активы: USD-события высокой важности — все активы; отчёт компании — только её акция (весь день отчёта США + до 10:00 следующего дня:
 время выхода неизвестно); квартальная экспирация Deribit — вся крипта."""
 import datetime as dt
@@ -8,7 +8,7 @@ import re
 
 from . import sources
 
-PRE_MIN, POST_MIN = 30, 30
+PRE_MIN, POST_MIN = 60, 60   # новые входы запрещены за 60 минут до и 60 минут после важного события (инфляция, ставка ФРС, занятость)
 TITLES_RU = [  # порядок важен: более длинные шаблоны раньше
     (r"FOMC Press Conference", "пресс-конференция ФРС"), (r"FOMC Statement", "решение ФРС по ставке"), (r"Federal Funds Rate", "решение ФРС по ставке"),
     (r"FOMC Meeting Minutes", "протокол заседания ФРС"), (r"Core CPI", "базовая инфляция (цены для потребителей)"), (r"\bCPI\b", "инфляция (цены для потребителей)"), (r"Core PPI", "базовые цены производителей"),
@@ -36,9 +36,27 @@ def _dt(s: str) -> dt.datetime:
     return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
+def dedup(rows: list[dict]) -> list[dict]:
+    """Одно событие — одна строка: одинаковые время + валюта + русское название (CPI m/m, Median CPI, Trimmed CPI в одну минуту; Flash Manufacturing/Services PMI) схлопываются,
+    остаётся запись с наибольшей важностью. Порядок по времени сохраняется."""
+    rank = {"High": 2, "Medium": 1}
+    best: dict[tuple, dict] = {}
+    for r in rows:
+        k = (r["ts"], r.get("ccy"), r.get("kind"), title_ru(r) if r.get("kind") == "macro" else r["title"])
+        if k not in best or rank.get(r["impact"], 0) > rank.get(best[k]["impact"], 0):
+            best[k] = r
+    return sorted(best.values(), key=lambda r: r["ts"])
+
+
 def refresh(board, symbols=()) -> int:
-    """Обновить таблицу событий из источников; возвращает число событий в таблице на ближайшие 3 дня."""
+    """Обновить таблицу событий из источников; возвращает число событий в таблице на ближайшие 3 дня.
+    Записи источника, которых больше нет в свежей выгрузке (событие перенесли; у отчётов компаний сменилась дата), удаляются — иначе накапливаются дубли."""
     evs = sources.faireconomy_events() + sources.deribit_expiry() + sources.earnings_events([s for s in symbols if "/" not in s])
+    now_iso = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat(timespec="minutes")
+    for src in {e["src"] for e in evs}:
+        keep = [_key(e) for e in evs if e["src"] == src]
+        marks = ",".join("?" * len(keep))
+        board.x(f"DELETE FROM events WHERE src=? AND ts>=? AND key NOT IN ({marks})", (src, now_iso, *keep))
     for e in evs:
         board.x("INSERT INTO events(key,ts,until,title,ccy,impact,kind,assets,src,data) VALUES(?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET impact=excluded.impact, until=excluded.until",
@@ -51,7 +69,7 @@ def refresh(board, symbols=()) -> int:
 def upcoming(board, hours: float = 24, now: dt.datetime | None = None, high_only: bool = False) -> list[dict]:
     now = now or dt.datetime.now(dt.timezone.utc)
     lo, hi = (now - dt.timedelta(minutes=POST_MIN)).isoformat(timespec="minutes"), (now + dt.timedelta(hours=hours)).isoformat(timespec="minutes")
-    rows = board.q("SELECT * FROM events WHERE ts>=? AND ts<=? ORDER BY ts", (lo, hi))
+    rows = dedup(board.q("SELECT * FROM events WHERE ts>=? AND ts<=? ORDER BY ts", (lo, hi)))
     return [r for r in rows if r["impact"] == "High"] if high_only else rows
 
 

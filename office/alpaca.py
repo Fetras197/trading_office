@@ -12,6 +12,14 @@ PAPER_HOST = "paper-api.alpaca.markets"
 DUST_USD = 1.0   # позиции дешевле 1 $ — «пыль» после продажи с комиссией в активе (ONDO: 0,00000087 шт.): не позиция, в отчётах и планах не показываем
 
 
+def stop_limit_price(stop: float, entry: float | None) -> float:
+    """Лимит защитного stop_limit крипты. Расстояние от стопа до лимита — не больше 10% от «стоп-дистанции с комиссиями» (и в пределах 0,05–1% цены), чтобы проскальзывание
+    при срабатывании добавляло к заложенному риску не более ~10%. Пример BTC: вход 82 126, стоп 81 248 → дистанция с комиссиями 1,57% → лимит на 0,157% ниже стопа."""
+    fee = COSTS["crypto"].fee
+    frac = max(((entry or stop * 1.02) * (1 + fee) - stop * (1 - fee)) / (entry or stop * 1.02), 0.0)
+    return stop * (1 - min(0.01, max(0.0005, 0.1 * frac)))
+
+
 class AlpacaError(Exception):
     pass
 
@@ -189,7 +197,7 @@ class AlpacaBroker:
             try:  # bracket для крипты запрещён API → отдельный защитный stop_limit (limit на 1% ниже стопа)
                 qty_s = math.floor(fq * 1e6) / 1e6
                 so = self.c.submit({"symbol": a.alpaca, "qty": f"{qty_s:.6f}", "side": "sell", "type": "stop_limit",
-                                    "time_in_force": "gtc", "stop_price": f"{stop:.4f}", "limit_price": f"{stop * 0.99:.4f}"})
+                                    "time_in_force": "gtc", "stop_price": f"{stop:.4f}", "limit_price": f"{stop_limit_price(stop, price):.4f}"})
                 stop_oid = so["id"]
             except AlpacaError as e:
                 mo = self._wait_fill(self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(fq * 1e6) / 1e6:.6f}", "side": "sell",
@@ -249,7 +257,7 @@ class AlpacaBroker:
         """Защитный ордер на остаток: крипто — stop_limit, акции — OCO (стоп + тейк). Возвращает id (или None для акций с OCO)."""
         if a.kind == "crypto":
             so = self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(qty * 1e6) / 1e6:.6f}", "side": "sell", "type": "stop_limit", "time_in_force": "gtc",
-                                "stop_price": f"{stop:.4f}", "limit_price": f"{stop * 0.99:.4f}"})
+                                "stop_price": f"{stop:.4f}", "limit_price": f"{stop_limit_price(stop, (self.position(a.name) or {}).get('avg')):.4f}"})
             return so["id"]
         body = {"symbol": a.alpaca, "qty": str(int(qty)), "side": "sell", "type": "limit", "time_in_force": "gtc", "order_class": "oco",
                 "stop_loss": {"stop_price": f"{stop:.2f}"}, "take_profit": {"limit_price": f"{(take or stop * 1.1):.2f}"}}
@@ -266,7 +274,7 @@ class AlpacaBroker:
             if o.get("type") in ("stop", "stop_limit"):
                 body = {"stop_price": f"{new_stop:.4f}" if a.kind == "crypto" else f"{new_stop:.2f}"}
                 if o.get("type") == "stop_limit":
-                    body["limit_price"] = f"{new_stop * 0.99:.4f}" if a.kind == "crypto" else f"{new_stop * 0.99:.2f}"
+                    body["limit_price"] = f"{stop_limit_price(new_stop, p['avg']):.4f}" if a.kind == "crypto" else f"{new_stop * 0.99:.2f}"
                 try:
                     r = self.c._req("PATCH", f"/orders/{o['id']}", json=body)   # Alpaca replace создаёт НОВЫЙ ордер с новым id
                     if a.kind == "crypto" and r.get("id"):
@@ -391,8 +399,6 @@ class AlpacaBroker:
                     events.append((name, ev))
         return events
 
-    STOP_LIMIT_GAP = 0.99   # лимит защитного stop_limit крипты стоит на 1% ниже стопа
-
     def _guard_live(self, name, p, a, px, high, ts):
         """Живая позиция на проходе (раз в 30–60 мин). Alpaca не даёт для крипты две заявки продажи на один объём (проверено: 403 insufficient balance) и запрещает OCO,
         поэтому на брокере стоит ТОЛЬКО защитный stop_limit, а тейк — по цене на проходе:
@@ -403,7 +409,7 @@ class AlpacaBroker:
             fee = 2 * (COSTS["crypto"].fee + COSTS["crypto"].slippage)
             if p["take"] and (px >= p["take"] or (high and high >= p["take"] and px > p["avg"] * (1 + fee))):
                 return self.sell(name, px, ts, "take")
-            if p["stop"] and px <= p["stop"] * self.STOP_LIMIT_GAP:
+            if p["stop"] and px <= stop_limit_price(p["stop"], p["avg"]):
                 return self.sell(name, px, ts, "stop")
         self.ensure_protection(name, p, a)
         return None
@@ -411,7 +417,19 @@ class AlpacaBroker:
     def ensure_protection(self, name, p=None, a=None) -> str:
         """Есть ли у позиции защитная заявка на брокере (stop/stop_limit); нет — ставим (крипта: stop_limit, акции: OCO стоп+тейк). Возвращает 'ok' | 'reinstalled'."""
         p, a = p or self.position(name), a or self.assets[name]
-        if any(o.get("type") in ("stop", "stop_limit") for o in self._open_sells(a)):
+        stops = [o for o in self._open_sells(a) if o.get("type") in ("stop", "stop_limit")]
+        if stops:
+            o = stops[0]
+            if a.kind == "crypto" and o.get("type") == "stop_limit" and o.get("limit_price"):
+                want = stop_limit_price(float(o.get("stop_price") or p["stop"]), p["avg"])
+                if float(o["limit_price"]) < want * (1 - 0.0002):   # лимит стоит шире допустимого (старые заявки: −1%) — подтягиваем к стопу
+                    try:
+                        r = self.c._req("PATCH", f"/orders/{o['id']}", json={"limit_price": f"{want:.4f}"})
+                        if r.get("id"):
+                            self.j.kv_set(f"stop_oid:{name}", r["id"])
+                        return "tightened"
+                    except AlpacaError:
+                        return "ok"
             return "ok"
         live = self.c.position(a.alpaca)
         qty = float(live["qty_available"]) if live else 0.0
