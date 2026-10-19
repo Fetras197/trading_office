@@ -335,3 +335,15 @@ def test_alt_cap_rechecked_under_lock_when_parallel_thread_opened_one(env):
     h._votes = votes_then_other_thread_opens
     r = h.run_asset("SOL/USD")
     assert r.status == "hold" and "общий лимит 2" in r.detail and not br.bought
+
+
+def test_pair_without_valid_protection_is_not_bought_and_logged(env):
+    from office.alpaca import AlpacaError
+    h, b, j, br = mk()
+
+    def bad(name, qty, price, stop):
+        raise AlpacaError("шаг цены 0.0001 слишком грубый для цены 1.18e-05")
+    br.validate_entry = bad
+    r = h.run_asset("BTC/USD")
+    assert r.status == "skipped" and "не покупаем" in r.detail and not br.bought
+    assert j.nogo_top("2000-01-01")[0]["stage"] == "protection"

@@ -49,6 +49,9 @@ class FakeC:
         self.log, self.fail_patch, self.fail_install, self.n = [], fail_patch, fail_install, 0
         self.pos = {"qty_available": "100", "current_price": "103"}
 
+    def asset_info(self, symbol):
+        return {"price_increment": "0.000000001", "min_order_size": "0"}
+
     def orders(self, **k):
         return [{"id": "stop1", "side": "sell", "type": "stop_limit", "qty": "100", "stop_price": "97"}]
 
@@ -83,7 +86,7 @@ def test_move_stop_patches_existing_order_and_updates_journal(monkeypatch):
     c = FakeC()
     b, j = mk(c)
     assert b.move_stop("BTC/USD", 101.0) and j.positions()["BTC/USD"]["stop"] == 101.0
-    assert c.log[0][0] == "PATCH" and c.log[0][2]["stop_price"] == "101.0000"
+    assert c.log[0][0] == "PATCH" and c.log[0][2]["stop_price"] == "101.00"
     assert j.kv_get("stop_oid:BTC/USD") == "replaced-1"                    # новый id ордера сохранён (замена создаёт новый ордер)
     assert not b.move_stop("BTC/USD", 99.0)                              # вниз — нельзя
 
@@ -98,7 +101,7 @@ def test_move_stop_falls_back_to_cancel_and_reinstall_and_restores_on_failure(mo
     b2, j2 = mk(c2)
     assert b2.move_stop("BTC/USD", 101.0) is False and j2.positions()["BTC/USD"]["stop"] == 97.0
     subs = [x for x in c2.log if x[0] == "submit"]
-    assert len(subs) == 2 and subs[1][4] == "97.0000"
+    assert len(subs) == 2 and subs[1][4] == "97.00"
 
 
 def test_sell_part_cancels_sells_half_and_reprotects_remainder(monkeypatch):

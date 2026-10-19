@@ -31,6 +31,11 @@ class FakeClient:
     def positions(self):
         return self._pos
 
+    tick, min_order = "0.000000001", "0"
+
+    def asset_info(self, symbol):
+        return {"price_increment": self.tick, "min_order_size": self.min_order}
+
     def position(self, symbol):
         return {"qty_available": self.avail} if self.avail is not None else None
 
@@ -226,3 +231,63 @@ def test_stop_limit_gap_unfilled_order_is_replaced_by_market_sell():
     c.order = lambda oid: {"id": oid, "status": "filled", "filled_avg_price": "93", "filled_qty": "9.975"}
     ev = b.sync({"BTC/USD": 93.0}, "t1")                           # цена 93 ниже лимита стопа 94,05: stop_limit не исполнился
     assert ev[0][1]["reason"] == "stop" and "s1" in c.cancelled and not j.positions()
+
+
+# ---- шаг цены пары (price_increment из Alpaca): BONK / SHIB / PEPE ----
+MICRO = {"BONK/USD": (0.0000118, 0.0000125), "SHIB/USD": (0.0000082, 0.0000088), "PEPE/USD": (0.0000037, 0.0000040)}   # (стоп, цена входа)
+
+
+@pytest.mark.parametrize("sym", list(MICRO))
+def test_micro_priced_pairs_get_valid_stop_and_limit_on_the_tick(sym):
+    from decimal import Decimal
+    from office.alpaca import protective_prices
+    stop, entry = MICRO[sym]
+    s, lim = protective_prices(stop, entry, "0.000000001")
+    assert Decimal(s) > 0 and Decimal(lim) > 0 and Decimal(lim) < Decimal(s)                 # раньше «0.0000» → 422 limit price must be > 0
+    assert Decimal(s) % Decimal("0.000000001") == 0 and Decimal(lim) % Decimal("0.000000001") == 0   # кратно шагу цены пары
+    assert abs(float(s) - stop) / stop < 0.001 and (float(s) - float(lim)) / float(s) <= 0.011       # стоп почти не сдвинут, лимит не дальше 1%
+
+
+@pytest.mark.parametrize("sym", list(MICRO))
+def test_micro_pair_entry_places_valid_protective_order(sym):
+    asset = next((a for a in ASSETS if a.name == sym), None) or __import__("office.config", fromlist=["x"]).make_asset(sym)
+    j, c = Journal(), FakeClient()
+    stop, entry = MICRO[sym]
+    b = AlpacaBroker(c, j, {sym: asset})
+    b.buy(sym, 1_000_000.0, entry, stop, entry * 1.1, "t")
+    so = c.submitted[1]
+    assert so["type"] == "stop_limit" and float(so["stop_price"]) > 0 and 0 < float(so["limit_price"]) < float(so["stop_price"]) and so["stop_price"].count(".") == 1 and "e" not in so["stop_price"]
+
+
+def test_invalid_protection_means_no_purchase_at_all():
+    from office.config import make_asset
+    asset = make_asset("BONK/USD")
+    for tick, min_order, qty, why in (("0.0001", "0", 1e9, "слишком грубый"),                # шаг 0,0001 при цене 0,0000118 → стоп обнулился бы
+                                      ("0", "0", 1e9, "не вернула шаг цены"),
+                                      ("0.000000001", "353356.89", 100_000.0, "меньше минимального")):
+        j, c = Journal(), FakeClient()
+        c.tick, c.min_order = tick, min_order
+        b = AlpacaBroker(c, j, {"BONK/USD": asset})
+        with pytest.raises(AlpacaError, match=why):
+            b.buy("BONK/USD", qty, 0.0000125, 0.0000118, 0.000014, "t")
+        assert not c.submitted and not j.positions()                                       # ни рыночного ордера, ни позиции: купить нечего без защиты
+
+
+def test_validate_entry_ok_and_stocks_skip():
+    from office.config import make_asset
+    j, c = Journal(), FakeClient()
+    c.min_order = "353356.89"
+    b = AlpacaBroker(c, j, {"BONK/USD": make_asset("BONK/USD"), "AAPL": make_asset("AAPL")})
+    b.validate_entry("BONK/USD", 1_700_000_000.0, 0.0000125, 0.0000118)
+    b.validate_entry("AAPL", 1, 100.0, 95.0)                                                # акции — bracket, шаг цены не нужен
+
+
+def test_existing_stop_limit_reinstalled_and_tightened_on_the_tick():
+    from office.config import make_asset
+    j, c = Journal(), FakeClient()
+    b = AlpacaBroker(c, j, {"PEPE/USD": make_asset("PEPE/USD")})
+    j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES('PEPE/USD',1000000,0.0000040,0.0000037,0.0000048,0,0,'t')")
+    c._pos, c._orders = [{"symbol": "PEPEUSD", "market_value": "100"}], []
+    assert b.ensure_protection("PEPE/USD") == "reinstalled"
+    so = c.submitted[-1]
+    assert float(so["stop_price"]) == pytest.approx(0.0000037) and 0 < float(so["limit_price"]) < float(so["stop_price"])

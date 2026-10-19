@@ -308,6 +308,13 @@ class Hall:
                 return Result(asset.name, "rejected", v.reason, cid)
             if not self.auto_trade:
                 return Result(asset.name, "hold", "dry-run: ордер не отправлен", cid)
+            val = getattr(self.broker, "validate_entry", None)
+            if val:   # пара без валидной защитной заявки (шаг цены, минимальное количество) не покупается вообще
+                try:
+                    val(asset.name, v.qty, price, stop)
+                except AlpacaError as e:
+                    self._nogo(ts, asset, "protection", str(e)[:200], tech, votes, score=0.9)
+                    return Result(asset.name, "skipped", f"защитная заявка невалидна — не покупаем: {e}"[:220], cid)
             try:
                 o = self.broker.buy(asset.name, v.qty, price, stop, take, ts, run_id, desk=desk["id"])
             except AlpacaError as e:
