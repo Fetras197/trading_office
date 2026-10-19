@@ -186,3 +186,29 @@ def test_legacy_positions_adopted_by_asset_class():
         j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES(?,?,?,?,?,?,?,?)", (a, 1, 1, .5, 2, 0, 0, "t"))
     desks.seed(j, NOW)
     assert {p["asset"]: p["desk"] for p in j.positions().values()} == {"AAPL": "stocks", "BTC/USD": "majors", "ARB/USD": "trend"}
+
+
+def test_partial_sales_count_in_desk_and_office_profit():
+    j = mk()
+    pos(j, "ARB/USD", "trend", qty=34016, avg=0.179)
+    trade(j, "trend", 343.36, fees=31.44, reason="partial", ts="2026-10-19T03:36:41+00:00")
+    rows = {r["id"]: r for r in desks.stats(j, "2026-10-18T21:00:00+00:00", {"equity": 97_000.0, "positions": []})}
+    assert rows["trend"]["pnl"] == pytest.approx(343.36) and rows["trend"]["trades"] == 0 and rows["trend"]["partials"] == 1       # прибыль отдела учитывает частичную продажу
+    txt = "\n".join(views.desk_lines(list(rows.values()), "Отделы")).replace("\u00a0", " ")
+    assert "частичных фиксаций 1" in txt and "прибыль после комиссий +343 $" in txt and "Итого по отделам: закрыто 0 сделок, частичных фиксаций 1; результат +343 $" in txt
+    r = j.realized("2026-10-18T21:00:00+00:00")                                         # офис: то же определение
+    assert r["closed"] == 0 and r["partials"] == 1 and r["pnl"] == pytest.approx(343.36)
+    lt = desks.lifetime(j, "trend")
+    assert lt["pnl"] == pytest.approx(343.36) and lt["trades"] == 0                      # для совета: прибыль с частичными, счёт сделок без них
+
+
+def test_day_boundaries_and_labels_consistent_between_summary_and_evening():
+    j = mk()
+    for ts in ("2026-10-18T10:43:00+00:00", "2026-10-18T16:05:00+00:00", "2026-10-18T16:22:00+00:00", "2026-10-18T16:04:00+00:00", "2026-10-18T16:05:30+00:00"):
+        j.add_fill(ts, "X/USD", "buy", 1, 1, 0, "entry", None, "trend")                # 5 покупок в UTC-сутки 18.10
+    j.add_fill("2026-10-19T03:36:51+00:00", "BTC/USD", "buy", 1, 1, 0, "entry", None, "majors")
+    minsk_midnight = "2026-10-18T21:00:00+00:00"                                       # 00:00 19.10 по Минску
+    assert j.entries_on("2026-10-18") == 5 and j.realized(minsk_midnight)["buys"] == 1   # раньше «сутки» в сводке (UTC) и в вечернем отчёте (Минск) расходились: 5 против 0
+    text = views.evening_text({"equity": 97_000.0, "last_equity": 98_000.0}, {}, [{"asset": "ARB/USD", "pnl": 343.36, "exit_reason": "partial"}], 1, [], [], [], {}, nogo=[], stock_open=False)
+    assert "Покупок за день: 1, закрыто сделок: 0, частичных фиксаций: 1" in text and "Реализованный результат за день: +343 $" in text and "• ARB: +343 $ (частичная фиксация)" in text
+    assert "биржа США закрыта" in text and "круглосуточно" in text

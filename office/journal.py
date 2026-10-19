@@ -111,3 +111,11 @@ class Journal:
     def add_signal(self, ts, asset, kind, price, atr, stop, take):
         """Технический сигнал на покупку (до любых блокировок/голосов) — вход для теневого портфеля «только технический сигнал»."""
         self._x("INSERT INTO tech_signals(ts,asset,kind,price,atr,stop,take) VALUES(?,?,?,?,?,?,?)", (ts, asset, kind, price, atr, stop, take))
+
+    def realized(self, since: str) -> dict:
+        """Итоги с момента since (одно и то же определение для всех сообщений): покупки, закрытые сделки (без частичных), частичные фиксации, реализованная прибыль после комиссий
+        (закрытые + частичные) и уплаченные по ним комиссии."""
+        buys = self.q("SELECT COUNT(*) n FROM fills WHERE side='buy' AND ts>=?", (since,))[0]["n"]
+        t = self.q("SELECT COALESCE(SUM(CASE WHEN exit_reason!='partial' THEN 1 ELSE 0 END),0) closed, COALESCE(SUM(CASE WHEN exit_reason='partial' THEN 1 ELSE 0 END),0) partials, "
+                   "COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(fees),0) fees FROM trades WHERE exit_ts>=?", (since,))[0]
+        return {"buys": buys, **t}

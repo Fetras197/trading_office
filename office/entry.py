@@ -19,6 +19,11 @@ TECH_RU = {"lab": "стратегия лаборатории", "trend": "тре�
 HALF = 0.5                             # множитель объёма при неполных данных
 MIN_LIVE_FULL = 3                      # меньше стольких живых голосов — данные считаются неполными
 RSI_MAX, RSI_MIN_TREND, RSI_BOUNCE = 75.0, 45.0, 38.0
+SUPPORT_ATR, SUPPORT_RSI = 1.0, 45.0                     # отскок от поддержки: цена ≤ 1 ATR над минимумом 50 свечей, RSI ≤ 45
+REVERT_ATR, REVERT_RSI, REVERT_BB_ATR = 1.5, 35.0, 0.25  # возврат к средней: ≥ 1,5 ATR ниже EMA20, RSI ≤ 35, не выше нижней Боллинджера + 0,25 ATR
+MAJORITY_MIN_SHARE = 0.5                                 # «за» не меньше половины живых голосов
+MAX_ALT_POSITIONS = 2                                    # общий лимит на все отделы: не больше 2 открытых позиций в альткоинах
+ALT_EXEMPT = ("BTC/USD", "ETH/USD")                      # BTC и ETH альткоинами не считаются
 COOLDOWN_H = 4.0                       # после стопа по активу повторный вход не раньше, чем через столько часов
 
 
@@ -48,9 +53,9 @@ def technical(ind: dict) -> Tech:
     atr, low50, e20, bbl = g("atr14"), g("low_50"), g("ema20"), g("bb_lower")
     pats = {"trend": trend, "bounce": bounce}
     if atr and low50 is not None:   # шаблоны для бокового и падающего рынка (не требуют роста)
-        pats["support"] = [("цена далеко от поддержки (минимума 50 свечей)", 0 <= c - low50 <= 1.0 * atr), (f"RSI {rsi:.0f} выше 45 — нет слабости", rsi <= 45.0)]
-        pats["revert"] = [("цена не ушла от средней на 1,5 ATR", e20 - c >= 1.5 * atr), (f"RSI {rsi:.0f} выше 35", rsi <= 35.0),
-                          ("цена выше нижней полосы Боллинджера", bbl is None or c <= bbl + 0.25 * atr)]
+        pats["support"] = [("цена далеко от поддержки (минимума 50 свечей)", 0 <= c - low50 <= SUPPORT_ATR * atr), (f"RSI {rsi:.0f} выше {SUPPORT_RSI:g} — нет слабости", rsi <= SUPPORT_RSI)]
+        pats["revert"] = [("цена не ушла от средней на 1,5 ATR", e20 - c >= REVERT_ATR * atr), (f"RSI {rsi:.0f} выше 35", rsi <= REVERT_RSI),
+                          ("цена выше нижней полосы Боллинджера", bbl is None or c <= bbl + REVERT_BB_ATR * atr)]
     score = {k: sum(ok for _, ok in v) / len(v) for k, v in pats.items()}
     for k in ("trend", "bounce", "support", "revert"):
         if k in pats and score[k] == 1:
@@ -88,7 +93,7 @@ def count_votes(analysts: list[dict]) -> Votes:
 
 def majority(v: Votes) -> bool:
     """«За» не меньше половины живых голосов и строго больше, чем «против»."""
-    return v.live > 0 and v.buy * 2 >= v.live and v.buy > v.sell
+    return v.live > 0 and v.buy >= MAJORITY_MIN_SHARE * v.live and v.buy > v.sell
 
 
 def data_gaps(bundle: dict, votes: Votes) -> list[str]:
@@ -127,6 +132,7 @@ MAX_SPREAD = 0.003         # спред шире 0,3% — вход запрещ�
 MIN_REWARD_RISK = 2.0      # цель с комиссиями ≥ 2× риска с комиссиями (все активы)
 MIN_TARGET_FEES = 4.0      # крипта: цель (грязная) ≥ 4× комиссии круга
 MAX_TAKE_ATR = 16.0        # дальше этого тейк не ищем — сделка не стоит риска
+TAKE_STEP_ATR = 0.25       # шаг поиска тейка
 
 
 @dataclass
@@ -153,7 +159,7 @@ def trade_plan(price: float, atr: float, pattern: str, asset_kind: str, costs) -
     if not atr > 1e-9:   # 0/NaN/ничтожный ATR: тейк не сдвигается, цикл не кончится
         return Plan(False, reason="экономика сделки не сходится: ATR нулевой")
     stop, take = levels(price, atr, pattern, asset_kind)
-    step = 0.25 * atr
+    step = TAKE_STEP_ATR * atr
     while True:
         risk, reward, fees = _units(price, stop, take, costs)
         ok_rr = reward >= MIN_REWARD_RISK * risk

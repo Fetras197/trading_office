@@ -4,6 +4,7 @@
 Маршрут сигнала — первый подходящий отдел со свободным лимитом: Акции США → Крупная крипта → Тренд → Отскок. Лаборатория-отделы (под стратегию со статусом live) идут первыми."""
 import hashlib
 
+from . import entry
 from .config import CRYPTO_CORE, Limits
 
 BASE_SHARE, RESERVE, MIN_SHARE, MAX_SHARE, STEP = 0.20, 0.20, 0.05, 0.40, 0.05
@@ -74,6 +75,11 @@ def eligible(j, desk: dict, symbol: str, pattern: str, stock_open: bool) -> bool
     return {"stock": not crypto, "major": crypto and symbol in majors(j), "any": True}[spec["assets"]]
 
 
+def alt_positions(j) -> list[str]:
+    """Открытые позиции в альткоинах по ВСЕМ отделам (BTC и ETH альткоинами не считаются)."""
+    return [a for a in j.positions() if "/" in a and a not in entry.ALT_EXEMPT]
+
+
 def usage(j, desk_id: str) -> dict:
     pos = [p for p in j.positions().values() if p.get("desk") == desk_id]
     return {"open": len(pos), "used": sum(p["qty"] * p["avg"] for p in pos)}
@@ -124,12 +130,13 @@ def stats(j, since: str = "", view: dict | None = None) -> list[dict]:
     for d in all_desks(j):
         t = j.q("SELECT COUNT(*) n, COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(fees),0) fees, COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) wins "
                 "FROM trades WHERE desk=? AND exit_reason!='partial' AND exit_ts>=?", (d["id"], since))[0]
-        part = j.q("SELECT COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(fees),0) fees FROM trades WHERE desk=? AND exit_reason='partial' AND exit_ts>=?", (d["id"], since))[0]
+        part = j.q("SELECT COUNT(*) n, COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(fees),0) fees FROM trades WHERE desk=? AND exit_reason='partial' AND exit_ts>=?", (d["id"], since))[0]
         pos = [p for p in j.positions().values() if p.get("desk") == d["id"]]
         unreal = sum(live.get(a["asset"].replace("/", ""), {}).get("pl", 0.0) for a in pos)
         opened_fees = sum(p["fees"] for p in pos)
         out.append({"id": d["id"], "name": d["name"], "status": d["status"], "share": d["share"], "budget": d["share"] * eq if eq else None, "open": len(pos), "unrealized": unreal,
-                    "trades": t["n"], "wins": t["wins"], "pnl": t["pnl"] + part["pnl"], "fees": t["fees"] + part["fees"] + opened_fees})
+                    "trades": t["n"], "wins": t["wins"], "partials": part["n"], "pnl": t["pnl"] + part["pnl"],   # прибыль отдела = закрытые сделки + частичные фиксации
+                    "fees": t["fees"] + part["fees"] + opened_fees})
     return out
 
 

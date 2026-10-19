@@ -166,7 +166,7 @@ def lab_line(st: dict, appr=None) -> str:
             f"прошли строгую проверку: {ok}; на испытании: {st.get('trial', 0)}; подтверждены вживую: {st.get('live', 0)}")
 
 
-def summary_message(view: dict, bench: dict, trades_today: int, lab_text: str, now=None, title: str = "Сводка офиса") -> str:
+def summary_message(view: dict, bench: dict, trades_today: int, lab_text: str, now=None, title: str = "Сводка офиса", day_line: str | None = None) -> str:
     """Все цифры счёта — из Alpaca (view = AlpacaClient.account_view()): equity, cash, last_equity, unrealized_pl по позициям."""
     now = now or config.localnow()
     eq, last = view["equity"], view["last_equity"]
@@ -174,7 +174,7 @@ def summary_message(view: dict, bench: dict, trades_today: int, lab_text: str, n
     day = eq / last - 1 if last else 0.0
     return "\n".join([f"📊 {title} на {now:%H:%M}", f"Счёт: {usd(eq)} ({pct(day, 2)} за день)", f"Свободные деньги: {usd(view['cash'])}",
                       f"Для сравнения: S&P 500 {pct(bench.get('SPY', 0))}, Биткоин {pct(bench.get('BTC', 0))}",
-                      f"Открытые позиции: {pos}", f"Сделок за день: {trades_today}", lab_text])
+                      f"Открытые позиции: {pos}", day_line or f"Покупок за день: {trades_today}", lab_text])
 
 
 def service(kind: str, asset: str = "", detail: str = "") -> str:

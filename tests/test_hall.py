@@ -304,3 +304,34 @@ def test_wide_spread_blocks_entry_and_real_spread_counts_as_slippage(env):
     br3.c = C(0.0024)                                  # допустимый, но заметный спред: проскальзывание в расчёте = 0,12% (> 0,05%) → тейк дальше, размер меньше
     r3 = h3.run_asset("BTC/USD")
     assert r3.status == "opened" and br3.bought[0][3] > br2.bought[0][3] and br3.bought[0][1] <= br2.bought[0][1]
+
+
+def test_alt_cap_two_open_positions_across_all_desks_btc_eth_exempt(env):
+    def with_alts(*names):
+        h, b, j, br = mk()
+        for n, d in zip(names, ("trend", "reversal", "majors")):
+            j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts,desk) VALUES(?,?,?,?,?,?,?,?,?)", (n, 1, 1, .5, 2, 0, 0, "t", d))
+        return h, b, j, br
+    h, b, j, br = with_alts("RENDER/USD", "ARB/USD")                                   # 2 альта в РАЗНЫХ отделах
+    r = h.run_asset("SOL/USD")
+    assert r.status == "hold" and "общий лимит на все отделы — 2" in r.detail and not br.bought and j.nogo_top("2000-01-01")[0]["stage"] == "alts"
+    assert h.run_asset("BTC/USD").status == "opened"                                    # BTC и ETH альткоинами не считаются
+    h2, b2, j2, br2 = with_alts("RENDER/USD", "ARB/USD")
+    assert h2.run_asset("ETH/USD").status == "opened"
+    h3, b3, j3, br3 = with_alts("RENDER/USD", "BTC/USD", "ETH/USD")                     # BTC/ETH в позициях лимит не занимают
+    assert h3.run_asset("SOL/USD").status == "opened"
+    h4, b4, j4, br4 = with_alts("RENDER/USD", "ARB/USD", "AAVE/USD")                    # уже больше лимита: новые альты нельзя, старые остаются
+    assert h4.run_asset("DOT/USD").status == "hold" and len(j4.positions()) == 3
+
+
+def test_alt_cap_rechecked_under_lock_when_parallel_thread_opened_one(env):
+    h, b, j, br = mk()
+    j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts,desk) VALUES('RENDER/USD',1,1,.5,2,0,0,'t','trend')")
+    orig = h._votes
+
+    def votes_then_other_thread_opens(asset, bundle, now=None):
+        j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts,desk) VALUES('ARB/USD',1,1,.5,2,0,0,'t','reversal')")   # пока шли аналитики, открылась вторая
+        return orig(asset, bundle, now)
+    h._votes = votes_then_other_thread_opens
+    r = h.run_asset("SOL/USD")
+    assert r.status == "hold" and "общий лимит 2" in r.detail and not br.bought

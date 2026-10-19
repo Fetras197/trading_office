@@ -71,4 +71,4 @@ def test_nogo_top_picks_best_per_asset_excludes_bought_and_formats():
     assert [r["asset"] for r in top] == ["ETH/USD", "BTC/USD", "SOL/USD"] and top[1]["stage"] == "votes"
     text = "\n".join(nogo_lines(top))
     assert "Почему не вошли" in text and "1) ETH — лимит риска: лимит 3 позиций" in text and "2) BTC — аналитики:" in text
-    assert "кандидатов за сутки не оценивали" in nogo_lines([])[0]
+    assert "оценённых кандидатов нет" in nogo_lines([])[0] and "биржа США закрыта" in nogo_lines([], False)[-1] and "круглосуточно" in nogo_lines([], False)[-1]

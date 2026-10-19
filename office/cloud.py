@@ -106,8 +106,11 @@ class Office:
         return out
 
     def summary(self):
-        view, now = self.client.account_view(), utcnow()
-        text = report.summary_message(view, self.bench(), self.j.entries_on(now[:10]), "")
+        view = self.client.account_view()
+        r = self.j.realized(self._local_midnight_utc())                      # те же сутки (по Минску) и то же определение, что в вечернем отчёте
+        day = (f"За сутки (по Минску): покупок {r['buys']}, закрыто сделок {r['closed']}"
+               + (f", частичных фиксаций {r['partials']}" if r["partials"] else "") + f"; реализованный результат {report.signed(r['pnl'])} $ после комиссий")
+        text = report.summary_message(view, self.bench(), r["buys"], "", day_line=day)
         cmp_ = views.compare_line(self.shadow.summary())
         if cmp_:
             text += "\n" + cmp_
@@ -123,11 +126,12 @@ class Office:
     def evening(self):
         """21:00 — вечерний отчёт: итоги дня, «Почему не вошли» (3 ближайших кандидата), теневые портфели, уроки, календарь."""
         since = self._local_midnight_utc()
-        trades = self.j.q("SELECT asset, pnl, exit_reason FROM trades WHERE exit_ts>=? AND exit_reason!='partial' ORDER BY id", (since,))
-        opened = self.j.q("SELECT COUNT(*) n FROM fills WHERE side='buy' AND ts>=?", (since,))[0]["n"]
+        trades = self.j.q("SELECT asset, pnl, exit_reason FROM trades WHERE exit_ts>=? ORDER BY id", (since,))      # включая частичные фиксации
+        opened = self.j.realized(since)["buys"]
+        since24 = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)).isoformat(timespec="seconds")
         lessons = [r["text"] for r in memory.recall(self.board, "lesson", days=1, limit=3)]
         self.notify(views.evening_text(self.client.account_view(), self.bench(), trades, opened, self.shadow.summary(), lessons, events.upcoming(self.board, 24),
-                                       {}, nogo=self.j.nogo_top(since, 3), rules_line=rules.line(rules.status(self.j)),
+                                       {}, nogo=self.j.nogo_top(since24, 3), stock_open=self.stock_open, rules_line=rules.line(rules.status(self.j)),
                                        desk_rows=desks.stats(self.j, since, self.client.account_view())))
 
     def weekly_with_council(self):
@@ -141,7 +145,7 @@ class Office:
         """Воскресенье 20:00 — недельное собрание (без предложений по весам: подтвердить «да» в облаке некому)."""
         since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat(timespec="seconds")
         from . import weights
-        trades = self.j.q("SELECT asset, pnl FROM trades WHERE exit_ts>=? AND exit_reason!='partial'", (since,))
+        trades = self.j.q("SELECT asset, pnl, exit_reason FROM trades WHERE exit_ts>=?", (since,))
         lessons = [r["text"] for r in memory.recall(self.board, "lesson", days=7, limit=5)]
         acc = [{"role": r, "n": v["n"], "accuracy": v["acc"]} for r, v in weights.stats(self.board).items()]
         insight = ""
@@ -237,6 +241,10 @@ class Office:
             config.STOP_FILE.touch()
         for name in filter(None, (x.strip() for x in os.environ.get("OFFICE_FORCE_JOBS", "").split(","))):   # ручной запуск: принудительно выполнить задания отдела сейчас
             self.sched.trigger(name)
+        try:   # статус биржи нужен ещё до сканера (вечерний отчёт и т.п. идут в исследовательском отделе раньше)
+            self.stock_open = bool(self.client.clock().get("is_open"))
+        except Exception:  # noqa: BLE001
+            pass
         desks.seed(self.j, utcnow())
         self.hall.stock_open = self.stock_open
         rules.register(self.j, self.notify)

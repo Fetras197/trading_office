@@ -228,6 +228,11 @@ class Hall:
         if not patterns:
             return hold("signal", "нет технического сигнала: " + ("; ".join(tech.notes[:2]) or "условия не выполнены"))
 
+        # --- общий лимит альткоинов: не больше MAX_ALT_POSITIONS открытых позиций по ВСЕМ отделам (BTC и ETH не считаются) ---
+        is_alt = "/" in asset.name and asset.name not in entry.ALT_EXEMPT
+        if is_alt and len(desks.alt_positions(self.j)) >= entry.MAX_ALT_POSITIONS:
+            return hold("alts", f"уже открыто {len(desks.alt_positions(self.j))} альткоин-позиции ({', '.join(a.split('/')[0] for a in desks.alt_positions(self.j))}); общий лимит на все отделы — {entry.MAX_ALT_POSITIONS}", score=0.85)
+
         # --- спред: BONK 18.10 — круг «купили-продали» стоил 2,7% (≈134 $). Спред шире порога — не входим; реальный спред входит в расчёт экономики как проскальзывание ---
         costs = COSTS[asset.kind]
         sp = self._spread(asset)
@@ -289,6 +294,8 @@ class Hall:
             live = getattr(self.broker, "live_positions", lambda: {})()
             if asset.alpaca.replace("/", "") in live:
                 return hold("broker", "по активу уже есть позиция у брокера", votes, score=0.9)
+            if is_alt and len(desks.alt_positions(self.j)) >= entry.MAX_ALT_POSITIONS:   # другой поток мог открыть альткоин, пока шла проверка аналитиков
+                return hold("alts", f"общий лимит {entry.MAX_ALT_POSITIONS} альткоин-позиций достигнут", votes, score=0.85)
             cap = desks.capacity(self.j, desk, acct["equity"], ts[:10])        # свежие лимиты отдела под локом исполнения
             if not cap["ok"]:
                 return hold("desk", f"«{desk['name']}»: {cap['why']}", votes, score=0.9)

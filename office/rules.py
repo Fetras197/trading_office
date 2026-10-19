@@ -1,43 +1,51 @@
 """Заморозка правил входа: пока не накоплено FREEZE_MIN_TRADES закрытых сделок по текущим правилам, правила не меняются.
 «Уроки дня» (review.py → memory) только ПИШУТСЯ в журнал и показываются в отчётах — ни один модуль не меняет по ним пороги, веса или шаблоны (автоподстройки в облаке нет:
-weights.propose/apply и лаборатория выключены). Отпечаток правил (константы + исходный код шаблонов сигнала, уровней, размера и блокировок) запоминается в journal.kv;
-если отпечаток изменился (кто-то поправил правила в коде), счётчик сделок начинается заново, а владелец получает сообщение. Тест test_rules.py привязан к текущему отпечатку:
-изменить правила можно только осознанно — обновив тест и сбросив счёт."""
+weights.propose/apply и лаборатория выключены).
+Отпечаток правил считается ТОЛЬКО от параметров правил входа, размера и блокировок (числа и списки: пороги шаблонов, уровни стопа/тейка, экономика, лимиты отделов и риска,
+окна событий, спред, лимит альткоинов, комиссии) — не от исходного кода: рефакторинг, комментарии и обычные коммиты счёт не сбрасывают. Если параметр изменился,
+счёт сделок начинается заново, а владелец получает сообщение. Тест test_v42.py закрепляет отпечаток: менять параметры можно только осознанно."""
 import hashlib
-import inspect
+import json
 
-from . import config, desks, entry, events
+from . import config, desks, entry, events, sources
 
 FREEZE_MIN_TRADES = 20
-VERSION = "v5.0"
+VERSION = "v5.2"
+SCHEME = "p1:"                                   # схема отпечатка: «только параметры»
+V5_START = "2026-10-18T21:37:43+00:00"           # начало счёта 20 сделок (запуск корпорации); при переходе на схему p1 счёт не сбрасывается
+
+
+def _consts(mod) -> dict:
+    return {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(mod).items()
+            if k.isupper() and (isinstance(v, (int, float, bool)) or (isinstance(v, tuple) and all(isinstance(x, (str, int, float)) for x in v)))}
 
 
 def snapshot() -> dict:
-    """Всё, что определяет вход, размер, выход и блокировки."""
-    return {"entry": {k: getattr(entry, k) for k in ("STOP_ATR", "TAKE_ATR", "HALF", "MIN_LIVE_FULL", "RSI_MAX", "RSI_MIN_TREND", "RSI_BOUNCE", "COOLDOWN_H", "CT_STOP_ATR", "CT_TAKE_ATR",
-                                                      "CRYPTO_STOP_ATR", "CRYPTO_TAKE_ATR", "TECH_ONLY", "MIN_REWARD_RISK", "MIN_TARGET_FEES", "MAX_TAKE_ATR", "MAX_SPREAD")},
-            "desks": {k: getattr(desks, k) for k in ("BASE_SHARE", "RESERVE", "MIN_SHARE", "MAX_SHARE", "STEP", "MAX_POSITIONS", "MAX_ENTRIES_DAY", "CLOSE_AFTER_TRADES", "POSITION_CAP", "ORDER")},
-            "desk_specs": {k: [v["patterns"], v["assets"]] for k, v in desks.BUILTIN.items()},
-            "counter": list(entry.COUNTER), "events": [events.PRE_MIN, events.POST_MIN], "limits": vars(config.Limits()), "turnover": dict(config.MIN_TURNOVER),
-            "code": [inspect.getsource(f) for f in (entry.technical, entry.majority, entry.data_gaps, entry.levels, entry.trade_plan, desks.route, desks.eligible, desks.limits_for, desks.council)]}
+    """Параметры, определяющие вход, размер, выход и блокировки (без исходного кода)."""
+    return {"entry": _consts(entry), "desks": _consts(desks), "desk_specs": {k: [list(v["patterns"]), v["assets"]] for k, v in desks.BUILTIN.items()},
+            "events": [events.PRE_MIN, events.POST_MIN, sources.KEY_US_EVENT.pattern], "limits": vars(config.Limits()), "turnover": dict(config.MIN_TURNOVER),
+            "costs": {k: vars(v) for k, v in config.COSTS.items()}}
 
 
 def fingerprint(snap: dict | None = None) -> str:
-    import json
-    return hashlib.sha1(json.dumps(snap or snapshot(), sort_keys=True, default=str).encode()).hexdigest()[:12]
+    return SCHEME + hashlib.sha1(json.dumps(snap or snapshot(), sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
 def register(j, notify=lambda t: None, now_iso: str = "") -> bool:
-    """Вызывать на каждом проходе. Первый запуск запоминает отпечаток и дату начала счёта; смена отпечатка — новый счёт + сообщение. True, если правила изменились."""
+    """Вызывать на каждом проходе. Первый запуск запоминает отпечаток и дату начала счёта; переход со старой схемы (по коду) — молча, счёт с V5_START;
+    смена параметров — новый счёт + сообщение. True, если правила изменились."""
     from .hall import utcnow
     now_iso = now_iso or utcnow()
     fp, old = fingerprint(), j.kv_get("rules_fp")
     if fp == old:
         return False
     j.kv_set("rules_fp", fp)
+    if old is not None and not str(old).startswith(SCHEME):   # миграция схемы: отпечаток по коду → по параметрам; счёт 20 сделок остаётся с запуска корпорации
+        j.kv_set("rules_since", V5_START)
+        return False
     j.kv_set("rules_since", now_iso)
     if old is not None:
-        notify(f"⚠️ Правила входа изменились (версия {VERSION}, отпечаток {fp}). Счёт «{FREEZE_MIN_TRADES} сделок без изменений правил» начат заново.")
+        notify(f"⚠️ Параметры правил входа изменились (версия {VERSION}, отпечаток {fp}). Счёт «{FREEZE_MIN_TRADES} сделок без изменений правил» начат заново.")
     return old is not None
 
 

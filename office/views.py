@@ -119,7 +119,7 @@ def briefing_text(pic, reg, evs, view, jpos, cands) -> str:
 
 
 STAGE_RU = {"signal": "нет сигнала", "votes": "аналитики", "limits": "лимит риска", "regime": "режим рынка", "event": "событие", "cooldown": "остывание после стопа",
-            "halt": "пауза", "riskgate": "риск-гейт", "desk": "отделы", "economics": "экономика сделки", "spread": "спред", "broker": "брокер", "data": "нет данных"}
+            "halt": "пауза", "alts": "лимит альткоинов", "riskgate": "риск-гейт", "desk": "отделы", "economics": "экономика сделки", "spread": "спред", "broker": "брокер", "data": "нет данных"}
 
 
 def desk_lines(rows: list[dict], title: str) -> list[str]:
@@ -127,43 +127,52 @@ def desk_lines(rows: list[dict], title: str) -> list[str]:
     if not rows:
         return []
     out = [title]
-    tot_pnl = tot_fees = tot_tr = 0
+    tot_pnl = tot_fees = tot_tr = tot_pt = 0
     for r in rows:
         tot_pnl += r["pnl"]
         tot_fees += r["fees"]
         tot_tr += r["trades"]
+        tot_pt += r.get("partials", 0)
         if r["status"] != "active":
             out.append(f"• {r['name']}: закрыт" + (f" — {r['trades']} сделок за период, {signed(r['pnl'])} $" if r["trades"] else ""))
             continue
         b = f"{num(r['share'] * 100)}%" + (f" ({usd(r['budget'])})" if r.get("budget") else "")
-        win = f", в плюс {r['wins']}" if r["trades"] else ""
+        win = (f", в плюс {r['wins']}" if r["trades"] else "") + (f"; частичных фиксаций {r['partials']}" if r.get("partials") else "")
         un = f", не закрыто {signed(r['unrealized'])} $" if r["open"] else ""
         out.append(f"• {r['name']}: бюджет {b}; открыто {r['open']} из 3; закрыто {r['trades']} {plural(r['trades'], 'сделка', 'сделки', 'сделок')}{win}; "
                    f"прибыль после комиссий {signed(r['pnl'])} $ (комиссии {num(r['fees'], 2)} $){un}")
-    out.append(f"Итого по отделам: {tot_tr} {plural(tot_tr, 'сделка', 'сделки', 'сделок')}, {signed(tot_pnl)} $ после комиссий {num(tot_fees, 2)} $ (резерв 20% не торгуется)")
+    out.append(f"Итого по отделам: закрыто {tot_tr} {plural(tot_tr, 'сделка', 'сделки', 'сделок')}" + (f", частичных фиксаций {tot_pt}" if tot_pt else "")
+               + f"; результат {signed(tot_pnl)} $ после комиссий {num(tot_fees, 2)} $ (резерв 20% не торгуется)")
     return out
 
 
-def nogo_lines(rows: list[dict]) -> list[str]:
-    """«Почему не вошли»: 3 ближайших к входу кандидата за сутки и что их заблокировало (rows = Journal.nogo_top)."""
+def nogo_lines(rows: list[dict], stock_open: bool | None = None) -> list[str]:
+    """«Почему не вошли»: 3 ближайших к входу кандидата за последние 24 часа и что их заблокировало (rows = Journal.nogo_top). Крипта торгуется круглосуточно — сканер и оценка работают всегда."""
+    out = []
     if not rows:
-        return ["🔎 Почему не вошли: кандидатов за сутки не оценивали (рынок акций закрыт или не было данных)."]
-    out = ["🔎 Почему не вошли (ближайшие кандидаты):"]
-    for i, r in enumerate(rows, 1):
-        out.append(f"{i}) {name(r['asset'])} — {STAGE_RU.get(r['stage'], r['stage'])}: {r['reason']}")
+        out.append("🔎 Почему не вошли: за последние 24 часа оценённых кандидатов нет (проходов офиса ещё не было — первые появятся в ближайшие минуты).")
+    else:
+        out.append("🔎 Почему не вошли (ближайшие кандидаты за последние 24 часа):")
+        for i, r in enumerate(rows, 1):
+            out.append(f"{i}) {name(r['asset'])} — {STAGE_RU.get(r['stage'], r['stage'])}: {r['reason']}")
+    if stock_open is False:
+        out.append("Акции и ETF сейчас не оцениваются: биржа США закрыта (отдел «Акции США» работает в её часы); крипта оценивается круглосуточно.")
     return out
 
 
-def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None, rules_line: str = "", desk_rows: list[dict] | None = None) -> str:
+def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None, rules_line: str = "", desk_rows: list[dict] | None = None, stock_open: bool | None = None) -> str:
     day = view["equity"] / view["last_equity"] - 1 if view["last_equity"] else 0.0
     lines = ["🌙 Вечерний отчёт", f"Счёт: {usd(view['equity'])} ({pct(day, 2)} за день)", f"S&P 500 {pct(bench.get('SPY', 0))}, биткоин {pct(bench.get('BTC', 0))} за день",
-             f"Покупок за день: {opened_today}, закрыто сделок: {len(trades_today)}"]
-    for t in trades_today[:5]:
-        lines.append(f"• {name(t['asset'])}: {signed(t['pnl'])} $ ({'по стопу' if t['exit_reason'] == 'stop' else 'по цели' if t['exit_reason'] == 'take' else 'по решению офиса'})")
+             f"Покупок за день: {opened_today}, закрыто сделок: {sum(1 for t in trades_today if t['exit_reason'] != 'partial')}"
+             + (f", частичных фиксаций: {sum(1 for t in trades_today if t['exit_reason'] == 'partial')}" if any(t['exit_reason'] == 'partial' for t in trades_today) else ""),
+             f"Реализованный результат за день: {signed(sum(t['pnl'] for t in trades_today))} $ (закрытые сделки и частичные фиксации, после комиссий)"]
+    for t in trades_today[:8]:
+        why = {"stop": "по стопу", "take": "по цели", "partial": "частичная фиксация"}.get(t["exit_reason"], "по решению офиса")
+        lines.append(f"• {name(t['asset'])}: {signed(t['pnl'])} $ ({why})")
     if desk_rows:
         lines += [""] + desk_lines(desk_rows, "🏢 Отделы за день:")
     if nogo is not None:
-        lines += [""] + nogo_lines(nogo)
+        lines += [""] + nogo_lines(nogo, stock_open)
     lines += ["", shadow_text(shadow_rows)]
     if lessons:
         lines += ["", "Уроки дня (только запись в журнал, правила от них не меняются):"] + [f"• {l}" for l in lessons[:3]]
@@ -181,9 +190,11 @@ def weekly_text(week_rows, trades: list[dict], lessons: list[str], acc: list[dic
     if insight:
         lines += [insight, ""]
     lines += [shadow_text(week_rows) if week_rows else "Теневые портфели ещё накапливают данные."]
-    n = len(trades)
-    wins = sum(1 for t in trades if t["pnl"] > 0)
-    lines += ["", f"Сделок закрыто за неделю: {n}" + (f", прибыльных {wins}, итог {signed(sum(t['pnl'] for t in trades))} $" if n else "")]
+    closed = [t for t in trades if t.get("exit_reason") != "partial"]
+    parts = [t for t in trades if t.get("exit_reason") == "partial"]
+    wins = sum(1 for t in closed if t["pnl"] > 0)
+    lines += ["", f"Сделок закрыто за неделю: {len(closed)}" + (f", прибыльных {wins}" if closed else "") + (f"; частичных фиксаций: {len(parts)}" if parts else "")
+              + (f". Реализованный результат (закрытые сделки и частичные фиксации, после комиссий): {signed(sum(t['pnl'] for t in trades))} $" if trades else "")]
     if lessons:
         lines += ["Уроки недели:"] + [f"• {l}" for l in lessons[:5]]
     ok = [a for a in acc if a["role"] in ROLES_ALL and a["n"] >= weights.MIN_N]

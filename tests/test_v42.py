@@ -48,7 +48,7 @@ def test_close_message_compares_loss_with_planned_risk():
 
 def test_rules_fingerprint_pinned_and_freeze_counter():
     # Изменить правила входа/размера/блокировок можно только осознанно: обновить PINNED и сбросить счёт сделок (rules.register сделает это сам и сообщит владельцу).
-    PINNED = "43866ce8f1a9"
+    PINNED = "p1:7b60354d9255"
     assert rules.fingerprint() == PINNED, f"правила изменились: {rules.fingerprint()} — счёт {rules.FREEZE_MIN_TRADES} сделок начнётся заново"
     j, sent = Journal(), []
     assert rules.register(j, sent.append, "2026-10-18T12:00:00+00:00") is False and not sent
@@ -58,7 +58,7 @@ def test_rules_fingerprint_pinned_and_freeze_counter():
     j._x("INSERT INTO trades(asset,entry_ts,exit_ts,entry,exit,qty,fees,pnl,r_mult,run_id,exit_reason) VALUES('X','t','2026-10-01T09:00:00+00:00',1,1,1,0,1,1,0,'stop')")   # до начала счёта
     st = rules.status(j)
     assert st["closed"] == 3 and st["frozen"] and "3 из 20" in rules.line(st) and "только записываются" in rules.line(st)
-    j.kv_set("rules_fp", "old")                                                        # «правки в коде»: отпечаток другой → счёт заново и сообщение
+    j.kv_set("rules_fp", "p1:other")                                                   # изменились ПАРАМЕТРЫ: отпечаток другой → счёт заново и сообщение
     assert rules.register(j, sent.append, "2026-10-20T00:00:00+00:00") is True and "изменились" in sent[0] and rules.status(j)["closed"] == 0
 
 
@@ -98,3 +98,27 @@ def test_existing_wide_stop_limit_is_tightened_to_10_percent_rule():
     assert patched[0][0] == "PATCH" and float(patched[0][2]["limit_price"]) == pytest.approx(want, abs=1e-4) and want > 94.05
     c._orders[0]["limit_price"] = f"{want:.4f}"
     assert b.ensure_protection("BTC/USD") == "ok"
+
+
+def test_fingerprint_depends_on_parameters_only_not_on_code(monkeypatch):
+    base = rules.fingerprint()
+    monkeypatch.setattr(rules.entry.technical, "__doc__", "комментарий изменён")                 # правка кода/докстринга не меняет отпечаток
+    assert rules.fingerprint() == base
+    monkeypatch.setattr(rules.entry, "SUPPORT_RSI", 44.0)                                      # а параметр — меняет
+    assert rules.fingerprint() != base
+    monkeypatch.setattr(rules.entry, "SUPPORT_RSI", 45.0)
+    monkeypatch.setattr(rules.entry, "MAX_ALT_POSITIONS", 3)
+    assert rules.fingerprint() != base
+    monkeypatch.setattr(rules.entry, "MAX_ALT_POSITIONS", 2)
+    monkeypatch.setattr(rules.desks, "MAX_POSITIONS", 4)
+    assert rules.fingerprint() != base
+
+
+def test_migration_from_code_fingerprint_keeps_the_count_since_corporation_start():
+    j = Journal()
+    j.kv_set("rules_fp", "43866ce8f1a9")                                                   # старая схема (по исходному коду)
+    j.kv_set("rules_since", "2026-10-18T22:00:00+00:00")                                  # сброшенный коммитами счёт
+    sent = []
+    assert rules.register(j, sent.append, "2026-10-19T04:00:00+00:00") is False and not sent
+    assert j.kv_get("rules_since") == rules.V5_START and j.kv_get("rules_fp") == rules.fingerprint()
+    assert rules.register(j, sent.append) is False                                         # повторные запуски — тишина
