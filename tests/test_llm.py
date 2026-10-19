@@ -131,3 +131,90 @@ def test_gemini_pause_after_429_stops_requests_and_budget_shares(monkeypatch):
     for _ in range(7):
         llm.budget_spend("market")
     assert not llm.budget_allow("market")
+
+
+# ---- запасные бесплатные модели ----
+class FbResp:
+    def __init__(self, code, content=None, text="", headers=None):
+        self.status_code, self.text, self.headers = code, text or (content or ""), headers or {}
+        self._j = {"choices": [{"message": {"content": content}}]}
+
+    def json(self):
+        return self._j
+
+
+class FbSess:
+    def __init__(self, *resps):
+        self.resps, self.calls = list(resps), []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append((url, dict(json)))     # копия: провайдер потом убирает response_format из того же словаря
+        return self.resps.pop(0) if self.resps else FbResp(500, text="no more")
+
+
+GOOD = '{"stance": "hold", "confidence": 0.6, "rationale": "ok"}'
+
+
+def _gem_down():
+    class G:
+        def ask(self, role, p, system=None):
+            raise llm.LLMUnavailable("gemini 429")
+    return G()
+
+
+def _chain(monkeypatch, sessions, keys=("groq", "cerebras", "mistral", "openrouter")):
+    for n, (_, env, *_r) in llm.OpenAICompatBackend.PROVIDERS.items():
+        monkeypatch.delenv(env, raising=False)
+    for n in keys:
+        monkeypatch.setenv(llm.OpenAICompatBackend.PROVIDERS[n][1], "k-" + n)
+    llm.OpenAICompatBackend._pause.clear()
+    return [llm.OpenAICompatBackend(n, session=sessions[n], min_interval=0) for n in ("groq", "cerebras", "mistral", "openrouter")]
+
+
+def test_fallback_switches_to_next_provider_on_429_and_pauses_the_limited_one(monkeypatch):
+    s = {"groq": FbSess(FbResp(429, text="rate", headers={"retry-after": "30"})), "cerebras": FbSess(FbResp(200, GOOD)), "mistral": FbSess(), "openrouter": FbSess()}
+    r = RoleRouter(gemini=_gem_down(), fallbacks=_chain(monkeypatch, s))
+    assert r.ask("market", {"a": 1}, system="x")["stance"] == "hold"
+    assert len(s["groq"].calls) == 1 and len(s["cerebras"].calls) == 1 and not s["mistral"].calls
+    assert llm.OpenAICompatBackend._pause["groq"] > __import__("time").time() + 20                 # Retry-After учтён: Groq на паузе
+    r2 = RoleRouter(gemini=_gem_down(), fallbacks=_chain_keep(s))
+    s["cerebras"].resps = [FbResp(200, GOOD)]
+    r2.ask("news", {"b": 2}, system="x")
+    assert len(s["groq"].calls) == 1                                                              # пока пауза, Groq не дёргаем
+
+
+def _chain_keep(sessions):
+    return [llm.OpenAICompatBackend(n, session=sessions[n], min_interval=0) for n in ("groq", "cerebras", "mistral", "openrouter")]
+
+
+def test_all_models_down_raises_plain_unavailable_text(monkeypatch):
+    s = {n: FbSess(FbResp(429, text="rate")) for n in ("groq", "cerebras", "mistral", "openrouter")}
+    r = RoleRouter(gemini=_gem_down(), fallbacks=_chain(monkeypatch, s))
+    with pytest.raises(llm.LLMUnavailable, match="аналитики недоступны: лимит моделей"):
+        r.ask("market", {}, system="x")
+
+
+def test_providers_without_keys_are_skipped_and_gemini_answer_wins_when_alive(monkeypatch):
+    s = {n: FbSess(FbResp(200, GOOD)) for n in ("groq", "cerebras", "mistral", "openrouter")}
+    chain = _chain(monkeypatch, s, keys=("mistral",))
+    r = RoleRouter(gemini=_gem_down(), fallbacks=chain)
+    assert r.ask("market", {}, system="x")["stance"] == "hold" and not s["groq"].calls and len(s["mistral"].calls) == 1
+    live = RoleRouter(gemini=type("G", (), {"ask": lambda self, role, p, system=None: {"stance": "buy", "confidence": 0.9, "rationale": "g"}})(), fallbacks=chain)
+    assert live.ask("quant", {"z": 1}, system="x")["stance"] == "buy" and len(s["mistral"].calls) == 1   # Gemini жив — запасные не тратим
+
+
+def test_unknown_model_goes_to_next_model_and_json_mode_retry(monkeypatch):
+    monkeypatch.setenv("GROQ_MODELS", "dead-model,live-model")
+    s = {"groq": FbSess(FbResp(404, text="model not found"), FbResp(400, text="no json mode"), FbResp(200, GOOD)), "cerebras": FbSess(), "mistral": FbSess(), "openrouter": FbSess()}
+    chain = _chain(monkeypatch, s, keys=("groq",))
+    out = chain[0].ask("market", {}, system="x")
+    assert out["stance"] == "hold"
+    models = [c[1]["model"] for c in s["groq"].calls]
+    assert models == ["dead-model", "live-model", "live-model"] and "response_format" in s["groq"].calls[1][1] and "response_format" not in s["groq"].calls[2][1]
+
+
+def test_garbage_answers_fall_through_to_unavailable(monkeypatch):
+    s = {n: FbSess(FbResp(200, "не json"), FbResp(200, "")) for n in ("groq", "cerebras", "mistral", "openrouter")}
+    r = RoleRouter(gemini=_gem_down(), fallbacks=_chain(monkeypatch, s))
+    with pytest.raises(llm.LLMUnavailable):
+        r.ask("market", {}, system="x")

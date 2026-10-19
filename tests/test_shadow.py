@@ -1,6 +1,7 @@
 import datetime as dt
 
 from office import shadow
+from office.journal import Journal
 from office.board import Board
 
 T0 = dt.datetime(2026, 10, 12, 10, 0, tzinfo=dt.timezone.utc)
@@ -34,7 +35,6 @@ def test_hold_portfolios_track_price_with_costs_and_office_is_broker_equity():
 import pandas as pd
 
 from office.config import COSTS
-from office.journal import Journal
 from office.risk import RiskGate
 
 
@@ -105,3 +105,31 @@ def test_office_baseline_is_start_equity_from_journal():
     s.step()
     r = {x["name"]: x for x in s.summary()}
     assert abs(r["office"]["ret"] - (99_509.64 / 100_000 - 1)) < 1e-12 and r["spy"]["start"] == 100_000.0
+
+
+def test_office_since_row_rebased_to_tech_shadow_start():
+    px = {"SPY": 500.0, "BTC/USD": 100.0}
+    b = Board()
+    eq = {"v": 100_000.0}
+    clock = {"t": T0}
+    j = Journal()
+    s = shadow.Shadow(b, lambda a: px[a], lambda: eq["v"], lambda: clock["t"], journal=j, candles_fn=lambda a: None)
+    eq["v"] = 97_000.0                                                  # офис уже в минусе к моменту старта теневого технического сигнала
+    s.step()
+    clock["t"] += dt.timedelta(hours=1)
+    eq["v"] = 98_940.0                                                  # +2% от точки старта tech2
+    s.step()
+    rows = s.summary()
+    names = [r["name"] for r in rows]
+    by = {r["name"]: r for r in rows}
+    assert names.index("office_since") == names.index("office") + 1
+    assert by["office_since"]["title"].startswith("Весь офис с ") and abs(by["office_since"]["ret"] - (98_940 / 97_000 - 1)) < 1e-9
+    assert "с " in by["tech2"]["title"] and "office_since" not in [r["name"] for r in s.summary("2026-10-12T00:00:00+00:00")]
+
+
+def test_old_422_rows_not_shown_in_why_not_report():
+    from office import desks
+    j = Journal()
+    j.add_nogo("2026-10-18T21:38:09+00:00", "BONK/USD", "broker", "защитный стоп не встал (POST /orders -> 422: limit price must be > 0)", 0.9)
+    desks.seed(j, "2026-10-19T10:00:00+00:00")
+    assert not j.nogo_top("2026-10-18T00:00:00+00:00")

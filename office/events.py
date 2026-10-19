@@ -18,13 +18,23 @@ TITLES_RU = [  # порядок важен: более длинные шабло
     (r"Fed Chair", "выступление главы ФРС"), (r"Treasury Currency Report", "отчёт Минфина США")]
 
 
+EXTRA_RU = [(r"BOE|Bailey|MPC", "Банк Англии"), (r"ECB|Lagarde", "ЕЦБ"), (r"BOJ|Ueda", "Банк Японии"), (r"\bPMI\b", "деловая активность (PMI)"), (r"Retail Sales", "розничные продажи"),
+            (r"Employment|Earnings|Claimant", "рынок труда"), (r"GDP", "ВВП"), (r"CPI|Inflation", "инфляция"), (r"Consumer Sentiment|Confidence", "настроения потребителей"), (r"Trade Balance", "торговый баланс")]
+
+
 def title_ru(ev: dict) -> str:
+    """Название события по-русски. USD-события — как в TITLES_RU; события других валют — «название (валюта)»; неизвестное — исходное название + валюта (а не безымянное «событие (GBP)»)."""
     if ev.get("kind") != "macro":
         return ev["title"]
+    ccy = ev.get("ccy") or ""
+    tail = f" ({ccy})" if ccy and ccy != "USD" else ""
     for pat, ru in TITLES_RU:
         if re.search(pat, ev["title"], re.I):
-            return ru
-    return f"событие ({ev['ccy']})"
+            return ru + tail
+    for pat, ru in EXTRA_RU:
+        if re.search(pat, ev["title"], re.I):
+            return f"{ru}: {ev['title']}{tail}"
+    return f"{ev['title']}{tail}"
 
 
 def _key(e: dict) -> str:
@@ -54,9 +64,10 @@ def refresh(board, symbols=()) -> int:
     evs = sources.faireconomy_events() + sources.deribit_expiry() + sources.earnings_events([s for s in symbols if "/" not in s])
     now_iso = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat(timespec="minutes")
     for src in {e["src"] for e in evs}:
-        keep = [_key(e) for e in evs if e["src"] == src]
-        marks = ",".join("?" * len(keep))
-        board.x(f"DELETE FROM events WHERE src=? AND ts>=? AND key NOT IN ({marks})", (src, now_iso, *keep))
+        keep = {_key(e) for e in evs if e["src"] == src}
+        for r in board.q("SELECT key FROM events WHERE src=? AND ts>=?", (src, now_iso)):   # без NOT IN (?,…): лимит переменных SQLite
+            if r["key"] not in keep:
+                board.x("DELETE FROM events WHERE key=?", (r["key"],))
     for e in evs:
         board.x("INSERT INTO events(key,ts,until,title,ccy,impact,kind,assets,src,data) VALUES(?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET impact=excluded.impact, until=excluded.until",

@@ -4,7 +4,7 @@ import difflib
 import hashlib
 import re
 
-from .llm import GeminiBackend, LLMError
+from .llm import LLMError, RoleRouter
 
 ROLE_WORDS = {"risk_manager": "Риск-менеджер", "portfolio_manager": "Управляющий", "fundamentals": "Фундаментальный анализ",
               "market": "Технический анализ", "news": "Новости", "quant": "Квант-аналитик", "trader": "Трейдер", "bull": "Бык", "bear": "Медведь"}
@@ -66,7 +66,7 @@ def proofread(text: str, backend=None) -> str:
     if key in _CACHE:
         return _CACHE[key]
     try:
-        out = (backend or GeminiBackend()).ask("proofread", {"text": text}, system=SYSTEM).get("text")
+        out = (backend or RoleRouter()).ask("proofread", {"text": text}, system=SYSTEM).get("text")
     except (LLMError, AttributeError):
         return text  # Gemini недоступен: отправляем чистый шаблон (он уже по-русски)
     res = out.strip() if _ok(text, out) else text

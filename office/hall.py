@@ -14,7 +14,7 @@ from . import agents, config, data, desks, entry, events, factcheck, indicators,
 from .alpaca import AlpacaError
 from .config import COSTS, Limits, make_asset
 from .board import PICTURE_MAX_AGE_H
-from .llm import LLMError, LLMUnavailable, budget_allow
+from .llm import UNAVAILABLE_TEXT, LLMError, LLMUnavailable
 from .risk import RiskGate
 
 VOTES_TTL_H = 1.5   # свежие голоса аналитиков по активу переиспользуем (экономия бюджета Gemini)
@@ -85,8 +85,8 @@ class Hall:
         def one(role):
             try:
                 n = agents.run_analyst(role, self.router, payloads[role])
-            except (LLMError, KeyError) as e:   # лимит/невалидный ответ = воздержался
-                n = {"stance": "abstain", "confidence": 0.0, "rationale": f"{type(e).__name__}: {str(e)[:150]}"}
+            except (LLMError, KeyError) as e:   # лимит/невалидный ответ = воздержался; лимит ВСЕХ моделей помечаем отдельно
+                n = {"stance": "abstain", "confidence": 0.0, "rationale": f"{type(e).__name__}: {str(e)[:150]}", "unavailable": isinstance(e, LLMUnavailable)}
             return {"role": role, **n}
         with cf.ThreadPoolExecutor(3) as ex:
             out = list(ex.map(one, list(payloads)))
@@ -105,8 +105,6 @@ class Hall:
         c = self.j.kv_get(f"votes:{asset.name}")
         if c and now - c["t"] < VOTES_TTL_H * 3600:
             return c["analysts"], "cache"
-        if not budget_allow("market"):
-            return [], "budget"
         with self._fresh_lock:
             if self.fresh_left <= 0:
                 return [], "queue"
@@ -271,10 +269,11 @@ class Hall:
             ban = self._ban(asset)
             if not entry.TECH_ONLY or ban:
                 why = (f"запрет совета: {ban}" if ban else
-                       {"queue": "очередь аналитиков: за проход разбирается ограниченное число активов (бюджет Gemini)", "budget": "дневной бюджет Gemini исчерпан"}.get(src) if not votes.live else
+                       ("очередь аналитиков: за проход разбирается ограниченное число активов" if src == "queue" else UNAVAILABLE_TEXT if any(r.get("unavailable") for r in analysts) else "аналитики воздержались: нет голосов") if not votes.live else
                        f"аналитики не одобрили: «за» {votes.buy}, «против» {votes.sell}, сомневаются {votes.hold}")
                 return hold("ban" if ban else "votes", why or "нет голосов аналитиков", votes, score=0.9 if ban else None)
-            gaps = [("аналитики не одобрили" if votes.live else "нет голосов аналитиков")] + gaps
+            down = not votes.live and any(r.get("unavailable") for r in analysts)
+            gaps = [("аналитики не одобрили" if votes.live else UNAVAILABLE_TEXT if down else "аналитики не успели: очередь прохода" if src == "queue" else "аналитики воздержались: нет голосов")] + gaps
 
         # --- решение: размер ---
         if pattern in entry.COUNTER:

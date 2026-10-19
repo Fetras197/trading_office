@@ -48,6 +48,8 @@ def purge_legacy_nogo(j) -> int:
     n = j.q("SELECT COUNT(*) n FROM nogo WHERE stage='limits' AND (reason LIKE '%входов в сутки исчерпан' OR reason LIKE '%позиций исчерпан')")[0]["n"]
     if n:
         j._x("DELETE FROM nogo WHERE stage='limits' AND (reason LIKE '%входов в сутки исчерпан' OR reason LIKE '%позиций исчерпан')")
+    # ошибка округления цены стопа 18.10 (BONK, «limit price must be > 0») исправлена — старые строки в отчёты не тащим
+    j._x("DELETE FROM nogo WHERE reason LIKE '%limit price must be%'")
     return n
 
 

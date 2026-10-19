@@ -31,7 +31,7 @@ def test_medium_and_foreign_events_do_not_block_but_earnings_block_only_own_stoc
 
 def test_title_ru_and_upcoming():
     assert events.title_ru({"kind": "macro", "title": "Core CPI m/m", "ccy": "USD"}) == "базовая инфляция (цены для потребителей)"
-    assert events.title_ru({"kind": "macro", "title": "Something odd", "ccy": "EUR"}) == "событие (EUR)"
+    assert events.title_ru({"kind": "macro", "title": "Something odd", "ccy": "EUR"}) == "Something odd (EUR)"
     b = Board()
     now = dt.datetime(2026, 10, 12, 6, 0, tzinfo=UTC)
     mk(b, "2026-10-12T12:30+00:00", "CPI", "all")
@@ -47,7 +47,7 @@ def test_duplicates_collapsed_same_minute_same_label():
     for t in ("Flash Manufacturing PMI", "Flash Services PMI"):
         b.x("INSERT INTO events(key,ts,title,ccy,impact,kind,assets,src) VALUES(?,?,?,?,?,?,?,?)", (t, "2026-10-19T13:45+00:00", t, "USD", "Medium", "macro", "", "t"))
     ups = events.upcoming(b, 24, now)
-    assert len(ups) == 2 and sum(1 for e in ups if e["ccy"] == "CAD") == 1 and next(e for e in ups if e["ccy"] == "CAD")["impact"] == "High"
+    assert len(ups) == 3 and sum(1 for e in ups if e["ccy"] == "CAD") == 1 and next(e for e in ups if e["ccy"] == "CAD")["impact"] == "High"
 
 
 def test_refresh_drops_moved_earnings_and_stale_rows(monkeypatch):
@@ -68,3 +68,11 @@ def test_key_us_events_are_always_high_and_block_all_assets():
     for title in ("CPI m/m", "Core CPI m/m", "Federal Funds Rate", "FOMC Press Conference", "Non-Farm Employment Change", "Unemployment Rate", "Core PCE Price Index m/m", "PPI m/m"):
         assert sources.KEY_US_EVENT.search(title), title
     assert not sources.KEY_US_EVENT.search("Unemployment Claims") and not sources.KEY_US_EVENT.search("Flash Services PMI")
+
+
+def test_foreign_events_keep_their_name_and_currency():
+    t = lambda title, ccy: events.title_ru({"kind": "macro", "title": title, "ccy": ccy})  # noqa: E731
+    assert t("BOE Gov Bailey Speaks", "GBP") == "Банк Англии: BOE Gov Bailey Speaks (GBP)"
+    assert t("Flash Services PMI", "GBP") == "деловая активность (PMI): Flash Services PMI (GBP)"
+    assert t("CPI y/y", "GBP") == "инфляция (цены для потребителей) (GBP)" and t("Core CPI m/m", "USD") == "базовая инфляция (цены для потребителей)"
+    assert t("Something odd", "GBP") == "Something odd (GBP)" and "событие (" not in t("Something odd", "GBP")

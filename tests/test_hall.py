@@ -162,7 +162,7 @@ def test_half_of_voters_for_is_enough_when_no_sells(env):
 def test_no_live_votes_enters_half_size_without_ban_and_blocked_with_ban(env):
     h, b, j, br = mk(FakeRouter(default="down"))
     r = h.run_asset("BTC/USD")
-    assert r.status == "opened" and r.order["half"] and "нет голосов аналитиков" in r.order["gaps"][0]
+    assert r.status == "opened" and r.order["half"] and "аналитики недоступны: лимит моделей" in r.order["gaps"][0]
     h2, b2, j2, br2 = mk(FakeRouter(default="down"))
     ban(b2, "BTC/USD")
     assert h2.run_asset("BTC/USD").status == "hold"

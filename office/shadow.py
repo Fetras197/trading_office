@@ -22,6 +22,11 @@ def _now():
     return dt.datetime.now(dt.timezone.utc)
 
 
+def _utc(s: str) -> dt.datetime:
+    d = dt.datetime.fromisoformat(s)
+    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)   # naive = UTC
+
+
 class Shadow:
     TECH = "tech2"
     COOLDOWN_H = 4.0
@@ -80,7 +85,11 @@ class Shadow:
                 df = self.candles_fn(a)
             except Exception:  # noqa: BLE001 — нет свечей: позиция остаётся до следующего шага
                 continue
-            df = df[df.index > dt.datetime.fromisoformat(p["opened"])]
+            opened = dt.datetime.fromisoformat(p["opened"])
+            if opened.tzinfo is not None:
+                opened = opened.astimezone(dt.timezone.utc).replace(tzinfo=None)
+            idx = df.index.tz_convert("UTC").tz_localize(None) if getattr(df.index, "tz", None) is not None else df.index
+            df = df[idx > opened]
             c = COSTS[make_asset(a).kind]
             for t, bar in df.iterrows():
                 lvl, why = (p["stop"], "stop") if bar["low"] <= p["stop"] else (p["take"], "take") if p["take"] and bar["high"] >= p["take"] else (None, None)   # в одной свече стоп раньше тейка (консервативно)
@@ -110,7 +119,7 @@ class Shadow:
             a = sg["asset"]
             kind = make_asset(a).kind
             recent_stop = self.b.q("SELECT closed FROM shadow_trades WHERE name=? AND asset=? AND reason='stop' ORDER BY rowid DESC LIMIT 1", (name, a))
-            if recent_stop and (dt.datetime.fromisoformat(sg["ts"]) - dt.datetime.fromisoformat(recent_stop[0]["closed"])).total_seconds() < self.COOLDOWN_H * 3600:
+            if recent_stop and (_utc(sg["ts"]) - _utc(recent_stop[0]["closed"])).total_seconds() < self.COOLDOWN_H * 3600:
                 continue   # то же остывание после стопа, что у офиса
             eq = cash + sum(p["qty"] * (self._px(x, p["entry"]) or p["entry"]) for x, p in pos.items())
             day0 = self.b.q("SELECT equity FROM shadow_eq WHERE name=? AND ts>=? ORDER BY ts, rowid LIMIT 1", (name, day))
@@ -187,8 +196,31 @@ class Shadow:
             for e in eqs:
                 peak = max(peak, e)
                 dd = min(dd, e / peak - 1)
+            if name == self.TECH:
+                from .views import local
+                title = f"{title}, с {local(ser[0]['ts']):%d.%m}"
             rows.append({"name": name, "title": title, "start": eqs[0], "last": eqs[-1], "ret": eqs[-1] / eqs[0] - 1, "max_dd": dd, "since": ser[0]["ts"]})
+        extra = self._office_since_row(rows) if not since else None
+        if extra:
+            i = next((k for k, r in enumerate(rows) if r["name"] == "office"), -1)
+            rows.insert(i + 1, extra)
         return rows
+
+    def _office_since_row(self, rows: list[dict]) -> dict | None:
+        """«Весь офис с <дата старта теневого технического сигнала>» — офис, пересчитанный от той же точки, что и tech2: честное сравнение (общий «Весь офис» идёт с 12.10)."""
+        t = next((r for r in rows if r["name"] == self.TECH), None)
+        if not t:
+            return None
+        ser = self.b.q("SELECT ts, equity FROM shadow_eq WHERE name='office' AND ts>=? ORDER BY ts, rowid", (t["since"],))
+        if len(ser) < 1:
+            return None
+        eqs = [r["equity"] for r in ser]
+        peak, dd = eqs[0], 0.0
+        for e in eqs:
+            peak = max(peak, e)
+            dd = min(dd, e / peak - 1)
+        from .views import local
+        return {"name": "office_since", "title": f"Весь офис с {local(t['since']):%d.%m}", "start": eqs[0], "last": eqs[-1], "ret": eqs[-1] / eqs[0] - 1, "max_dd": dd, "since": ser[0]["ts"]}
 
 
 def table_text(rows: list[dict]) -> str:

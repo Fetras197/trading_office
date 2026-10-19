@@ -32,13 +32,30 @@ class FakeLLM:
         return {"phrases": a}
 
 
-def test_phrases_reject_latin_and_fall_back(monkeypatch):
+def test_phrases_reject_latin_and_never_use_templates(monkeypatch):
     items = {"market": "RSI overbought", "risk": "reduce"}
-    monkeypatch.setattr(report, "GeminiBackend", lambda: FakeLLM([{"market": "RSI высокий", "risk": "уменьшил размер позиции из-за изменчивости"}]))
+
+    class R:
+        def __init__(self, out): self.out = out
+
+        def ask(self, role, payload, system=None):
+            if isinstance(self.out, Exception):
+                raise self.out
+            return {"phrases": self.out}
+    monkeypatch.setattr(report, "RoleRouter", lambda: R({"market": "RSI высокий", "risk": "уменьшил размер позиции из-за изменчивости"}))
     ph = report.phrases(items)
-    assert ph["market"] == report.FALLBACK["market"] and ph["risk"].startswith("уменьшил")   # латиница в фразе = брак → запасная фраза
-    monkeypatch.setattr(report, "GeminiBackend", lambda: FakeLLM([report.LLMError("x")]))
-    assert report.phrases(items) == {"market": report.FALLBACK["market"], "risk": report.FALLBACK["risk"]}
+    assert ph == {"risk": "уменьшил размер позиции из-за изменчивости"}                 # латиница = брак; шаблона вместо мнения нет
+    monkeypatch.setattr(report, "RoleRouter", lambda: R(report.LLMError("все модели недоступны")))
+    assert report.phrases(items) == {}
+
+
+def test_trade_message_says_summary_unavailable_instead_of_template(monkeypatch):
+    b = Board()
+    b.publish("c", "market", "MOS", "buy: x", 0.7, data={"stance": "buy"})
+    monkeypatch.setattr(report, "phrases", lambda items: {})
+    res = SimpleNamespace(status="opened", asset="MOS", cycle_id="c", order={"price": 20.0, "qty": 100, "stop": 19.0, "take": 22.0, "equity": 100000, "tech": "support", "half": True, "gaps": ["аналитики не одобрили"]})
+    m = report.trade_message(b, res)
+    assert "оценка по графику цены" not in m and "Технический анализ: за (уверенность 70%) — краткий пересказ недоступен: лимит моделей" in m
 
 
 def test_trade_message_template_and_no_latin(monkeypatch):

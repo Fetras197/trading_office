@@ -40,6 +40,10 @@ jobs:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ secrets.TG_CHAT }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       OFFICE_HALT: ${{ vars.OFFICE_HALT }}
       OFFICE_FORCE_JOBS: ${{ inputs.force_jobs }}
       GEMINI_DAILY_BUDGET: ${{ vars.GEMINI_DAILY_BUDGET || '450' }}

@@ -7,15 +7,11 @@ import subprocess
 
 from . import config, proofread, telegram
 from .config import COSTS, make_asset
-from .llm import GeminiBackend, LLMError
+from .llm import LLMError, RoleRouter
 from .risk import RiskGate
 
 ROLE_RU = {"market": "Технический анализ", "news": "Новости", "fundamentals": "Фундаментальный анализ", "quant": "Квант-аналитик",
            "buffett": "Баффетт", "munger": "Мангер", "druckenmiller": "Друкенмиллер", "lab": "Лаборатория стратегий", "smartmoney": "Умные деньги"}
-FALLBACK = {"market": "оценка по графику цены", "news": "оценка новостного фона", "fundamentals": "оценка размера и динамики проекта",
-            "quant": "оценка волатильности и импульса", "buffett": "оценка качества бизнеса", "munger": "оценка качества бизнеса",
-            "druckenmiller": "оценка роста и макрофона", "lab": "сигнал проверенных стратегий", "smartmoney": "позиции крупных прибыльных трейдеров",
-            "debate": "решение принято по итогам обсуждения", "risk": "проверил риск сделки", "manager": "проверил сделку целиком"}
 ACC_RU = {**ROLE_RU, "bull": "Бык", "bear": "Медведь", "trader": "Трейдер"}
 STANCE_RU = {"buy": "за", "sell": "против", "hold": "сомневается"}
 FAMILY_RU = {"sma_cross": "пересечение средних", "rsi_revert": "возврат после перепроданности", "donchian": "пробой диапазона", "macd": "смена импульса",
@@ -81,21 +77,21 @@ def _valid(p) -> bool:
 
 
 def phrases(items: dict[str, str]) -> dict[str, str]:
-    """{ключ: исходный текст} -> {ключ: русская фраза}. Gemini -> Claude(haiku) -> запасная фраза. Латиница в ответе = брак."""
+    """{ключ: исходный текст} -> {ключ: русская фраза}. Gemini → запасные модели (Groq/Cerebras/Mistral/OpenRouter). Латиница в ответе = брак.
+    Ключи без пригодной фразы в результат НЕ попадают — шаблонных «оценка по графику цены» вместо мнения больше нет, вызывающий пишет прямо, что пересказ недоступен."""
     if not items:
         return {}
     payload = {"items": {k: v[:400] for k, v in items.items()}}
     out: dict[str, str] = {}
     try:
-        got = GeminiBackend().ask("notify", payload, system=PHRASE_SYSTEM).get("phrases", {})
+        got = RoleRouter().ask("notify", payload, system=PHRASE_SYSTEM).get("phrases", {})
     except (LLMError, AttributeError):
         got = {}
     for k, v in got.items():
         if k in items and k not in out and _valid(v):
             v = v.strip().rstrip(".").strip()
             out[k] = v[:1].lower() + v[1:]
-    base = {k: FALLBACK.get(k.split(":")[0], "оценка получена") for k in items}
-    return {**base, **out}
+    return out
 
 
 # ---------- сообщения ----------
@@ -122,7 +118,8 @@ def trade_message(board, res) -> str:
             order.append(role)
     ph = phrases(items)
     dec = last.get("decision", {}).get("data", {})
-    why = [f"• {ROLE_RU[r]}: {ph[r]} ({STANCE_RU[last[r]['data']['stance']]})" for r in order]
+    why = [f"• {ROLE_RU[r]}: {ph[r]} ({STANCE_RU[last[r]['data']['stance']]})" if r in ph else
+           f"• {ROLE_RU[r]}: {STANCE_RU[last[r]['data']['stance']]} (уверенность {num(last[r]['confidence'] * 100)}%) — краткий пересказ недоступен: лимит моделей" for r in order]
     why.insert(0, "• Технический сигнал: " + TECH_PHRASE.get(o.get("tech"), "растущий тренд, импульс подтверждает"))
     if o.get("mode") == "tech_only":
         why.insert(1, "• Аналитики не одобрили вход, но запрета от совета нет — вход только по техническому сигналу")
