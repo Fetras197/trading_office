@@ -27,11 +27,18 @@ def when_text(ts: str, now: dt.datetime | None = None) -> str:
     return f"{t:%H:%M}" if days == 0 else f"завтра {t:%H:%M}" if days == 1 else f"{t:%d.%m %H:%M}"
 
 
-def events_lines(evs: list[dict], limit: int = 8) -> list[str]:
+def day_label(ts: str, now: dt.datetime | None = None) -> str:
+    """«сегодня» / «завтра» / «21.10» — по календарной дате в Минске (а не по числу часов от сейчас)."""
+    t, n = local(ts), (now or dt.datetime.now(dt.timezone.utc)).astimezone(ZoneInfo(config.TZ_NAME))
+    days = (t.date() - n.date()).days
+    return "сегодня" if days == 0 else "завтра" if days == 1 else f"{t:%d.%m}"
+
+
+def events_lines(evs: list[dict], limit: int = 8, now: dt.datetime | None = None) -> list[str]:
     out = []
     for e in evs[:limit]:
         star = "‼️" if e["impact"] == "High" else "•"
-        out.append(f"{star} {local(e['ts']):%d.%m %H:%M} — {events.title_ru(e)}")
+        out.append(f"{star} {day_label(e['ts'], now)} {local(e['ts']):%H:%M} — {events.title_ru(e)}")
     return out
 
 
@@ -110,7 +117,7 @@ def shadow_text(rows: list[dict]) -> str:
 
 def briefing_text(pic, reg, evs, view, jpos, cands) -> str:
     lines = ["☀️ Утренний брифинг", picture_text(pic, reg), ""]
-    lines += ["События на ближайшие сутки:"] + (events_lines(evs) or ["• значимых событий нет"])
+    lines += ["События на ближайшие сутки (время по Минску):"] + (events_lines(evs) or ["• значимых событий нет"])
     lines += ["", "План на день:", f"• открытых позиций: {len(view['positions'])}, свободных денег {usd(view['cash'])}"]
     if cands:
         lines.append("• присматриваемся к: " + ", ".join(name(c) for c in cands[:5]))
@@ -160,7 +167,7 @@ def nogo_lines(rows: list[dict], stock_open: bool | None = None) -> list[str]:
     return out
 
 
-def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None, rules_line: str = "", desk_rows: list[dict] | None = None, stock_open: bool | None = None) -> str:
+def evening_text(view, bench, trades_today: list[dict], opened_today: int, shadow_rows, lessons: list[str], evs, labst, nogo: list[dict] | None = None, rules_line: str = "", desk_rows: list[dict] | None = None, stock_open: bool | None = None, now: dt.datetime | None = None) -> str:
     day = view["equity"] / view["last_equity"] - 1 if view["last_equity"] else 0.0
     lines = ["🌙 Вечерний отчёт", f"Счёт: {usd(view['equity'])} ({pct(day, 2)} за день)", f"S&P 500 {pct(bench.get('SPY', 0))}, биткоин {pct(bench.get('BTC', 0))} за день",
              f"Покупок за день: {opened_today}, закрыто сделок: {sum(1 for t in trades_today if t['exit_reason'] != 'partial')}"
@@ -179,7 +186,7 @@ def evening_text(view, bench, trades_today: list[dict], opened_today: int, shado
     if rules_line:
         lines += ["", rules_line]
     if evs:
-        lines += ["", "Завтра в календаре:"] + events_lines(evs, 4)
+        lines += ["", "Ближайшие 24 часа в календаре (время по Минску):"] + events_lines(evs, 4, now)
     if labst.get("trial") or labst.get("live"):
         lines += ["", f"Лаборатория: на испытании {labst.get('trial', 0)}, подтверждено вживую {labst.get('live', 0)}"]
     return "\n".join(lines)

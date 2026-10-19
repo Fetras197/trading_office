@@ -28,6 +28,7 @@ def seed(j, now_iso: str) -> None:
             j._x("INSERT INTO desks(id,name,kind,share,status,opened) VALUES(?,?,?,?,?,?)", (did, BUILTIN[did]["name"], "builtin", BASE_SHARE, "active", now_iso))
             j._x("INSERT INTO desk_hist(ts,desk,event,share,note) VALUES(?,?,?,?,?)", (now_iso, did, "open", BASE_SHARE, "создан"))
     adopt_legacy(j)
+    purge_legacy_nogo(j)
 
 
 def adopt_legacy(j) -> int:
@@ -38,6 +39,15 @@ def adopt_legacy(j) -> int:
         d = "stocks" if "/" not in a else "majors" if a in majors(j) else "trend"
         j._x("UPDATE positions SET desk=? WHERE asset=?", (d, a))
         n += 1
+    return n
+
+
+def purge_legacy_nogo(j) -> int:
+    """Отсечки старой общей схемы (до отделов: «лимит 5 входов в сутки исчерпан», «лимит 3 позиций исчерпан» по счёту в целом) в отчёты «Почему не вошли» не попадают:
+    они читались как отказ конкретного отдела, хотя считались по всему офису."""
+    n = j.q("SELECT COUNT(*) n FROM nogo WHERE stage='limits' AND (reason LIKE '%входов в сутки исчерпан' OR reason LIKE '%позиций исчерпан')")[0]["n"]
+    if n:
+        j._x("DELETE FROM nogo WHERE stage='limits' AND (reason LIKE '%входов в сутки исчерпан' OR reason LIKE '%позиций исчерпан')")
     return n
 
 
@@ -93,9 +103,9 @@ def capacity(j, desk: dict, equity: float, day: str) -> dict:
     free = budget - u["used"]
     why = ""
     if u["open"] >= MAX_POSITIONS:
-        why = f"лимит {MAX_POSITIONS} позиций отдела"
+        why = f"лимит {MAX_POSITIONS} позиций отдела (открыто {u['open']})"
     elif entries >= MAX_ENTRIES_DAY:
-        why = f"лимит {MAX_ENTRIES_DAY} входов в сутки отдела"
+        why = f"лимит {MAX_ENTRIES_DAY} входов в сутки отдела (сегодня входов в этом отделе: {entries})"
     elif free < 10:
         why = "бюджет отдела исчерпан"
     return {"ok": not why, "why": why, "open": u["open"], "entries": entries, "budget": budget, "free": free}

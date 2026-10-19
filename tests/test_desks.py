@@ -212,3 +212,25 @@ def test_day_boundaries_and_labels_consistent_between_summary_and_evening():
     text = views.evening_text({"equity": 97_000.0, "last_equity": 98_000.0}, {}, [{"asset": "ARB/USD", "pnl": 343.36, "exit_reason": "partial"}], 1, [], [], [], {}, nogo=[], stock_open=False)
     assert "Покупок за день: 1, закрыто сделок: 0, частичных фиксаций: 1" in text and "Реализованный результат за день: +343 $" in text and "• ARB: +343 $ (частичная фиксация)" in text
     assert "биржа США закрыта" in text and "круглосуточно" in text
+
+
+def test_entries_limit_is_counted_per_desk_one_entry_in_majors_does_not_trigger_limit():
+    j = mk()
+    j.add_fill("2026-10-19T03:36:51+00:00", "BTC/USD", "buy", 1, 1, 0, "entry", None, "majors")
+    for i in range(5):                                                         # «Тренд» исчерпал свои 5 входов
+        j.add_fill(f"2026-10-19T0{i}:10:00+00:00", f"A{i}/USD", "buy", 1, 1, 0, "entry", None, "trend")
+    assert j.entries_on("2026-10-19", "majors") == 1 and j.entries_on("2026-10-19", "trend") == 5 and j.entries_on("2026-10-19") == 6
+    caps = {d["id"]: desks.capacity(j, d, 100_000, "2026-10-19") for d in desks.active(j)}
+    assert caps["majors"]["ok"] and caps["majors"]["entries"] == 1
+    assert not caps["trend"]["ok"] and "лимит 5 входов в сутки отдела (сегодня входов в этом отделе: 5)" in caps["trend"]["why"]
+    assert desks.route(j, "ETH/USD", "support", 100_000, "2026-10-19", True)[0]["id"] == "majors"
+
+
+def test_legacy_global_limit_rows_are_purged_from_why_not_report():
+    j = Journal()
+    j.add_nogo("2026-10-18T19:50:00+00:00", "SOL/USD", "limits", "лимит 5 входов в сутки исчерпан", 0.95)
+    j.add_nogo("2026-10-18T19:50:00+00:00", "ETH/USD", "limits", "лимит 3 позиций исчерпан", 0.95)
+    j.add_nogo("2026-10-18T19:50:00+00:00", "BTC/USD", "limits", "дневной стоп -5% достигнут", 0.95)          # настоящий общий лимит остаётся
+    j.add_nogo("2026-10-19T03:00:00+00:00", "XRP/USD", "desk", "нет свободного отдела — «Тренд»: лимит 3 позиций отдела", 0.8)
+    desks.seed(j, NOW)
+    assert [r["asset"] for r in j.nogo_top("2026-10-18T00:00:00+00:00", 5)] == ["BTC/USD", "XRP/USD"]

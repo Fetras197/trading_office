@@ -98,3 +98,13 @@ def test_weekly_journal_script(tmp_path):
     subprocess.run([sys.executable, "scripts/weekly_journal.py", str(st), str(out)], check=True, capture_output=True)
     f = next(out.glob("*.md"))
     assert "100,000.00" in f.read_text() and "signal 1" in f.read_text()
+
+
+def test_calendar_labels_today_and_tomorrow_by_minsk_date():
+    from office import views
+    now = dt.datetime(2026, 10, 19, 18, 0, tzinfo=dt.timezone.utc)                       # 21:00 по Минску
+    ev = lambda ts: {"ts": ts, "impact": "High", "kind": "macro", "ccy": "USD", "title": "CPI"}  # noqa: E731
+    lines = views.events_lines([ev("2026-10-19T19:30+00:00"), ev("2026-10-19T21:30+00:00"), ev("2026-10-20T12:30+00:00"), ev("2026-10-22T12:30+00:00")], now=now)
+    assert lines[0].startswith("‼️ сегодня 22:30") and lines[1].startswith("‼️ завтра 00:30") and lines[2].startswith("‼️ завтра 15:30") and lines[3].startswith("‼️ 22.10 15:30")
+    txt = views.evening_text({"equity": 1.0, "last_equity": 1.0}, {}, [], 0, [], [], [ev("2026-10-19T19:30+00:00")], {}, now=now)
+    assert "Завтра в календаре" not in txt and "Ближайшие 24 часа в календаре" in txt and "сегодня 22:30" in txt
