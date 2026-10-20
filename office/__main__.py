@@ -44,6 +44,7 @@ def main(argv=None):
         print("ответ:", json.dumps(out, ensure_ascii=False)[:300])
         used = llm.status()["fallback_used"]
         print("запасные провайдеры (ответов):", used)
+        print(llm.or_line() or "OpenRouter: ключа нет")
         return 0 if used else 1
     elif a.cmd == "prune":
         prune_board()

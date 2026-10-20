@@ -230,3 +230,64 @@ def test_gemini_disabled_flag_sends_everything_to_fallbacks(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "x")
     with pytest.raises(llm.LLMUnavailable):
         GeminiBackend(session=object()).ask("market", {})
+
+
+@pytest.fixture
+def or_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(llm, "OR_SPEND_FILE", tmp_path / "or.json")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k-or")
+    monkeypatch.delenv("OPENROUTER_MODELS", raising=False)
+    llm.OpenAICompatBackend._pause.clear()
+    llm.OpenAICompatBackend._model_pause.clear()
+
+
+def _or(sess):
+    return llm.OpenAICompatBackend("openrouter", session=sess, min_interval=0)
+
+
+def test_openrouter_is_first_fallback_free_then_paid_order():
+    b = llm.fallback_chain()
+    assert b[0].name == "openrouter"
+    ms = b[0].models()
+    assert all(m.endswith(":free") for m in ms[:-1]) and ms[-1] == "meta-llama/llama-3.3-70b-instruct"
+
+
+def test_openrouter_free_limit_goes_to_paid_and_spend_is_recorded(or_env):
+    paid_resp = FbResp(200, GOOD)
+    paid_resp._j["usage"] = {"cost": 0.0004}
+    sess = FbSess(FbResp(429, text="free limit"), FbResp(429, text="free limit"), FbResp(429, text="free limit"), paid_resp)
+    assert _or(sess).ask("market", {}, system="x")["stance"] == "hold"
+    models = [c[1]["model"] for c in sess.calls]
+    assert models[-1] == "meta-llama/llama-3.3-70b-instruct" and all(m.endswith(":free") for m in models[:-1])
+    assert all(c[1]["usage"] == {"include": True} for c in sess.calls)
+    b = llm.or_spend_load()
+    assert b["usd"] == pytest.approx(0.0004) and b["paid_calls"] == 1
+    # бесплатные модели на паузе — следующий вызов сразу идёт на платную
+    sess2 = FbSess(FbResp(200, GOOD))
+    _or(sess2).ask("news", {}, system="x")
+    assert [c[1]["model"] for c in sess2.calls] == ["meta-llama/llama-3.3-70b-instruct"]
+
+
+def test_openrouter_paid_blocked_at_daily_cap(or_env):
+    llm.or_spend_add(0.20, True)
+    sess = FbSess(FbResp(429), FbResp(429), FbResp(429), FbResp(200, GOOD))
+    with pytest.raises(llm.LLMUnavailable, match="потолок"):
+        _or(sess).ask("market", {}, system="x")
+    assert len(sess.calls) == 3          # платная не вызывалась
+    r = RoleRouter(gemini=_gem_down(), fallbacks=[_or(FbSess())])
+    llm.OpenAICompatBackend._pause.clear()
+    with pytest.raises(llm.LLMUnavailable, match="аналитики недоступны: лимит моделей"):
+        r.ask("market", {"x": 1}, system="x")
+
+
+def test_openrouter_line_shows_spend_and_balance(or_env):
+    llm.or_spend_add(0.0123, True)
+
+    class S:
+        def get(self, url, headers=None, timeout=None):
+            class R:
+                def json(self_):
+                    return {"data": {"total_credits": 8, "total_usage": 1.97}}
+            return R()
+    line = llm.or_line(S())
+    assert "0.012 $" in line and "6.03 $" in line and line.startswith("OpenRouter: потрачено за день")

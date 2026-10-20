@@ -6,7 +6,7 @@ import datetime as dt
 import os
 import time
 
-from . import desks, earnings, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
+from . import desks, earnings, llm, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
@@ -130,9 +130,11 @@ class Office:
         opened = self.j.realized(since)["buys"]
         since24 = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)).isoformat(timespec="seconds")
         lessons = [r["text"] for r in memory.recall(self.board, "lesson", days=1, limit=3)]
-        self.notify(views.evening_text(self.client.account_view(), self.bench(), trades, opened, self.shadow.summary(), lessons, events.upcoming(self.board, 24),
+        txt = (views.evening_text(self.client.account_view(), self.bench(), trades, opened, self.shadow.summary(), lessons, events.upcoming(self.board, 24),
                                        {}, nogo=self.j.nogo_top(since24, 3), stock_open=self.stock_open, rules_line=rules.line(rules.status(self.j)),
                                        desk_rows=desks.stats(self.j, since, self.client.account_view())))
+        orl = llm.or_line()
+        self.notify(txt + ("\n\n" + orl if orl else ""))
 
     def weekly_with_council(self):
         """Воскресенье 20:00 по Минску: заседание совета директоров (бюджеты, закрытие отделов, новые отделы под лабораторию), затем недельный отчёт."""

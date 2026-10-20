@@ -199,17 +199,74 @@ class GeminiBackend:
 UNAVAILABLE_TEXT = "аналитики недоступны: лимит моделей"
 
 
+# ---------- OpenRouter: платная модель только под суточный потолок расхода ----------
+OR_DAILY_CAP_USD = float(os.environ.get("OPENROUTER_DAILY_CAP_USD", 0.20))
+OR_SPEND_FILE = config.STATE_DIR / "logs" / "openrouter_spend.json"
+_OR_LOCK = threading.Lock()
+
+
+def or_spend_load() -> dict:
+    today = time.strftime("%F", time.gmtime())
+    try:
+        b = json.loads(OR_SPEND_FILE.read_text())
+        if b.get("day") == today:
+            return b
+    except (OSError, ValueError):
+        pass
+    return {"day": today, "usd": 0.0, "paid_calls": 0, "free_calls": 0}
+
+
+def or_spend_add(usd: float, paid: bool) -> None:
+    with _OR_LOCK:
+        b = or_spend_load()
+        b["usd"] = round(b["usd"] + max(usd, 0.0), 6)
+        b["paid_calls" if paid else "free_calls"] += 1
+        try:
+            OR_SPEND_FILE.parent.mkdir(parents=True, exist_ok=True)
+            OR_SPEND_FILE.write_text(json.dumps(b))
+        except OSError:
+            pass
+
+
+def or_cap_left() -> float:
+    with _OR_LOCK:
+        return OR_DAILY_CAP_USD - or_spend_load()["usd"]
+
+
+def or_balance(session=None, timeout: int = 15) -> float | None:
+    """Остаток на счёте OpenRouter, $ (credits − usage); нет ключа/сети → None."""
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not key:
+        return None
+    try:
+        d = (session or requests).get("https://openrouter.ai/api/v1/credits", headers={"Authorization": f"Bearer {key}"}, timeout=timeout).json()["data"]
+        return float(d["total_credits"]) - float(d["total_usage"])
+    except (requests.RequestException, KeyError, TypeError, ValueError):
+        return None
+
+
+def or_line(session=None) -> str | None:
+    """Строка вечернего отчёта; None, если OpenRouter не подключён."""
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        return None
+    b, left = or_spend_load(), or_balance(session)
+    return (f"OpenRouter: потрачено за день {b['usd']:.3f} $ из потолка {OR_DAILY_CAP_USD:.2f} $ (платных ответов {b['paid_calls']}, бесплатных {b['free_calls']}) / "
+            f"остаток на счёте {'%.2f $' % left if left is not None else 'неизвестен'}")
+
+
 class OpenAICompatBackend:
     """Бесплатные запасные модели с OpenAI-совместимым API (Groq, OpenRouter free, Mistral, Cerebras). Ключ — переменная окружения (секрет GitHub); нет ключа — провайдер молча пропускается.
     429/5xx/сеть → LLMUnavailable и пауза провайдера (Retry-After или 10 минут); модель не найдена/отклонена → следующая модель того же провайдера."""
     PROVIDERS = {
         "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY", "GROQ_MODELS", "llama-3.3-70b-versatile,llama-3.1-8b-instant", True),
-        "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY", "OPENROUTER_MODELS", "meta-llama/llama-3.3-70b-instruct:free,google/gemma-3-27b-it:free", False),
+        "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY", "OPENROUTER_MODELS",
+                       "google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-super-120b-a12b:free,meta-llama/llama-3.3-70b-instruct", True),
         "mistral": ("https://api.mistral.ai/v1/chat/completions", "MISTRAL_API_KEY", "MISTRAL_MODELS", "mistral-small-latest,open-mistral-nemo", True),
         "cerebras": ("https://api.cerebras.ai/v1/chat/completions", "CEREBRAS_API_KEY", "CEREBRAS_MODELS", "llama-3.3-70b,llama3.1-8b", True),
     }
     _lock, _last = threading.Lock(), {}
     _pause: dict[str, float] = {}
+    _model_pause: dict[str, float] = {}     # OpenRouter: бесплатная модель упёрлась в лимит — пропускаем её, платную не трогаем
 
     def __init__(self, name: str, session=None, timeout: int = 60, min_interval: float | None = None):
         self.name, self.s, self.timeout = name, session or requests.Session(), timeout
@@ -234,9 +291,18 @@ class OpenAICompatBackend:
         sysmsg = system or load_agent(role)
         last = None
         for model in self.models():
+            paid = self.name == "openrouter" and not model.endswith(":free")
+            if self.name == "openrouter":
+                if time.time() < self._model_pause.get(model, 0.0):
+                    last = f"{last}; {model}: на паузе" if last else f"{model}: на паузе"
+                    continue
+                if paid and or_cap_left() <= 0:      # потолок расхода за сутки достигнут — платные запросы не отправляем
+                    raise LLMUnavailable(f"openrouter: потолок расхода {OR_DAILY_CAP_USD:.2f} $ в сутки достигнут")
             body = {"model": model, "temperature": 0.2, "messages": [{"role": "system", "content": sysmsg}, {"role": "user", "content": _prompt(payload)}]}
             if self.json_mode:
                 body["response_format"] = {"type": "json_object"}
+            if self.name == "openrouter":
+                body["usage"] = {"include": True}    # в ответе будет фактическая стоимость
             for attempt in (0, 1):
                 with self._lock:
                     wait = self._last.get(self.name, 0.0) + self.min_interval - time.monotonic()
@@ -252,6 +318,16 @@ class OpenAICompatBackend:
                     body.pop("response_format")
                     continue
                 break
+            if r.status_code == 429 and self.name == "openrouter" and not paid:   # лимит бесплатной модели — идём к следующей, платной
+                try:
+                    ra = float(r.headers.get("retry-after", 0))
+                except (TypeError, ValueError, AttributeError):
+                    ra = 0.0
+                self._model_pause[model] = time.time() + (min(ra, 3600) if ra else 900)
+                mark(self.name, False)
+                bad = f"{self.name}/{model} 429"
+                last = f"{last}; {bad}" if last else bad
+                continue
             if r.status_code == 429 or r.status_code >= 500:
                 try:
                     ra = float(r.headers.get("retry-after", 0))
@@ -271,6 +347,12 @@ class OpenAICompatBackend:
                 bad = f"{self.name}/{model}: странный ответ ({type(ex).__name__}: {str(locals().get('text', r.text))[:60]!r})"
                 last = f"{last}; {bad}" if last else bad
                 continue
+            if self.name == "openrouter":
+                try:
+                    cost = float((r.json().get("usage") or {}).get("cost") or 0.0)
+                except (TypeError, ValueError, AttributeError):
+                    cost = 0.0
+                or_spend_add(cost, paid)
             mark(self.name, True)
             _FALLBACK_USED[self.name] = _FALLBACK_USED.get(self.name, 0) + 1
             return out
@@ -282,14 +364,14 @@ _FALLBACK_USED: dict[str, int] = {}   # сколько ответов дали �
 
 def fallback_chain(session=None) -> list:
     """Запасные провайдеры в порядке приоритета; без ключа в окружении пропускаются при вызове."""
-    return [OpenAICompatBackend(n, session=session) for n in ("groq", "cerebras", "mistral", "openrouter")]
+    return [OpenAICompatBackend(n, session=session) for n in ("openrouter", "groq", "cerebras", "mistral")]
 
 
 CACHE_TTL = 5400   # 1,5 ч: одинаковый запрос (новости/макро без изменений) повторно не отправляем
 
 
 class RoleRouter:
-    """Все роли → Gemini; при лимите/сбое → запасные бесплатные модели (Groq → Cerebras → Mistral → OpenRouter free) с автопереключением при 429.
+    """Все роли → Gemini; при лимите/сбое → запасные бесплатные модели (OpenRouter: :free → одна платная под потолок 0,20 $/сутки → Groq → Cerebras → Mistral) с автопереключением при 429.
     Не ответил никто → LLMUnavailable('аналитики недоступны: лимит моделей'). Кэш одинаковых запросов в памяти процесса."""
     def __init__(self, gemini=None, now_fn=time.time, fallbacks=None):
         self.gemini, self.now = gemini or GeminiBackend(), now_fn
