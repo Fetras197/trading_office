@@ -154,6 +154,8 @@ class GeminiBackend:
             self._last[0] = time.monotonic()
 
     def ask(self, role: str, payload: dict, system: str | None = None) -> dict:
+        if os.environ.get("GEMINI_DISABLED") == "1":   # проверка запасных моделей: Gemini выключен принудительно
+            raise LLMUnavailable("gemini отключён (GEMINI_DISABLED=1)")
         key = os.environ.get("GEMINI_API_KEY")
         if not key:
             raise LLMError("нет GEMINI_API_KEY")
@@ -198,9 +200,10 @@ UNAVAILABLE_TEXT = "аналитики недоступны: лимит моде
 
 
 class OpenAICompatBackend:
-    """Бесплатные запасные модели с OpenAI-совместимым API (Groq, OpenRouter free, Mistral, Cerebras). Ключ — переменная окружения (секрет GitHub); нет ключа — провайдер молча пропускается.
+    """Бесплатные запасные модели с OpenAI-совместимым API (GitHub Models, Groq, OpenRouter free, Mistral, Cerebras). Ключ — переменная окружения (секрет GitHub); нет ключа — провайдер молча пропускается.
     429/5xx/сеть → LLMUnavailable и пауза провайдера (Retry-After или 10 минут); модель не найдена/отклонена → следующая модель того же провайдера."""
     PROVIDERS = {
+        "github": ("https://models.github.ai/inference/chat/completions", "GITHUB_MODELS_TOKEN", "GITHUB_MODELS", "openai/gpt-4o-mini,meta/Llama-3.3-70B-Instruct", True),
         "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY", "GROQ_MODELS", "llama-3.3-70b-versatile,llama-3.1-8b-instant", True),
         "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY", "OPENROUTER_MODELS", "meta-llama/llama-3.3-70b-instruct:free,google/gemma-3-27b-it:free", False),
         "mistral": ("https://api.mistral.ai/v1/chat/completions", "MISTRAL_API_KEY", "MISTRAL_MODELS", "mistral-small-latest,open-mistral-nemo", True),
@@ -216,7 +219,8 @@ class OpenAICompatBackend:
 
     @property
     def key(self) -> str:
-        return os.environ.get(self.key_env, "")
+        k = os.environ.get(self.key_env, "")
+        return k or (os.environ.get("GITHUB_TOKEN", "") if self.name == "github" else "")   # GitHub Models: встроенный токен Actions (permissions: models: read)
 
     def models(self) -> list[str]:
         return [m.strip() for m in os.environ.get(self.models_env, self.default_models).split(",") if m.strip()]
@@ -277,14 +281,14 @@ _FALLBACK_USED: dict[str, int] = {}   # сколько ответов дали �
 
 def fallback_chain(session=None) -> list:
     """Запасные провайдеры в порядке приоритета; без ключа в окружении пропускаются при вызове."""
-    return [OpenAICompatBackend(n, session=session) for n in ("groq", "cerebras", "mistral", "openrouter")]
+    return [OpenAICompatBackend(n, session=session) for n in ("github", "groq", "cerebras", "mistral", "openrouter")]
 
 
 CACHE_TTL = 5400   # 1,5 ч: одинаковый запрос (новости/макро без изменений) повторно не отправляем
 
 
 class RoleRouter:
-    """Все роли → Gemini; при лимите/сбое → запасные бесплатные модели (Groq → Cerebras → Mistral → OpenRouter free) с автопереключением при 429.
+    """Все роли → Gemini; при лимите/сбое → запасные бесплатные модели (GitHub Models → Groq → Cerebras → Mistral → OpenRouter free) с автопереключением при 429.
     Не ответил никто → LLMUnavailable('аналитики недоступны: лимит моделей'). Кэш одинаковых запросов в памяти процесса."""
     def __init__(self, gemini=None, now_fn=time.time, fallbacks=None):
         self.gemini, self.now = gemini or GeminiBackend(), now_fn

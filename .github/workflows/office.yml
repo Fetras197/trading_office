@@ -18,6 +18,10 @@ on:
         description: "Принудительно выполнить задания отдела сейчас (через запятую: macro,news,crypto,sectors,portfolio,picture,evening,briefing,summary)"
         type: string
         default: ""
+      llm_check:
+        description: "Проверка запасных моделей: Gemini выключен, один вызов аналитика, торгового прохода нет"
+        type: boolean
+        default: false
 
 concurrency:
   group: office            # два прохода одновременно = два писателя в SQLite и двойные ордера
@@ -25,6 +29,7 @@ concurrency:
 
 permissions:
   contents: write
+  models: read             # GitHub Models (запасные аналитики) через встроенный токен, ключи не нужны
 
 jobs:
   tick:
@@ -44,6 +49,8 @@ jobs:
       CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
       MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      GEMINI_DISABLED: ${{ inputs.llm_check && '1' || '' }}
       OFFICE_HALT: ${{ vars.OFFICE_HALT }}
       OFFICE_FORCE_JOBS: ${{ inputs.force_jobs }}
       GEMINI_DAILY_BUDGET: ${{ vars.GEMINI_DAILY_BUDGET || '450' }}
@@ -70,7 +77,12 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip_tests }}
         run: python -m pytest -q -x -p no:cacheprovider
 
+      - name: Проверка запасных моделей (Gemini выключен)
+        if: ${{ inputs.llm_check }}
+        run: python -m office llmcheck
+
       - name: Проход офиса
+        if: ${{ !inputs.llm_check }}
         run: python -m office cloud
 
       - name: Сохранить состояние в ветку state

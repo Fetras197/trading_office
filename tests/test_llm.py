@@ -218,3 +218,23 @@ def test_garbage_answers_fall_through_to_unavailable(monkeypatch):
     r = RoleRouter(gemini=_gem_down(), fallbacks=_chain(monkeypatch, s))
     with pytest.raises(llm.LLMUnavailable):
         r.ask("market", {}, system="x")
+
+
+def test_github_models_first_in_chain_uses_builtin_token_and_second_model(monkeypatch):
+    assert [b.name for b in llm.fallback_chain()][0] == "github"
+    for e in ("GITHUB_MODELS_TOKEN", "GITHUB_MODELS"):
+        monkeypatch.delenv(e, raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_builtin")
+    llm.OpenAICompatBackend._pause.clear()
+    sess = FbSess(FbResp(404, text="unknown model"), FbResp(200, GOOD))
+    b = llm.OpenAICompatBackend("github", session=sess, min_interval=0)
+    assert b.available() and b.url == "https://models.github.ai/inference/chat/completions"
+    assert b.ask("market", {}, system="x")["stance"] == "hold"
+    assert [c[1]["model"] for c in sess.calls] == ["openai/gpt-4o-mini", "meta/Llama-3.3-70B-Instruct"]
+
+
+def test_gemini_disabled_flag_sends_everything_to_fallbacks(monkeypatch):
+    monkeypatch.setenv("GEMINI_DISABLED", "1")
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    with pytest.raises(llm.LLMUnavailable):
+        GeminiBackend(session=object()).ask("market", {})

@@ -26,7 +26,7 @@ def prune_board(path=None, keep_days: int = 14) -> None:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="office")
-    ap.add_argument("cmd", choices=["cloud", "once", "screen", "status", "summary", "accuracy", "prune", "halt", "resume"])
+    ap.add_argument("cmd", choices=["cloud", "once", "screen", "status", "summary", "accuracy", "prune", "halt", "resume", "llmcheck"])
     ap.add_argument("symbol", nargs="?", help="для once: BTC/USD, NVDA ...")
     ap.add_argument("--dry-run", action="store_true", help="once: пройти всю цепочку, но ордер не отправлять")
     a = ap.parse_args(argv)
@@ -37,6 +37,14 @@ def main(argv=None):
     elif a.cmd == "resume":
         config.STOP_FILE.unlink(missing_ok=True)
         print("RESUME: STOP снят")
+    elif a.cmd == "llmcheck":
+        from . import llm
+        r = llm.RoleRouter()
+        out = r.ask("tech_analyst", {"asset": "TEST", "note": "проверка связи, ответь JSON: {\"stance\":\"hold\",\"summary\":\"ок\"}"})
+        print("ответ:", json.dumps(out, ensure_ascii=False)[:300])
+        used = llm.status()["fallback_used"]
+        print("запасные провайдеры (ответов):", used)
+        return 0 if used else 1
     elif a.cmd == "prune":
         prune_board()
         print("board.db урезан")
