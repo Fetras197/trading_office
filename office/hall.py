@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import agents, config, data, desks, entry, events, factcheck, indicators, lab, regime, views
+from . import agents, config, data, desks, earnings, entry, events, factcheck, indicators, lab, regime, views
 from .alpaca import AlpacaError
 from .config import COSTS, Limits, make_asset
 from .board import PICTURE_MAX_AGE_H
@@ -225,6 +225,12 @@ class Hall:
             patterns.append(tech.kind)
         if not patterns:
             return hold("signal", "нет технического сигнала: " + ("; ".join(tech.notes[:2]) or "условия не выполнены"))
+
+        # --- отчёты компаний (правило риска): акцию не открываем за 2 торговых дня до отчёта ---
+        if asset.kind == "stock":
+            why_e = earnings.entry_block(getattr(self.broker, "c", None), self.board, asset.name)
+            if why_e:
+                return hold("earnings", why_e, score=0.9)
 
         # --- общий лимит альткоинов: не больше MAX_ALT_POSITIONS открытых позиций по ВСЕМ отделам (BTC и ETH не считаются) ---
         is_alt = "/" in asset.name and asset.name not in entry.ALT_EXEMPT

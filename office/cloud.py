@@ -6,7 +6,7 @@ import datetime as dt
 import os
 import time
 
-from . import desks, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
+from . import desks, earnings, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .hall import Hall, Result, utcnow
@@ -191,6 +191,30 @@ class Office:
         if self.j.kv_get("start_equity") is None:
             self.j.kv_set("start_equity", eq)
 
+    def earnings_guard(self) -> list[str]:
+        """Правило риска: позиция в акции закрывается заранее, если отчёт компании сегодня или на следующий торговый день (только в часы биржи; первый же проход накануне)."""
+        done = []
+        if not self.stock_open:
+            return done
+        for name in [n for n in self.j.positions() if "/" not in n]:
+            try:
+                why = earnings.must_exit(self.client, self.board, name)
+                if not why:
+                    continue
+                with self.hall.exec_lock:
+                    desk = self.j.positions()[name].get("desk")
+                    r = self.broker.sell(name, float(self.client.price(name)), utcnow(), "earnings")
+                t = self.j.q("SELECT entry, qty FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
+                cost = t[0]["entry"] * t[0]["qty"] if t else 0
+                self.notify(report.close_message(name, r["pnl"], r["pnl"] / cost if cost else 0.0, "earnings", desk=desks.name_of(self.j, desk)) + f"\n{why}")
+                self.sched.trigger("portfolio")
+                self.sched.trigger("review")
+                done.append(name)
+            except Exception as e:  # noqa: BLE001 — сбой по одной акции не мешает остальным
+                print(f"{utcnow()} отчёт-гард {name}: {type(e).__name__}: {str(e)[:150]}", flush=True)
+                self.notify_limited(f"earnings_guard:{name}", f"⚠️ Не удалось закрыть {report.name(name)} перед отчётом компании — проверьте позицию вручную.", hours=2)
+        return done
+
     def screen(self):
         """Сканер рынка (без LLM): весь ликвидный список Alpaca → 10–20 кандидатов для отделов; список крупной крипты запоминается для маршрутизации."""
         self.stock_open = bool(self.client.clock().get("is_open"))
@@ -251,7 +275,7 @@ class Office:
         if self.j.kv_get("cloud_started") is None:
             self.j.kv_set("cloud_started", utcnow())
             self.notify("☁️ Офис переехал в облако (GitHub Actions): проход каждые 30–60 минут, телефон больше не нужен. Сообщения о сделках, сводки и отчёты приходят сюда.")
-        for name, fn in (("сверка с брокером", self.watch), ("исследовательский отдел", self.sched.run_due)):
+        for name, fn in (("сверка с брокером", self.watch), ("закрытие перед отчётами", self.earnings_guard), ("исследовательский отдел", self.sched.run_due)):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001 — сбой одной части не должен ронять проход

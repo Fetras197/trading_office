@@ -347,3 +347,22 @@ def test_pair_without_valid_protection_is_not_bought_and_logged(env):
     r = h.run_asset("BTC/USD")
     assert r.status == "skipped" and "не покупаем" in r.detail and not br.bought
     assert j.nogo_top("2000-01-01")[0]["stage"] == "protection"
+
+
+def test_stock_entry_blocked_two_trading_days_before_report_but_allowed_after(env, monkeypatch):
+    import datetime as dt
+    from office import earnings
+    today = earnings.today_ny()
+    nxt = lambda n: today + dt.timedelta(days=n)  # noqa: E731
+    h, b, j, br = mk()
+    monkeypatch.setattr(earnings, "next_report", lambda symbol, board=None, today=None: (nxt(1), True))
+    r = h.run_asset("UAL")
+    assert r.status == "hold" and "отчёт компании UAL" in r.detail and not br.bought and j.nogo_top("2000-01-01")[0]["stage"] == "earnings"
+    h2, b2, j2, br2 = mk()
+    monkeypatch.setattr(earnings, "next_report", lambda symbol, board=None, today=None: (nxt(10), True))
+    assert h2.run_asset("UAL").status == "opened"
+    h3, b3, j3, br3 = mk()
+    monkeypatch.setattr(earnings, "next_report", lambda symbol, board=None, today=None: (None, False))
+    assert "нет данных о дате отчёта" in h3.run_asset("UAL").detail
+    h4, b4, j4, br4 = mk()
+    assert h4.run_asset("BTC/USD").status == "opened"                                   # крипту правило отчётов не касается

@@ -133,12 +133,14 @@ def trade_message(board, res) -> str:
 
 def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: bool = False, planned_risk: float | None = None, desk: str | None = None) -> str:
     if offline and reason in ("stop", "take"):
-        head = (f"🔴 Продажа {name(asset)} — сработал стоп-лосс (пока офис был выключен)" if reason == "stop"
-                else f"🟢 Продажа {name(asset)} — взят тейк-профит (пока офис был выключен)")
+        head = (f"🔴 Продажа {name(asset)} — сработал стоп-лосс (между проверками офиса, заявка на бирже)" if reason == "stop"
+                else f"🟢 Продажа {name(asset)} — взят тейк-профит (между проверками офиса, заявка на бирже)")
     elif reason == "stop":
         head = f"🔴 Продажа {name(asset)} — сработал стоп-лосс"
     elif reason == "take":
         head = f"🟢 Продажа {name(asset)} — взят тейк-профит"
+    elif reason == "earnings":
+        head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — перед отчётом компании (позицию не держим через отчёт)"
     elif reason == "manual":
         head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — по вашей команде"
     else:

@@ -126,7 +126,7 @@ def briefing_text(pic, reg, evs, view, jpos, cands) -> str:
 
 
 STAGE_RU = {"signal": "нет сигнала", "votes": "аналитики", "limits": "лимит риска", "regime": "режим рынка", "event": "событие", "cooldown": "остывание после стопа",
-            "halt": "пауза", "alts": "лимит альткоинов", "riskgate": "риск-гейт", "desk": "отделы", "economics": "экономика сделки", "protection": "защитная заявка", "spread": "спред", "broker": "брокер", "data": "нет данных"}
+            "halt": "пауза", "alts": "лимит альткоинов", "riskgate": "риск-гейт", "desk": "отделы", "economics": "экономика сделки", "protection": "защитная заявка", "earnings": "отчёт компании", "spread": "спред", "broker": "брокер", "data": "нет данных"}
 
 
 def desk_lines(rows: list[dict], title: str) -> list[str]:

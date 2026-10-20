@@ -99,6 +99,9 @@ class AlpacaClient:
     def clock(self):
         return self._req("GET", "/clock")
 
+    def calendar(self, start: str, end: str):
+        return self._req("GET", "/calendar", params={"start": start, "end": end})
+
     def positions(self):
         return self._req("GET", "/positions")
 
