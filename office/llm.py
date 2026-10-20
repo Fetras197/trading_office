@@ -263,12 +263,15 @@ class OpenAICompatBackend:
                 mark(self.name, False)
                 raise LLMUnavailable(f"{self.name} {r.status_code}: {r.text[:100]}")
             if r.status_code != 200:     # неизвестная модель / отказ — пробуем следующую модель провайдера
-                last = f"{self.name}/{model} {r.status_code}: {r.text[:100]}"
+                bad = f"{self.name}/{model} {r.status_code}: {r.text[:100]}"
+                last = f"{last}; {bad}" if last else bad
                 continue
             try:
-                out = parse_json(r.json()["choices"][0]["message"]["content"])
+                text = r.json()["choices"][0]["message"]["content"]
+                out = parse_json(text)
             except (KeyError, IndexError, ValueError, LLMError) as ex:
-                last = f"{self.name}/{model}: странный ответ ({type(ex).__name__})"
+                bad = f"{self.name}/{model}: странный ответ ({type(ex).__name__}: {str(locals().get('text', r.text))[:60]!r})"
+                last = f"{last}; {bad}" if last else bad
                 continue
             mark(self.name, True)
             _FALLBACK_USED[self.name] = _FALLBACK_USED.get(self.name, 0) + 1
