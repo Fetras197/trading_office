@@ -1,6 +1,6 @@
 """Облачный офис: один проход = `python -m office cloud` (GitHub Actions, каждые 30–60 минут; состояние лежит в ветке `state`).
 Проход: сверка с брокером -> задания исследовательского отдела по расписанию (Scheduler помнит последний запуск в journal.kv) -> скринер -> цикл зала -> вечерний/утренний отчёты.
-Телефон офис больше не запускает: единственный канал связи с владельцем — сообщения в Telegram. Команд из чата нет (стоп-кран: переменная репозитория OFFICE_HALT=1)."""
+Телефон офис больше не запускает: единственный канал связи с владельцем — сообщения в Telegram. Команды из чата (/статус, /позиции, /отчёт, /пауза, /продолжить, /закрыть) читаются на каждом проходе (commands.py); стоп-кран: переменная репозитория OFFICE_HALT=1 или /пауза."""
 import concurrent.futures as cf
 import datetime as dt
 import os
@@ -9,6 +9,7 @@ import time
 from . import desks, earnings, llm, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
+from .commands import Commands
 from .hall import Hall, Result, utcnow
 from .journal import Journal
 from .llm import RoleRouter
@@ -36,6 +37,7 @@ class Office:
         self.manager = manage.Manager(self.broker, self.j, self.client, notify)
         self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"], lab_fn=lambda: lab.shadow_signals(self.board), start_fn=lambda: self.j.kv_get("start_equity"), journal=self.j,
                                    candles_fn=lambda n: data.candles(config.BY_NAME[n], "1h", **({"limit": 500} if "/" in n else {"rng": "60d"})))
+        self.commands = Commands(self)
         self.sched = scheduler.Scheduler(self.j, self.jobs())
 
     # ---------- расписание исследовательского отдела (порядок = порядок первичного наполнения) ----------
@@ -263,7 +265,7 @@ class Office:
 
     def run_once(self) -> list[Result]:
         """Один проход облачного офиса."""
-        if os.environ.get("OFFICE_HALT", "").strip() in ("1", "true", "yes"):
+        if os.environ.get("OFFICE_HALT", "").strip() in ("1", "true", "yes") or self.j.kv_get("paused"):   # пауза: переменная репозитория или команда /пауза (хранится в office.db)
             config.STOP_FILE.touch()
         for name in filter(None, (x.strip() for x in os.environ.get("OFFICE_FORCE_JOBS", "").split(","))):   # ручной запуск: принудительно выполнить задания отдела сейчас
             self.sched.trigger(name)
@@ -277,7 +279,7 @@ class Office:
         if self.j.kv_get("cloud_started") is None:
             self.j.kv_set("cloud_started", utcnow())
             self.notify("☁️ Офис переехал в облако (GitHub Actions): проход каждые 30–60 минут, телефон больше не нужен. Сообщения о сделках, сводки и отчёты приходят сюда.")
-        for name, fn in (("сверка с брокером", self.watch), ("закрытие перед отчётами", self.earnings_guard), ("исследовательский отдел", self.sched.run_due)):
+        for name, fn in (("сверка с брокером", self.watch), ("закрытие перед отчётами", self.earnings_guard), ("команды Telegram", self.commands.poll), ("исследовательский отдел", self.sched.run_due)):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001 — сбой одной части не должен ронять проход
