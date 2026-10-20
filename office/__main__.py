@@ -40,7 +40,7 @@ def main(argv=None):
     elif a.cmd == "llmcheck":
         from . import llm
         r = llm.RoleRouter()
-        out = r.ask("tech_analyst", {"asset": "TEST", "note": "проверка связи, ответь JSON: {\"stance\":\"hold\",\"summary\":\"ок\"}"})
+        out = r.ask("tech_analyst", {"asset": "TEST/USD", "indicators_1h": {"close": 100.0, "ema20": 99.0, "ema50": 97.0, "ema200": 90.0, "rsi14": 58.0, "macd_hist": 0.4, "atr14": 1.2, "bb_lower": 95.0, "bb_upper": 103.0, "low_50": 94.0}})
         print("ответ:", json.dumps(out, ensure_ascii=False)[:300])
         used = llm.status()["fallback_used"]
         print("запасные провайдеры (ответов):", used)
