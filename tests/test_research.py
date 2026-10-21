@@ -186,7 +186,7 @@ def test_office_wiring_without_running_anything():
         def price(self, s): return 1.0
     s = Office(board=Board(), journal=Journal(), client=C(), notify=lambda t: None, router=object())
     names = [j.name for j in s.sched.jobs]
-    assert set(names) == {"events", "regime", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "realmoney", "shadow", "review", "summary", "picture", "briefing", "evening", "weekly"}
+    assert set(names) == {"events", "regime", "macro", "macro_pre_event", "news", "crypto", "sectors", "portfolio", "manage", "smartmoney", "realmoney", "shadow", "interns", "review", "summary", "picture", "briefing", "evening", "weekly"}
     assert names.index("events") < names.index("macro") < names.index("picture")   # порядок первичного наполнения: картина дня — последняя среди исследований
     assert s.research.on_urgent == s.urgent and s.scope() == {"held": [], "candidates": []} and s.hall.fresh_left == 5
 

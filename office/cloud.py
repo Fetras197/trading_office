@@ -6,7 +6,7 @@ import datetime as dt
 import os
 import time
 
-from . import desks, earnings, llm, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage
+from . import desks, earnings, llm, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage, interns
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .commands import Commands
@@ -37,6 +37,9 @@ class Office:
         self.manager = manage.Manager(self.broker, self.j, self.client, notify)
         self.shadow = shadow.Shadow(self.board, self.client.price, lambda: self.client.account_view()["equity"], lab_fn=lambda: lab.shadow_signals(self.board), start_fn=lambda: self.j.kv_get("start_equity"), journal=self.j,
                                    candles_fn=lambda n: data.candles(config.BY_NAME[n], "1h", **({"limit": 500} if "/" in n else {"rng": "60d"})))
+        self.interns = interns.Interns(self.board, self.j, lambda: screener.universe(self.client)["stock"],
+                                       lambda syms, days: data.alpaca_bars(syms, "stock", days=days, timeframe="1Day"),
+                                       lambda a: data.candles(config.make_asset(a), "1h", **({"limit": 500} if "/" in a else {"rng": "60d"})), self.client.price)   # стажёры: бумажные, на правила не влияют
         self.commands = Commands(self)
         self.sched = scheduler.Scheduler(self.j, self.jobs())
 
@@ -58,6 +61,7 @@ class Office:
                 J("smartmoney", smartmoney.refresh, every=3 * 3600),
                 J("realmoney", lambda: realmoney.check(self.board, self.j, self.notify, self.j), every=21600),
                 J("shadow", self.shadow.step, every=3600),
+                J("interns", self.interns.step, every=3600),
                 J("review", self.run_review, every=3600),
                 J("summary", self.summary, every=6 * 3600),
                 J("picture", R.run_picture, at=["03:30", "07:30", "11:30", "15:30", "19:30", "23:30"], catchup_h=3),
@@ -136,13 +140,14 @@ class Office:
                                        {}, nogo=self.j.nogo_top(since24, 3), stock_open=self.stock_open, rules_line=rules.line(rules.status(self.j)),
                                        desk_rows=desks.stats(self.j, since, self.client.account_view())))
         orl = llm.or_line()
-        self.notify(txt + ("\n\n" + orl if orl else ""))
+        self.notify(txt + ("\n\n" + orl if orl else "") + self._interns_lines(since))
 
     def weekly_with_council(self):
         """Воскресенье 20:00 по Минску: заседание совета директоров (бюджеты, закрытие отделов, новые отделы под лабораторию), затем недельный отчёт."""
         since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)).isoformat(timespec="seconds")
         decisions = desks.council(self.j, self.board, self.client.account_view()["equity"], utcnow(), since)
         self.notify("🏛 Совет директоров\n" + "\n".join(f"• {d}" for d in decisions))
+        self._interns_council(since)
         self.weekly()
 
     def weekly(self):
@@ -161,7 +166,22 @@ class Office:
         except Exception:  # noqa: BLE001 — итоги недели не должны зависеть от лимитов
             pass
         self.notify(views.weekly_text(self.shadow.summary(since), trades, lessons, acc, [], {}, insight, realmoney.progress_line(realmoney.progress(self.board, self.j)) + "\n" + rules.line(rules.status(self.j))
-                                       + "\n\n" + "\n".join(views.desk_lines(desks.stats(self.j, since, self.client.account_view()), "🏢 Отделы за неделю:"))))
+                                       + "\n\n" + "\n".join(views.desk_lines(desks.stats(self.j, since, self.client.account_view()), "🏢 Отделы за неделю:")) + self._interns_lines(since, "🎓 Стажёры за неделю (бумажные, на боевые правила не влияют):")))
+
+    def _interns_lines(self, since: str, title: str | None = None) -> str:
+        """Строки стажёров для вечернего и недельного отчётов; сбой стажёров не должен ломать отчёт."""
+        try:
+            return "\n\n" + (self.interns.lines(since, title) if title else self.interns.lines(since))
+        except Exception as e:  # noqa: BLE001
+            print(f"{utcnow()} interns lines: {type(e).__name__}: {str(e)[:120]}", flush=True)
+            return ""
+
+    def _interns_council(self, since: str):
+        """Воскресный совет: сравнение стажёров с боевыми отделами и предложения владельцу (кого перевести в боевые, кого уволить). Ничего не применяется автоматически."""
+        try:
+            self.notify(self.interns.council_text(self.j, [r for r in desks.stats(self.j, since, self.client.account_view()) if r["status"] == "active"], dt.datetime.now(dt.timezone.utc)))
+        except Exception as e:  # noqa: BLE001
+            print(f"{utcnow()} interns council: {type(e).__name__}: {str(e)[:120]}", flush=True)
 
     def run_review(self):
         """Разбор закрытых сделок — не больше 3 за проход."""
