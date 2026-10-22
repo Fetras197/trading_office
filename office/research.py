@@ -253,6 +253,7 @@ class Research:
             if self.j.kv_get(f"urgent:{h}") is None:
                 self.j.kv_set(f"urgent:{h}", self._now().isoformat())
                 self.notify(report.urgent_message(k, a["note"]))
+                self.j.kv_set(f"urgent_info:{k}", {"note": a["note"], "headline": a["headline"], "sentiment": a["sentiment"], "ts": self._now().isoformat()})   # для защиты открытой позиции (newsguard)
                 self.on_urgent(k)
         return rid
 

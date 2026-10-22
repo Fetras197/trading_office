@@ -1,9 +1,8 @@
 """Команды из Telegram: опрос getUpdates на проходе, offset в journal.kv, только свой chat_id, пауза/продолжить/закрыть, время прохода."""
-import time
 
 import pytest
 
-from office import commands, config, telegram
+from office import commands, config
 from office.board import Board
 from office.cloud import Office
 from office.journal import Journal

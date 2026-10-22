@@ -6,7 +6,7 @@ import datetime as dt
 import os
 import time
 
-from . import desks, earnings, llm, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage, interns
+from . import desks, earnings, llm, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage, interns, newsguard
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .commands import Commands
@@ -80,7 +80,17 @@ class Office:
                 return
 
     def urgent(self, asset: str):
-        """Срочная новость: внеочередной разбор актива (не чаще раза в 30 минут), только если он в зоне внимания."""
+        """Срочная новость. Актив в позиции: защита (newsguard) — совет закрывает по рынку или подтягивает стоп до −1% (пауза ей не мешает: это защита).
+        Иначе — внеочередной разбор актива (не чаще раза в 30 минут), только если он в зоне внимания."""
+        if asset in self.j.positions():
+            info = newsguard.info_for(self, asset)
+            if info:
+                try:
+                    newsguard.handle(self, asset, info)
+                except Exception as e:  # noqa: BLE001 — сбой защиты не должен ронять проход, но владельцу о нём скажем
+                    print(f"{utcnow()} newsguard {asset}: {type(e).__name__}: {str(e)[:150]}", flush=True)
+                    self.notify_limited(f"newsguard:{asset}", f"⚠️ Срочная новость по {report.name(asset)}, но защитное решение выполнить не удалось ({type(e).__name__}). Проверьте позицию вручную.", hours=2)
+            return
         if asset not in self.scope()["held"] + self.candidates + list(config.CRYPTO_CORE) or config.STOP_FILE.exists():
             return
         k, now = f"urgent_run:{asset}", time.time()
