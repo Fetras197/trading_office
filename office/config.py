@@ -52,13 +52,19 @@ ASSETS = [make_asset(s) for s in CRYPTO_CORE + STOCK_CORE]
 
 # Не торгуем: ONDO (по решению владельца) и стейблкоины (цена ≈ 1 $, сигналов нет, только шум).
 STABLE_BASES = frozenset({"USDC", "USDT", "DAI", "PYUSD", "USDG", "TUSD", "USDP", "BUSD", "FDUSD", "USDS", "USD1"})
+# Мем-монеты исключены из списка наблюдения и входов (решение владельца 2026-10-22, после покупки DOGE): фильтр списка, как у стейблкоинов; правила входа и счёт сделок не затронуты.
+# Уже открытая позиция по такой монете остаётся под своими стопом и целью — фильтр касается только новых кандидатов.
+MEME_BASES = frozenset({"DOGE", "TRUMP", "PEPE", "BONK", "SHIB", "WIF", "FLOKI", "MEME", "MOG", "BOME", "POPCAT", "PENGU", "FARTCOIN", "PNUT", "TURBO", "BRETT", "NEIRO", "MEW", "SPX", "GOAT", "PONKE", "MOODENG", "WEN", "BABYDOGE", "ELON", "SAMO", "TOSHI", "PEOPLE"})
 EXCLUDED = frozenset({"ONDO/USD", "ONDOUSD"})
 MIN_TURNOVER = {"crypto": 10_000_000.0, "stock": 10_000_000.0}   # крипта: оборот за 24 ч по CoinGecko ($); акции: средний дневной оборот за 20 дней по барам Alpaca IEX ($)
 
 
 def excluded(symbol: str) -> bool:
     s = symbol.upper().replace("-", "/")
-    return s in EXCLUDED or s.split("/")[0] in STABLE_BASES
+    base = s.split("/")[0]
+    if base.endswith("USD") and "/" not in s:     # «DOGEUSD» без слэша (формат брокера)
+        base = base[:-3]
+    return s in EXCLUDED or base in STABLE_BASES or base in MEME_BASES or base.lstrip("0123456789") in MEME_BASES   # 1000PEPE и подобные
 
 
 class _ByName(dict):

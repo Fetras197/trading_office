@@ -32,22 +32,22 @@ def mk(monkeypatch, tmp_path):
     o = Office(board=Board(), journal=Journal(), client=C(), hall=FakeHall(), notify=sent.append, router=object())
     o.watch = lambda: None
     o.sched.run_due = lambda: []
-    o.screen = lambda: setattr(o, "candidates", ["DOGE/USD"])
+    o.screen = lambda: setattr(o, "candidates", ["AVAX/USD"])
     return o, sent
 
 
 def test_targets_candidates_first_core_after_no_stocks_when_closed(monkeypatch, tmp_path):
     o, _ = mk(monkeypatch, tmp_path)
-    o.candidates = ["DOGE/USD", "ONDO/USD", "AAPL"]
-    assert o.targets() == ["DOGE/USD", "BTC/USD", "ETH/USD", "SOL/USD"]       # ONDO исключён, акции вне часов биржи — нет
+    o.candidates = ["AVAX/USD", "ONDO/USD", "AAPL"]
+    assert o.targets() == ["AVAX/USD", "BTC/USD", "ETH/USD", "SOL/USD"]       # ONDO исключён, акции вне часов биржи — нет
     o.stock_open = True
-    assert o.targets()[:2] == ["DOGE/USD", "AAPL"] and "SPY" in o.targets()
+    assert o.targets()[:2] == ["AVAX/USD", "AAPL"] and "SPY" in o.targets()
 
 
 def test_run_once_sends_welcome_once_and_runs_hall(monkeypatch, tmp_path):
     o, sent = mk(monkeypatch, tmp_path)
     res = o.run_once()
-    assert len(res) == 4 and o.hall.ran[0] == "DOGE/USD" and sum("переехал в облако" in m for m in sent) == 1
+    assert len(res) == 4 and o.hall.ran[0] == "AVAX/USD" and sum("переехал в облако" in m for m in sent) == 1
     o.run_once()
     assert sum("переехал в облако" in m for m in sent) == 1
 
@@ -95,11 +95,11 @@ def test_prune_board_drops_lab_and_old_reports(tmp_path):
 
 def test_candidates_restored_from_previous_pass_without_excluded(monkeypatch, tmp_path):
     b = Board()
-    for i, s in enumerate(["DOGE/USD", "ONDO/USD", "USDC/USD", "LINK/USD"], 1):
+    for i, s in enumerate(["DOGE/USD", "ONDO/USD", "USDC/USD", "LINK/USD", "PEPE/USD"], 1):
         b.x("INSERT INTO candidates(ts,symbol,score,rank,data) VALUES('t',?,1,?,'{}')", (s, i))
     monkeypatch.setattr(config, "STOP_FILE", tmp_path / "STOP")
     o = Office(board=b, journal=Journal(), client=C(), hall=FakeHall(), notify=lambda t: None, router=object())
-    assert o.candidates == ["DOGE/USD", "LINK/USD"]
+    assert o.candidates == ["LINK/USD"]   # мем-монеты, ONDO и стейблкоины отфильтрованы
 
 
 def test_force_jobs_env_triggers_jobs_even_if_not_bootstrapped(monkeypatch, tmp_path):

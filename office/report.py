@@ -131,8 +131,13 @@ def trade_message(board, res) -> str:
     return "\n".join(lines)
 
 
+SAFE_STOP = "сделка закрыта в безубыток / с прибылью по подтянутому стопу"
+
+
 def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: bool = False, planned_risk: float | None = None, desk: str | None = None) -> str:
-    if offline and reason in ("stop", "take"):
+    if reason == "stop" and pnl >= 0:      # стоп подтянут выше входа: это не стоп-лосс, а защита результата
+        head = f"🟢 Продажа {name(asset)} — {SAFE_STOP}" + (" (между проверками офиса, заявка на бирже)" if offline else "")
+    elif offline and reason in ("stop", "take"):
         head = (f"🔴 Продажа {name(asset)} — сработал стоп-лосс (между проверками офиса, заявка на бирже)" if reason == "stop"
                 else f"🟢 Продажа {name(asset)} — взят тейк-профит (между проверками офиса, заявка на бирже)")
     elif reason == "stop":

@@ -122,3 +122,41 @@ def test_migration_from_code_fingerprint_keeps_the_count_since_corporation_start
     assert rules.register(j, sent.append, "2026-10-19T04:00:00+00:00") is False and not sent
     assert j.kv_get("rules_since") == rules.V5_START and j.kv_get("rules_fp") == rules.fingerprint()
     assert rules.register(j, sent.append) is False                                         # повторные запуски — тишина
+
+
+# ── v5.7.1: мем-монеты исключены из списка наблюдения (как стейблкоины); сообщение о стопе выше входа ──
+def test_meme_coins_excluded_like_stablecoins_without_touching_rules():
+    from office import config, rules
+    for s in ("DOGE/USD", "TRUMP/USD", "PEPE/USD", "BONK/USD", "SHIB/USD", "WIF/USD", "FLOKI/USD", "DOGEUSD", "doge/usd", "1000PEPE/USD"):
+        assert config.excluded(s), s
+    for s in ("BTC/USD", "ETH/USD", "SOL/USD", "LINK/USD", "AAPL", "USDC/USD", "ONDO/USD"):
+        assert config.excluded(s) == (s in ("USDC/USD", "ONDO/USD")), s
+    assert rules.fingerprint() == rules.fingerprint() and "MEME" not in str(rules.snapshot())
+
+
+def test_held_meme_position_still_managed_but_not_a_target(monkeypatch, tmp_path):
+    from office import config
+    from office.board import Board
+    from office.cloud import Office
+    from office.journal import Journal
+    from tests.helpers_cloud import C, FakeHall
+    monkeypatch.setattr(config, "STOP_FILE", tmp_path / "STOP")
+    j = Journal()
+    j.positions = lambda: {"DOGE/USD": {"qty": 1}}
+    b = Board()
+    b.x("INSERT INTO candidates(ts,symbol,score,rank,data) VALUES('t','DOGE/USD',1,1,'{}')")
+    b.x("INSERT INTO candidates(ts,symbol,score,rank,data) VALUES('t','LINK/USD',1,2,'{}')")
+    o = Office(board=b, journal=j, client=C(), hall=FakeHall(), notify=lambda t: None, router=object())
+    assert "DOGE/USD" not in o.candidates and "DOGE/USD" not in o.targets() and "LINK/USD" in o.targets()
+    assert "DOGE/USD" in o.scope()["held"]                 # позиция остаётся под управлением (стоп/цель)
+
+
+def test_stop_above_entry_is_not_called_stop_loss():
+    from office import report
+    safe = report.close_message("BTC/USD", 12.5, 0.012, "stop")
+    assert safe.startswith("🟢") and "в безубыток / с прибылью по подтянутому стопу" in safe and "стоп-лосс" not in safe
+    zero = report.close_message("BTC/USD", 0.0, 0.0, "stop", offline=True)
+    assert "🟢" in zero and "в безубыток" in zero and "между проверками" in zero
+    loss = report.close_message("BTC/USD", -20.0, -0.02, "stop", planned_risk=25.0)
+    assert loss.startswith("🔴") and "сработал стоп-лосс" in loss and "Заложенный риск" in loss
+    assert "взят тейк-профит" in report.close_message("BTC/USD", 30.0, 0.03, "take")
