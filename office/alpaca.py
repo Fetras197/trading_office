@@ -63,6 +63,8 @@ class AlpacaError(Exception):
 
 
 class AlpacaClient:
+    base_fn = None            # callable -> эквити для «за день» (Office ставит daybase), None — цифры брокера
+
     def __init__(self, key=None, secret=None, base=None, session=None):
         self.base = (base or os.environ.get("ALPACA_BASE_URL", f"https://{PAPER_HOST}/v2")).rstrip("/")
         if os.environ.get("ALPACA_PAPER", "true").lower() != "true":
@@ -170,7 +172,14 @@ class AlpacaClient:
         pos = [{"symbol": p["symbol"], "qty": float(p["qty"]), "avg": float(p["avg_entry_price"]), "price": float(p["current_price"]),
                 "value": float(p["market_value"]), "pl": float(p["unrealized_pl"]), "plpc": float(p["unrealized_plpc"])}
                for p in self.positions() if abs(float(p.get("market_value") or 0)) >= DUST_USD]
-        return {"equity": float(a["equity"]), "cash": float(a["cash"]), "last_equity": float(a.get("last_equity") or a["equity"]), "positions": pos}
+        broker_last = float(a.get("last_equity") or a["equity"])
+        base = None
+        if self.base_fn:
+            try:
+                base = self.base_fn()            # эквити последнего вечернего отчёта (daybase): «за день» считается от него
+            except Exception:  # noqa: BLE001 — сбой базы не должен ломать отчёты: берём цифры брокера
+                base = None
+        return {"equity": float(a["equity"]), "cash": float(a["cash"]), "last_equity": float(base) if base else broker_last, "broker_last_equity": broker_last, "positions": pos}
 
     def orders(self, **params):
         return self._req("GET", "/orders", params=params)

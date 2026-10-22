@@ -144,6 +144,8 @@ def close_message(asset: str, pnl: float, pnl_pct: float, reason: str, offline: 
         head = f"🔴 Продажа {name(asset)} — сработал стоп-лосс"
     elif reason == "take":
         head = f"🟢 Продажа {name(asset)} — взят тейк-профит"
+    elif reason == "peer":
+        head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — перед отчётом крупного конкурента (гэп может зацепить и эту акцию)"
     elif reason == "earnings":
         head = f"{'🟢' if pnl >= 0 else '🔴'} Продажа {name(asset)} — перед отчётом компании (позицию не держим через отчёт)"
     elif reason == "news":

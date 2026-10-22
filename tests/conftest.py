@@ -35,3 +35,10 @@ def _no_real_llm_keys(monkeypatch):
     """Тесты не должны доходить до настоящих моделей (в Actions ключи есть в окружении: это и расход, и сбой тестов «лимит пробрасывается»)."""
     for k in ("OPENROUTER_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.delenv(k, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_yf_industry(monkeypatch):
+    """Отрасль незнакомых акций (правило «отчёт конкурента») в тестах — только по таблице, без сети."""
+    from office import earnings
+    monkeypatch.setattr(earnings, "YF_INDUSTRY", False)

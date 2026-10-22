@@ -6,7 +6,7 @@ import datetime as dt
 import os
 import time
 
-from . import desks, earnings, llm, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage, interns, newsguard
+from . import desks, earnings, llm, rules, accuracy, config, data, events, memory, realmoney, report, research, review, scheduler, screener, shadow, smartmoney, views, lab, manage, interns, daybase, newsguard
 from .alpaca import AlpacaBroker, AlpacaClient
 from .board import Board
 from .commands import Commands
@@ -40,6 +40,11 @@ class Office:
         self.interns = interns.Interns(self.board, self.j, lambda: screener.universe(self.client)["stock"],
                                        lambda syms, days: data.alpaca_bars(syms, "stock", days=days, timeframe="1Day"),
                                        lambda a: data.candles(config.make_asset(a), "1h", **({"limit": 500} if "/" in a else {"rng": "60d"})), self.client.price)   # стажёры: бумажные, на правила не влияют
+        self._in_evening = False
+        try:
+            self.client.base_fn = self._day_base          # «за день» в сообщениях — от последнего вечернего отчёта (daybase), а не от закрытия биржи у брокера
+        except Exception:  # noqa: BLE001
+            pass
         self.commands = Commands(self)
         self.sched = scheduler.Scheduler(self.j, self.jobs())
 
@@ -139,7 +144,22 @@ class Office:
         rg = self.board.latest("regime", max_age_h=6)
         self.notify(views.briefing_text(pic, rg["data"] if rg else None, events.upcoming(self.board, 24), self.client.account_view(), self.j.positions(), self.candidates))
 
+    def _day_base(self):
+        return daybase.get(self.j, config.localnow().date().isoformat(), evening=self._in_evening)
+
     def evening(self):
+        """21:00 — вечерний отчёт. «За день» — от предыдущего вечернего отчёта; после отправки сегодняшний вечер становится новой базой."""
+        self._in_evening = True
+        try:
+            self._evening()
+        finally:
+            self._in_evening = False
+        try:
+            daybase.commit(self.j, float(self.client.account_view()["equity"]), config.localnow().date().isoformat())
+        except Exception as e:  # noqa: BLE001
+            print(f"{utcnow()} daybase: {type(e).__name__}: {str(e)[:120]}", flush=True)
+
+    def _evening(self):
         """21:00 — вечерний отчёт: итоги дня, «Почему не вошли» (3 ближайших кандидата), теневые портфели, уроки, календарь."""
         since = self._local_midnight_utc()
         trades = self.j.q("SELECT asset, pnl, exit_reason FROM trades WHERE exit_ts>=? ORDER BY id", (since,))      # включая частичные фиксации
@@ -235,12 +255,13 @@ class Office:
                 why = earnings.must_exit(self.client, self.board, name)
                 if not why:
                     continue
+                kind = "peer" if why.startswith("отчёт крупного конкурента") else "earnings"      # конкурент из той же отрасли (гэп, как KLAC после LRCX) или сама компания
                 with self.hall.exec_lock:
                     desk = self.j.positions()[name].get("desk")
-                    r = self.broker.sell(name, float(self.client.price(name)), utcnow(), "earnings")
+                    r = self.broker.sell(name, float(self.client.price(name)), utcnow(), kind)
                 t = self.j.q("SELECT entry, qty FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
                 cost = t[0]["entry"] * t[0]["qty"] if t else 0
-                self.notify(report.close_message(name, r["pnl"], r["pnl"] / cost if cost else 0.0, "earnings", desk=desks.name_of(self.j, desk)) + f"\n{why}")
+                self.notify(report.close_message(name, r["pnl"], r["pnl"] / cost if cost else 0.0, kind, desk=desks.name_of(self.j, desk)) + f"\n{why}")
                 self.sched.trigger("portfolio")
                 self.sched.trigger("review")
                 done.append(name)
