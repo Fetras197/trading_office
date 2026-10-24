@@ -291,3 +291,94 @@ def test_existing_stop_limit_reinstalled_and_tightened_on_the_tick():
     assert b.ensure_protection("PEPE/USD") == "reinstalled"
     so = c.submitted[-1]
     assert float(so["stop_price"]) == pytest.approx(0.0000037) and 0 < float(so["limit_price"]) < float(so["stop_price"])
+
+
+# ── v5.8.1: продажа снимает заявки, возвращает стоп при неудаче, не шлёт рыночный приказ при закрытой бирже ──
+class SellClient(FakeClient):
+    """Открытые заявки живут, пока их не снимут; position().qty_available освобождается только после снятия."""
+    def __init__(self, orders, closed=False, fill=True, fail_reinstall=False, **kw):
+        super().__init__(fill=fill, **kw)
+        self.open_orders, self.closed, self.fail_reinstall, self.log = list(orders), closed, fail_reinstall, []
+
+    def clock(self):
+        return {"is_open": not self.closed}
+
+    def orders(self, **kw):
+        return list(self.open_orders)
+
+    def cancel(self, oid):
+        self.log.append(("cancel", oid))
+        self.open_orders = [o for o in self.open_orders if o["id"] != oid]
+
+    def submit(self, b):
+        self.log.append(("submit", b.get("type"), b.get("order_class")))
+        if self.fail_reinstall and (b.get("order_class") == "oco" or b.get("type") == "stop_limit") and any(x[0] == "submit" and x[1] == "market" for x in self.log):
+            raise AlpacaError("reject")
+        return super().submit(b)
+
+    def order(self, oid):
+        if self.fill:
+            return super().order(oid)
+        return {"id": oid, "status": "accepted", "filled_avg_price": None, "filled_qty": "0"}
+
+    def position(self, symbol):
+        q = "10" if not self.open_orders else "0"
+        return {"qty": "10", "qty_available": q}
+
+
+def open_stock(c):
+    j = Journal()
+    j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES('MSFT',10,100,95,110,0,1,'t')")
+    return AlpacaBroker(c, j, ASSETS), j
+
+
+OCO = [{"id": "s1", "side": "sell", "type": "stop", "qty": "10"}, {"id": "t1", "side": "sell", "type": "limit", "qty": "10"}]
+
+
+def test_sell_cancels_stop_and_limit_orders_before_market_order():
+    c = SellClient(OCO)
+    b, j = open_stock(c)
+    r = b.sell("MSFT", 100.0, "t", "news")
+    kinds = [x[0] + ":" + str(x[1]) for x in c.log]
+    assert kinds.index("cancel:s1") < kinds.index("submit:market") and kinds.index("cancel:t1") < kinds.index("submit:market")
+    assert c.open_orders == [] and "MSFT" not in j.positions() and r["reason"] == "news"
+    assert c.submitted[-1]["qty"] == "10"                                        # количество освободилось от заявок
+
+
+def test_failed_sell_cancels_hanging_order_and_restores_stop():
+    c = SellClient(OCO, fill=False)
+    b, j = open_stock(c)
+    with pytest.raises(AlpacaError) as e:
+        b.sell("MSFT", 100.0, "t", "news")
+    assert "стоп возвращён на место" in str(e.value) and "accepted" in str(e.value)
+    kinds = [x[0] + ":" + str(x[1]) for x in c.log]
+    assert "cancel:o1" in kinds                                                  # зависший рыночный приказ снят
+    assert kinds[-1] == "submit:limit" and c.log[-1][2] == "oco"                 # акции: OCO (стоп + цель) на прежних уровнях
+    oco = c.submitted[-1]
+    assert oco["stop_loss"]["stop_price"] == "95.00" and oco["take_profit"]["limit_price"] == "110.00"
+    assert "MSFT" in j.positions()                                               # позиция в журнале осталась
+
+
+def test_failed_sell_and_failed_restore_is_loud():
+    c = SellClient(OCO, fill=False, fail_reinstall=True)
+    b, j = open_stock(c)
+    with pytest.raises(AlpacaError) as e:
+        b.sell("MSFT", 100.0, "t", "news")
+    assert "ПРОВЕРЬТЕ ПОЗИЦИЮ ВРУЧНУЮ" in str(e.value)
+
+
+def test_stock_sell_with_closed_market_touches_nothing():
+    from office.alpaca import MarketClosed
+    c = SellClient(OCO, closed=True)
+    b, j = open_stock(c)
+    with pytest.raises(MarketClosed):
+        b.sell("MSFT", 100.0, "t", "news")
+    assert c.log == [] and len(c.open_orders) == 2 and "MSFT" in j.positions()   # стоп и цель на месте, приказов нет
+
+
+def test_crypto_sell_is_not_blocked_by_stock_hours():
+    c = SellClient([{"id": "s1", "side": "sell", "type": "stop_limit", "qty": "10"}], closed=True)
+    j = Journal()
+    j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES('BTC/USD',10,100,95,110,0,1,'t')")
+    b = AlpacaBroker(c, j, ASSETS)
+    assert b.sell("BTC/USD", 100.0, "t", "news")["reason"] == "news"

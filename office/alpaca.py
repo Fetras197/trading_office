@@ -62,6 +62,10 @@ class AlpacaError(Exception):
     pass
 
 
+class MarketClosed(AlpacaError):
+    """Биржа акций закрыта: рыночный приказ не отправляем (он повиснет в «accepted», а стоп уже снят). Действие откладывается до открытия."""
+
+
 class AlpacaClient:
     base_fn = None            # callable -> эквити для «за день» (Office ставит daybase), None — цифры брокера
 
@@ -306,25 +310,76 @@ class AlpacaBroker:
         self.j.kv_set(f"stop_oid:{name}", stop_oid)
         self.j.add_fill(ts, name, "buy", qty, price, fee_usd, "entry", run_id, desk)
 
-    def sell(self, name, ref_price, ts, reason="signal"):
-        """Закрыть существующий лонг (только полностью)."""
-        p = self.position(name)
-        if not p:
-            raise AlpacaError(f"нет позиции {name}")
-        a = self.assets[name]
-        for o in self.c.orders(status="open", symbols=a.alpaca):
+    def _market_open(self) -> bool:
+        try:
+            return bool(self.c.clock().get("is_open"))
+        except Exception:  # noqa: BLE001 — часы недоступны: не блокируем закрытие
+            return True
+
+    def _cancel_open_orders(self, a, timeout: float = 8.0) -> list[dict]:
+        """Снять ВСЕ открытые заявки по символу (стоп, тейк, OCO: акции «заняты» заявками и без этого продать нечего) и дождаться, пока их не останется. -> снятые заявки."""
+        found = list(self.c.orders(status="open", symbols=a.alpaca))
+        for o in found:
             try:
                 self.c.cancel(o["id"])
             except AlpacaError:
                 pass
-        time.sleep(1)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if not self.c.orders(status="open", symbols=a.alpaca):
+                break
+            time.sleep(0.5)
+        return found
+
+    def _restore_protection(self, a, p, cancelled: list[dict], market_oid: str | None = None) -> str:
+        """Продажа не удалась: убрать зависший рыночный приказ и вернуть стоп (и тейк) на место. Возвращает короткое описание для сообщения."""
+        if market_oid:
+            try:
+                self.c.cancel(market_oid)
+                time.sleep(1)
+            except AlpacaError:
+                pass
+        if not cancelled:
+            return "заявок для возврата не было"
         live = self.c.position(a.alpaca)
-        qty = float(live["qty_available"]) if live else p["qty"]
-        o = self._wait_fill(self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(qty * 1e6) / 1e6:.6f}" if a.kind == "crypto" else str(int(qty)),
-                                           "side": "sell", "type": "market", "time_in_force": "gtc"})["id"])
-        self.last_order_id = o["id"]
-        if o["status"] != "filled":
-            raise AlpacaError(f"закрытие не исполнено: {o['status']}")
+        qty = float(live.get("qty") or live.get("qty_available")) if live else p["qty"]
+        try:
+            oid = self._install_stop(a, qty, p["stop"], p["take"])
+        except AlpacaError as e:
+            raise AlpacaError(f"закрыть не удалось, и стоп {a.name} вернуть не удалось ({e}) — ПРОВЕРЬТЕ ПОЗИЦИЮ ВРУЧНУЮ") from e
+        if a.kind == "crypto":
+            self.j.kv_set(f"stop_oid:{a.name}", oid)
+        return "стоп возвращён на место"
+
+    def sell(self, name, ref_price, ts, reason="signal"):
+        """Закрыть существующий лонг (только полностью). Акции при закрытой бирже: MarketClosed до любых действий (стоп остаётся). Иначе: снять заявки по символу →
+        продать по рынку; не вышло — отменить зависший приказ и вернуть стоп."""
+        p = self.position(name)
+        if not p:
+            raise AlpacaError(f"нет позиции {name}")
+        a = self.assets[name]
+        if a.kind == "stock" and not self._market_open():
+            raise MarketClosed(f"биржа акций закрыта: {name} не продаём по рынку, действие ждёт открытия")
+        cancelled = self._cancel_open_orders(a)
+        mo = None
+        try:
+            t0 = time.time()
+            while cancelled and time.time() - t0 < 6:      # количество должно освободиться от заявок
+                live = self.c.position(a.alpaca)
+                if live and float(live.get("qty_available") or 0) >= float(live.get("qty") or live.get("qty_available") or 0) * 0.999:
+                    break
+                time.sleep(0.5)
+            live = self.c.position(a.alpaca)
+            qty = float(live["qty_available"]) if live else p["qty"]
+            mo = self.c.submit({"symbol": a.alpaca, "qty": f"{math.floor(qty * 1e6) / 1e6:.6f}" if a.kind == "crypto" else str(int(qty)),
+                                "side": "sell", "type": "market", "time_in_force": "gtc"})
+            o = self._wait_fill(mo["id"])
+            self.last_order_id = o["id"]
+            if o["status"] != "filled":
+                raise AlpacaError(f"закрытие не исполнено: {o['status']}")
+        except AlpacaError as e:
+            back = self._restore_protection(a, p, cancelled, (mo or {}).get("id"))
+            raise AlpacaError(f"{e} ({back})") from e
         return self._book_close(name, float(o["filled_avg_price"]), ts, reason)
 
     def _book_close(self, name, price, ts, reason):

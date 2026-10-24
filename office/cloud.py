@@ -330,7 +330,7 @@ class Office:
         if self.j.kv_get("cloud_started") is None:
             self.j.kv_set("cloud_started", utcnow())
             self.notify("☁️ Офис переехал в облако (GitHub Actions): проход каждые 30–60 минут, телефон больше не нужен. Сообщения о сделках, сводки и отчёты приходят сюда.")
-        for name, fn in (("сверка с брокером", self.watch), ("закрытие перед отчётами", self.earnings_guard), ("команды Telegram", self.commands.poll), ("исследовательский отдел", self.sched.run_due)):
+        for name, fn in (("сверка с брокером", self.watch), ("закрытие перед отчётами", self.earnings_guard), ("отложенные закрытия по новостям", lambda: newsguard.run_queue(self)), ("команды Telegram", self.commands.poll), ("исследовательский отдел", self.sched.run_due)):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001 — сбой одной части не должен ронять проход

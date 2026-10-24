@@ -2,9 +2,12 @@
 Срочная новость по активу, который держим, раньше ни на что не влияла: зал не трогает открытые позиции, а manage.py реагирует только на цену.
 Теперь на том же проходе, где новость найдена, решает совет (три роли): закрыть по рынку или подтянуть стоп до −1% от текущей цены.
 Закрытие — если «закрыть» сказали минимум двое; иначе (и если совет недоступен) — подтяжка стопа: она никогда не опускает стоп и ничем не рискует.
-Решение и причина — отдельным сообщением в Telegram."""
+Решение и причина — отдельным сообщением в Telegram.
+v5.8.1 (ночные сбои MSFT/ISRG «закрытие не исполнено: accepted»): акции при закрытой бирже по рынку не закрываем — решение «закрыть» встаёт в очередь (kv news_close:<тикер>) и
+исполняется на первом проходе после открытия биржи (16:30 по Минску); пока стоп подтягивается. Перед продажей брокер снимает все заявки по символу и при неудаче возвращает стоп."""
 
 from . import desks, report
+from .alpaca import AlpacaError, MarketClosed
 from .hall import utcnow
 from .llm import LLMError
 
@@ -68,14 +71,62 @@ def handle(office, name: str, info: dict) -> str | None:
             office.notify(f"{head}\nРешение совета: подтянуть стоп до {new_stop:.6g} (−1% от цены {price:.6g}, был {pos['stop']:.6g}).\nПричина: {why}")
             return "tighten"
         action, why = "close", "стоп переставить не удалось — позицию закрываем по рынку"
+    if "/" not in name and not office.stock_open:
+        return _queue_close(office, name, pos, head, why, price)
+    try:
+        return _close_now(office, name, pos, head, why)
+    except MarketClosed:                    # биржа закрылась между проверкой и приказом
+        return _queue_close(office, name, pos, head, why, price)
+
+
+KEY = "news_close:"
+
+
+def _queue_close(office, name: str, pos, head: str, why: str, price: float) -> str:
+    """Биржа закрыта: «закрыть» откладывается до открытия, стоп тем временем подтягивается (он остаётся единственной защитой)."""
+    office.j.kv_set(KEY + name, {"why": why, "head": head, "ts": utcnow()})
+    new_stop = price * (1 - TIGHTEN_PCT)
+    moved = ""
+    if new_stop > pos["stop"]:
+        try:
+            if office.broker.move_stop(name, new_stop):
+                moved = f"\nПока биржа закрыта, стоп подтянут до {new_stop:.6g} (−1% от цены {price:.6g}, был {pos['stop']:.6g})."
+        except AlpacaError:
+            moved = "\nСтоп подтянуть не удалось — остаётся прежний."
+    office.notify(f"{head}\nРешение совета: закрыть позицию. Биржа акций закрыта — закрою при открытии биржи (16:30 по Минску).\nПричина: {why}{moved}")
+    return "queued"
+
+
+def _close_now(office, name: str, pos, head: str, why: str) -> str:
     with office.hall.exec_lock:
         desk = pos["desk"] if "desk" in pos.keys() else None
-        r = office.broker.sell(name, price, utcnow(), "news")
+        r = office.broker.sell(name, float(office.client.price(name)), utcnow(), "news")
     t = office.j.q("SELECT entry, qty FROM trades WHERE asset=? ORDER BY id DESC LIMIT 1", (name,))
     cost = t[0]["entry"] * t[0]["qty"] if t else 0
     office.notify(f"{head}\nРешение совета: закрыть по рынку.\nПричина: {why}\nРезультат: {report.signed(r['pnl'])} $ ({report.pct(r['pnl'] / cost if cost else 0.0)})"
-                  + (f"\nОтдел: {desks.name_of(office.j, desk)}" if desk else "")
-                  + ("\nБиржа акций закрыта: заявка исполнится на открытии." if "/" not in name and not office.stock_open else ""))
+                  + (f"\nОтдел: {desks.name_of(office.j, desk)}" if desk else ""))
     office.sched.trigger("portfolio")
     office.sched.trigger("review")
     return "close"
+
+
+def run_queue(office) -> list[str]:
+    """Первый проход после открытия биржи: исполнить отложенные закрытия. Позиции уже нет (закрылась по стопу) — запись снимается. Сбой — запись остаётся, владельцу одно сообщение в 2 часа."""
+    done = []
+    if not office.stock_open:
+        return done
+    for row in office.j.q("SELECT k FROM kv WHERE k LIKE ?", (KEY + "%",)):
+        name = row["k"][len(KEY):]
+        item = office.j.kv_get(row["k"])
+        pos = office.j.positions().get(name)
+        if not item or not pos:
+            office.j._x("DELETE FROM kv WHERE k=?", (row["k"],))
+            continue
+        try:
+            _close_now(office, name, pos, item.get("head", f"🛡 Отложенное закрытие {report.name(name)}"), item.get("why", "решение совета"))
+            office.j._x("DELETE FROM kv WHERE k=?", (row["k"],))
+            done.append(name)
+        except Exception as e:  # noqa: BLE001 — запись остаётся, попробуем на следующем проходе
+            print(f"{utcnow()} newsguard очередь {name}: {type(e).__name__}: {str(e)[:150]}", flush=True)
+            office.notify_limited(f"newsguard_q:{name}", f"⚠️ Отложенное закрытие {report.name(name)} при открытии биржи не удалось ({type(e).__name__}). Стоп на месте; проверьте позицию вручную.", hours=2)
+    return done
