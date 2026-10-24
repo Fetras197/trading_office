@@ -345,7 +345,13 @@ def test_sell_cancels_stop_and_limit_orders_before_market_order():
     assert c.submitted[-1]["qty"] == "10"                                        # количество освободилось от заявок
 
 
-def test_failed_sell_cancels_hanging_order_and_restores_stop():
+@pytest.fixture
+def quick_fill(monkeypatch):
+    """Ожидание исполнения в тестах не тянем 30 секунд: берём текущее состояние заявки."""
+    monkeypatch.setattr(AlpacaBroker, "_wait_fill", lambda self, oid, timeout=0: self.c.order(oid))
+
+
+def test_failed_sell_cancels_hanging_order_and_restores_stop(quick_fill):
     c = SellClient(OCO, fill=False)
     b, j = open_stock(c)
     with pytest.raises(AlpacaError) as e:
@@ -359,7 +365,7 @@ def test_failed_sell_cancels_hanging_order_and_restores_stop():
     assert "MSFT" in j.positions()                                               # позиция в журнале осталась
 
 
-def test_failed_sell_and_failed_restore_is_loud():
+def test_failed_sell_and_failed_restore_is_loud(quick_fill):
     c = SellClient(OCO, fill=False, fail_reinstall=True)
     b, j = open_stock(c)
     with pytest.raises(AlpacaError) as e:
@@ -382,3 +388,80 @@ def test_crypto_sell_is_not_blocked_by_stock_hours():
     j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES('BTC/USD',10,100,95,110,0,1,'t')")
     b = AlpacaBroker(c, j, ASSETS)
     assert b.sell("BTC/USD", 100.0, "t", "news")["reason"] == "news"
+
+
+# ── v5.8.2: проверка «у каждой позиции есть стоп (и цель) на бирже» ───────────────
+class ProtClient(SellClient):
+    def __init__(self, orders, **kw):
+        super().__init__(orders, **kw)
+        self.patched = []
+
+    def _req(self, method, path, **kw):
+        self.patched.append((method, path, kw.get("json")))
+        return {"id": "new-id"}
+
+
+BRACKET = [{"id": "t1", "side": "sell", "type": "limit", "status": "new", "limit_price": "110", "qty": "10", "order_class": "bracket"},
+           {"id": "s1", "side": "sell", "type": "stop", "status": "held", "stop_price": "95", "qty": "10", "order_class": "bracket"}]
+STRAY = [{"id": "m1", "side": "sell", "type": "market", "status": "accepted", "qty": "10"}]
+
+
+def test_protection_ok_with_held_stop_leg():
+    b, j = open_stock(ProtClient(BRACKET))
+    assert b.verify_protection("MSFT", market_open=False) is None                 # held-нога стопа видна, цель на месте
+
+
+def test_stray_market_sell_replaced_by_oco_at_saved_levels():
+    c = ProtClient(STRAY, closed=True)
+    b, j = open_stock(c)
+    r = b.verify_protection("MSFT", market_open=False)
+    assert r["fixed"] and r["error"] is None and r["missing"] == ["стоп", "цель"] and r["stray_market"] == 1
+    assert ("cancel", "m1") in c.log
+    oco = c.submitted[-1]
+    assert oco["order_class"] == "oco" and oco["stop_loss"]["stop_price"] == "95.00" and oco["take_profit"]["limit_price"] == "110.00" and oco["qty"] == "10"
+
+
+def test_market_order_during_open_session_is_left_alone():
+    c = ProtClient(STRAY)
+    b, j = open_stock(c)
+    assert b.verify_protection("MSFT", market_open=True) is None and c.log == []   # исполняется прямо сейчас — не вмешиваемся
+
+
+def test_only_take_missing_rebuilds_both_legs():
+    c = ProtClient([BRACKET[1]])
+    b, j = open_stock(c)
+    r = b.verify_protection("MSFT", market_open=False)
+    assert r["missing"] == ["цель"] and r["fixed"] and c.submitted[-1]["order_class"] == "oco"
+
+
+def test_crypto_needs_only_stop_limit():
+    c = ProtClient([])
+    j = Journal()
+    j._x("INSERT INTO positions(asset,qty,avg,stop,take,fees,run_id,opened_ts) VALUES('BTC/USD',10,100,95,110,0,1,'t')")
+    b = AlpacaBroker(c, j, ASSETS)
+    r = b.verify_protection("BTC/USD")
+    assert r["missing"] == ["стоп"] and r["fixed"] and c.submitted[-1]["type"] == "stop_limit"
+    c2 = ProtClient([{"id": "s", "side": "sell", "type": "stop_limit", "status": "new", "stop_price": "95", "limit_price": "94.5", "qty": "10"}])
+    b2 = AlpacaBroker(c2, j, ASSETS)
+    assert b2.verify_protection("BTC/USD") is None                                 # у крипты цели на бирже нет и не требуется
+
+
+def test_stop_price_mismatch_is_patched():
+    stale = [BRACKET[0], {**BRACKET[1], "stop_price": "90"}]
+    c = ProtClient(stale)
+    b, j = open_stock(c)
+    r = b.verify_protection("MSFT", market_open=False)
+    assert r["fixed"] and r["mismatch"] and not r["missing"]
+    assert c.patched == [("PATCH", "/orders/s1", {"stop_price": "95.00"})]
+
+
+def test_dry_run_changes_nothing_and_failures_are_reported_not_raised():
+    c = ProtClient(STRAY, closed=True)
+    b, j = open_stock(c)
+    r = b.verify_protection("MSFT", market_open=False, fix=False)
+    assert r["missing"] and not r["fixed"] and c.log == []
+    c2 = ProtClient(STRAY, closed=True, fail_reinstall=True)
+    b2, j2 = open_stock(c2)
+    c2.log.append(("submit", "market", None))                                      # включаем режим «установка защиты отклоняется»
+    r2 = b2.verify_protection("MSFT", market_open=False)
+    assert not r2["fixed"] and "reject" in r2["error"]

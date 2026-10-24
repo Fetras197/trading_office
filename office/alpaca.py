@@ -559,6 +559,72 @@ class AlpacaBroker:
         self.ensure_protection(name, p, a)
         return None
 
+    LIVE_STATES = frozenset({"new", "accepted", "held", "partially_filled", "pending_new", "pending_replace", "accepted_for_bidding"})
+    PRICE_TOL = 0.005       # цена стопа на бирже отличается от журнала больше чем на 0,5% — расхождение
+
+    def protective_orders(self, a) -> list[dict]:
+        """Все живые заявки продажи по символу, ВКЛЮЧАЯ статус held: стоп-нога bracket у Alpaca лежит как held и в списке status=open не видна."""
+        rows = self.c.orders(status="all", symbols=a.alpaca, limit=50, direction="desc")
+        return [o for o in rows if o.get("side") == "sell" and o.get("status") in self.LIVE_STATES]
+
+    def verify_protection(self, name, market_open: bool = True, fix: bool = True) -> dict | None:
+        """Проверка «у позиции есть стоп (и цель для акций) на бирже». None — всё на месте.
+        Иначе словарь: missing (чего нет), stray_market (висящие рыночные приказы продажи — следы сбоя прошлого закрытия), mismatch (стоп на бирже ≠ журналу), fixed/error, stop/take (уровни журнала).
+        Исправление (fix=True): акции — снять все заявки продажи и поставить OCO (стоп+цель) по сохранённым уровням; крипта — stop_limit; расхождение цены стопа — PATCH."""
+        p, a = self.position(name), self.assets[name]
+        if not p:
+            return None
+        sells = self.protective_orders(a)
+        stop = next((o for o in sells if o.get("type") in ("stop", "stop_limit")), None)
+        take = next((o for o in sells if o.get("type") == "limit"), None)
+        market = [o for o in sells if o.get("type") == "market"]
+        if market and market_open:
+            return None                                  # приказ исполняется прямо сейчас: проверим на следующем проходе
+        missing = []
+        if not stop:
+            missing.append("стоп")
+        if a.kind == "stock" and not take:
+            missing.append("цель")
+        mismatch = None
+        if stop and p["stop"] and abs(float(stop.get("stop_price") or 0) / p["stop"] - 1) > self.PRICE_TOL:
+            mismatch = f"стоп на бирже {float(stop.get('stop_price') or 0):.6g}, в журнале {p['stop']:.6g}"
+        if not (missing or market or mismatch):
+            return None
+        res = {"name": name, "missing": missing, "stray_market": len(market), "mismatch": mismatch, "stop": p["stop"], "take": p["take"], "fixed": False, "error": None}
+        if not fix:
+            return res
+        try:
+            if missing or market:
+                for o in sells:                          # всё лишнее снимаем: иначе количество «занято» и новая защита не встанет
+                    try:
+                        self.c.cancel(o["id"])
+                    except AlpacaError:
+                        pass
+                self._wait_orders_gone(a)
+                live = self.c.position(a.alpaca)
+                qty = float(live["qty_available"]) if live else 0.0
+                if qty <= 0:
+                    raise AlpacaError("количество недоступно (заявки ещё не сняты)")
+                oid = self._install_stop(a, qty, p["stop"], p["take"])
+                if a.kind == "crypto":
+                    self.j.kv_set(f"stop_oid:{name}", oid)
+            elif mismatch and stop:
+                body = {"stop_price": f"{p['stop']:.2f}" if a.kind == "stock" else self._prot(a, p["stop"], p["avg"])[0]}
+                if stop.get("type") == "stop_limit":
+                    body["limit_price"] = self._prot(a, p["stop"], p["avg"])[1]
+                self.c._req("PATCH", f"/orders/{stop['id']}", json=body)
+            res["fixed"] = True
+        except AlpacaError as e:
+            res["error"] = str(e)[:200]
+        return res
+
+    def _wait_orders_gone(self, a, timeout: float = 8.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if not self.protective_orders(a):
+                return
+            time.sleep(0.5)
+
     def ensure_protection(self, name, p=None, a=None) -> str:
         """Есть ли у позиции защитная заявка на брокере (stop/stop_limit); нет — ставим (крипта: stop_limit, акции: OCO стоп+тейк). Возвращает 'ok' | 'reinstalled'."""
         p, a = p or self.position(name), a or self.assets[name]

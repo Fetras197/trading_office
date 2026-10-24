@@ -231,3 +231,25 @@ def chain_text(board, cycle_id: str, asset: str) -> str:
         refs = ", ".join(f"#{i}{'+' if r['stances'].get(str(i)) == 'agree' else '-'}" for i in r["refs"])
         out.append(f"#{r['id']} {r['role']} [{r['confidence']:.2f}]: {r['verdict'][:110]}" + (f"\n   -> {refs}" if refs else ""))
     return "\n".join(out)
+
+
+def protection_message(asset: str, res: dict) -> str:
+    """Сообщение проверки защитных заявок: что пропало и что сделано (res из AlpacaBroker.verify_protection)."""
+    n = name(asset)
+    parts = []
+    if res.get("missing"):
+        parts.append("на бирже не было: " + " и ".join(res["missing"]))
+    if res.get("stray_market"):
+        parts.append("висел рыночный приказ продажи (след сорвавшегося закрытия)")
+    if res.get("mismatch"):
+        parts.append("расхождение: " + res["mismatch"])
+    lv = f"стоп {res['stop']:.6g}" + (f", цель {res['take']:.6g}" if res.get("take") and "/" not in asset else "")
+    head = f"🛡 Проверка защиты {n}: " + "; ".join(parts) + "."
+    if res.get("error"):
+        return head + f"\nВосстановить не удалось ({res['error']}). Проверьте стоп на бирже вручную."
+    if res.get("fixed"):
+        tail = f"\nВосстановил по сохранённым уровням: {lv}."
+        if res.get("stray_market") and "/" not in asset:
+            tail += "\nРешение о закрытии не потеряно: закрою при открытии биржи (16:30 по Минску)."
+        return head + tail
+    return head

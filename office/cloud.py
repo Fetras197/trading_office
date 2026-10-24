@@ -20,6 +20,10 @@ FRESH_ROUNDS = 5        # новых раундов аналитиков за п
 WORKERS = 3
 
 
+def _sym_of(broker, name: str) -> str:
+    return broker.assets[name].alpaca.replace("/", "")
+
+
 class Office:
     def __init__(self, board=None, journal=None, client=None, hall=None, notify=report.notify, router=None):
         config.load_env()
@@ -245,6 +249,34 @@ class Office:
         if self.j.kv_get("start_equity") is None:
             self.j.kv_set("start_equity", eq)
 
+    def protection_guard(self) -> list[dict]:
+        """Каждый проход: у каждой позиции из журнала на бирже должен стоять стоп (акции — ещё и цель). Нет — восстанавливаем по сохранённым уровням и пишем в Telegram.
+        Висящий рыночный приказ продажи при закрытой бирже (след сбоя закрытия по новости) снимается, а решение «закрыть» переносится на открытие биржи (очередь newsguard)."""
+        out = []
+        try:
+            live = self.broker.live_positions()
+        except Exception as e:  # noqa: BLE001
+            print(f"{utcnow()} защитные заявки: нет списка позиций ({type(e).__name__})", flush=True)
+            return out
+        for name in list(self.j.positions()):
+            try:
+                if _sym_of(self.broker, name) not in live:
+                    continue
+                res = self.broker.verify_protection(name, market_open=self.stock_open or "/" in name)
+                if not res:
+                    continue
+                if res["stray_market"] and "/" not in name and not self.j.kv_get(newsguard.KEY + name):
+                    self.j.kv_set(newsguard.KEY + name, {"why": "решение совета о закрытии: рыночный приказ остался в очереди биржи, закрою при открытии", "head": f"🛡 Отложенное закрытие {report.name(name)}", "ts": utcnow()})
+                if res["error"]:
+                    self.notify_limited(f"protect:{name}", report.protection_message(name, res), hours=2)       # не удалось восстановить: не чаще раза в 2 часа
+                else:
+                    self.notify(report.protection_message(name, res))
+                out.append(res)
+            except Exception as e:  # noqa: BLE001 — сбой по одной позиции не мешает остальным
+                print(f"{utcnow()} защитные заявки {name}: {type(e).__name__}: {str(e)[:150]}", flush=True)
+                self.notify_limited(f"protect_fail:{name}", f"⚠️ Не удалось проверить защитные заявки {report.name(name)} ({type(e).__name__}) — проверьте стоп на бирже вручную.", hours=2)
+        return out
+
     def earnings_guard(self) -> list[str]:
         """Правило риска: позиция в акции закрывается заранее, если отчёт компании сегодня или на следующий торговый день (только в часы биржи; первый же проход накануне)."""
         done = []
@@ -330,7 +362,7 @@ class Office:
         if self.j.kv_get("cloud_started") is None:
             self.j.kv_set("cloud_started", utcnow())
             self.notify("☁️ Офис переехал в облако (GitHub Actions): проход каждые 30–60 минут, телефон больше не нужен. Сообщения о сделках, сводки и отчёты приходят сюда.")
-        for name, fn in (("сверка с брокером", self.watch), ("закрытие перед отчётами", self.earnings_guard), ("отложенные закрытия по новостям", lambda: newsguard.run_queue(self)), ("команды Telegram", self.commands.poll), ("исследовательский отдел", self.sched.run_due)):
+        for name, fn in (("сверка с брокером", self.watch), ("закрытие перед отчётами", self.earnings_guard), ("защитные заявки на бирже", self.protection_guard), ("отложенные закрытия по новостям", lambda: newsguard.run_queue(self)), ("команды Telegram", self.commands.poll), ("исследовательский отдел", self.sched.run_due)):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001 — сбой одной части не должен ронять проход
