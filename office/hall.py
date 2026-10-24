@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import agents, config, data, desks, earnings, entry, events, factcheck, indicators, lab, regime, views
+from . import agents, bans, config, data, desks, earnings, entry, events, factcheck, indicators, lab, regime, views
 from .alpaca import AlpacaError
 from .config import COSTS, Limits, make_asset
 from .board import PICTURE_MAX_AGE_H
@@ -231,6 +231,11 @@ class Hall:
             why_e = earnings.entry_block(getattr(self.broker, "c", None), self.board, asset.name)
             if why_e:
                 return hold("earnings", why_e, score=0.9)
+
+        # --- запрет совета на КЛАСС/отрасль («Сегодня нельзя» из картины дня): исполняется всегда, даже если аналитики «за»; открытые позиции не трогаем ---
+        cb = bans.blocking(self.board, asset)
+        if cb:
+            return hold("council", f"«{bans.label(cb)}» до {views.when_text(cb['until'])} по Минску — {cb['reason']}", score=0.9)
 
         # --- общий лимит альткоинов: не больше MAX_ALT_POSITIONS открытых позиций по ВСЕМ отделам (BTC и ETH не считаются) ---
         is_alt = "/" in asset.name and asset.name not in entry.ALT_EXEMPT

@@ -61,6 +61,9 @@ def picture_text(pic: dict | None, reg: dict | None = None) -> str:
         lines.append("Сегодня нельзя:")
         lines += [f"• {f}" for f in d.get("forbidden", [])]
         lines += [f"• не покупать {name(a)} до {when_text(e['until'])} — {e['reason']}" for a, e in bans.items()]
+    cb = [b for b in d.get("class_bans") or [] if b.get("src") == "council"]
+    if cb:
+        lines += [f"• не открывать новые позиции: «{LABEL_BAN(b)}» до {when_text(b['until'])} — {b['reason']}" for b in cb]
     sm = d.get("size_mult", 1.0)
     lines.append("Новые покупки запрещены" if d.get("no_new_entries") else f"Размер новых позиций: {num(sm * 100)}% от обычного" if sm < 1 else "Новые покупки разрешены в обычном размере")
     if d.get("data_sources"):
@@ -125,7 +128,12 @@ def briefing_text(pic, reg, evs, view, jpos, cands) -> str:
     return "\n".join(lines)
 
 
-STAGE_RU = {"signal": "нет сигнала", "votes": "аналитики", "limits": "лимит риска", "regime": "режим рынка", "event": "событие", "cooldown": "остывание после стопа",
+def LABEL_BAN(b: dict) -> str:
+    from . import bans
+    return bans.label(b)
+
+
+STAGE_RU = {"council": "запрет совета на класс", "signal": "нет сигнала", "votes": "аналитики", "limits": "лимит риска", "regime": "режим рынка", "event": "событие", "cooldown": "остывание после стопа",
             "halt": "пауза", "alts": "лимит альткоинов", "riskgate": "риск-гейт", "desk": "отделы", "economics": "экономика сделки", "protection": "защитная заявка", "earnings": "отчёт компании", "spread": "спред", "broker": "брокер", "data": "нет данных"}
 
 

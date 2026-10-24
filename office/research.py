@@ -8,7 +8,7 @@ import json
 import math
 import threading
 
-from . import config, data, events, memory, portfolio, regime, report, sources, views
+from . import bans, config, data, events, memory, portfolio, regime, report, sources, views
 from .board import PICTURE_MAX_AGE_H, age_h
 from .llm import LLMError, LLMUnavailable
 
@@ -52,9 +52,10 @@ PICTURE_SYS = f"""You are the head of research of a paper-trading firm (US stock
 Input JSON: macro report, event calendar for the next 24h, news desk, crypto desk, sector rotation, portfolio analyst, market regime (code), account state, open positions, the screener's candidates, and notes from previous days with what actually happened since.
 Be concrete and conservative. Your restrictions are enforced by code: no_new_entries=true blocks ALL new entries; avoid_assets blocks the listed assets; size_mult (0..1) can only REDUCE position size. You can never loosen the firm's risk limits.
 Use no_new_entries=true only when risk is genuinely extreme (panic, imminent major event, data failure). Prefer avoid_assets/size_mult for milder caution.
-An avoid_assets entry is valid ONLY with a concrete reason (a specific event or fact from the input) and a term in hours (1..24); entries without both are discarded by code. Never list an asset that is in priority_assets or a core crypto asset (BTC/USD, ETH/USD, SOL/USD): such entries are discarded.
+An avoid_assets entry is valid ONLY with a concrete reason (a specific event or fact from the input) and a term in hours (1..24); entries without both are discarded by code. Every line of "forbidden" that forbids OPENING/BUYING a whole class (all crypto, altcoins, stocks) or a sector MUST also be given as a class_bans entry: code enforces class_bans at the entry gate (no new long positions in that class until the term ends; open positions are not touched). Prefer a short term; a class ban needs a concrete reason too. Never list an asset that is in priority_assets or a core crypto asset (BTC/USD, ETH/USD, SOL/USD): such entries are discarded.
 Schema: {{"regime": "risk_on|risk_off|neutral", "summary": "<=80 words", "main_risks": ["<=12 words", ...max 4], "priority_assets": ["asset exactly as in input candidates/positions", ...max 5],
-"avoid_assets": [{{"asset": "asset", "reason": "<=12 words, specific", "hours": 1-24}}, ...], "forbidden": ["<=14 words: what must NOT be done today", ...max 4], "no_new_entries": true|false, "size_mult": 0.0-1.0, "confidence": 0.0-1.0,
+"avoid_assets": [{{"asset": "asset", "reason": "<=12 words, specific", "hours": 1-24}}, ...],
+"class_bans": [{{"scope": "crypto|altcoins|stocks|sector", "sector": "semiconductors|technology|real_estate|industrials|consumer|financial|energy|healthcare|materials|utilities|communication (only for scope=sector)", "reason": "<=12 words, specific", "hours": 1-24}}, ...], "forbidden": ["<=14 words: what must NOT be done today", ...max 4], "no_new_entries": true|false, "size_mult": 0.0-1.0, "confidence": 0.0-1.0,
 "expectation": "<=30 words: what you expect over the next 4 hours", "lesson_of_previous": "<=30 words: what from the previous picture came true / did not (empty if no data)"}}
 {UNTRUSTED}
 {SOURCES_RULE}
@@ -135,6 +136,11 @@ def v_picture(raw, known_assets=()):
     ka = set(known_assets)
     pic["priority_assets"] = [a for a in _strs(raw.get("priority_assets"), 5, 20) if not ka or a in ka]
     pic["avoid_assets"] = _avoid(raw.get("avoid_assets"), set(pic["priority_assets"]) | set(config.CRYPTO_CORE))
+    cb = bans.normalize(raw.get("class_bans"))
+    for b in bans.from_forbidden(pic["forbidden"]):          # строка «Сегодня нельзя» про класс без записи в class_bans всё равно становится запретом
+        if (b["scope"], b["sector"]) not in [(x["scope"], x["sector"]) for x in cb]:
+            cb.append(b)
+    pic["class_bans"] = cb
     if not pic["summary"].strip():
         raise ValueError("пустая картина")
     return pic
