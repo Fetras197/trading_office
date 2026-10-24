@@ -129,7 +129,7 @@ def test_closed_market_queues_close_and_tightens_stop(o):
     assert o.j.kv_get("news_close:CRWV")["why"]
     assert o.broker.moved == [("CRWV", pytest.approx(96.2 * 0.99))]              # стоп пока подтянут
     m = o.sent[-1]
-    assert "закрою при открытии биржи" in m and "16:30 по Минску" in m and "стоп подтянут" in m
+    assert "закрою при открытии биржи: " in m and "16:30 по Минску" in m and "стоп подтянут" in m and "." in m.split("по Минску")[0][-12:]
 
 
 def test_queue_waits_while_closed_then_executes_once_at_open(o):

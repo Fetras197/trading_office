@@ -157,3 +157,35 @@ def peer_entry_block(client, board, symbol: str, today: dt.date | None = None) -
 def peer_must_exit(client, board, symbol: str, today: dt.date | None = None) -> str:
     a = peer_alert(client, board, symbol, today)
     return _peer_text(a, symbol, True) if a else ""
+
+
+# ---------- ближайшее открытие биржи акций для сообщений ----------
+MINSK = ZoneInfo("Europe/Minsk")
+DAY_ACC = ("понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье")        # «в …»
+DAY_NOM = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+
+
+def next_open(client, now: dt.datetime | None = None) -> dt.datetime:
+    """Ближайшее открытие биржи акций (aware): время от Alpaca (/clock → next_open), запасное — 9:30 по Нью-Йорку ближайшего торгового дня (выходные и праздники по календарю Alpaca)."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    try:
+        c = client.clock()
+        if c.get("next_open"):
+            return dt.datetime.fromisoformat(str(c["next_open"]).replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        pass
+    ny = now.astimezone(NY)
+    day = ny.date()
+    for d in trading_days(client, day - dt.timedelta(days=1), day + dt.timedelta(days=12)):      # сегодняшний день входит, только если он торговый
+        o = dt.datetime.combine(d, dt.time(9, 30), NY)
+        if o > ny:
+            return o
+    return dt.datetime.combine(day + dt.timedelta(days=1), dt.time(9, 30), NY)
+
+
+def open_text(client, now: dt.datetime | None = None) -> str:
+    """«в понедельник 26.10 в 16:30 по Минску» (сегодня — «сегодня, четверг 29.10 в 16:30 по Минску»); время и дата пересчитаны в пояс Минска (учёт перехода на зимнее время США)."""
+    m = next_open(client, now).astimezone(MINSK)
+    today = (now or dt.datetime.now(dt.timezone.utc)).astimezone(MINSK).date()
+    lead = f"сегодня, {DAY_NOM[m.weekday()]}" if m.date() == today else (f"во {DAY_ACC[m.weekday()]}" if m.weekday() == 1 else f"в {DAY_ACC[m.weekday()]}")
+    return f"{lead} {m:%d.%m} в {m:%H:%M} по Минску"

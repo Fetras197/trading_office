@@ -157,3 +157,33 @@ def test_office_wires_base_into_client_and_evening_commits(monkeypatch):
     assert o.client.base_fn() == 99_630.0                                          # после отчёта «за день» считается от сегодняшнего вечера
     o.evening()                                                                    # повторный запуск в те же сутки базу не двигает
     assert o.j.kv_get("day_base")["equity"] == 99_630.0
+
+
+# ── день и дата открытия биржи в сообщениях очереди ───────────────────────────
+def test_open_text_weekend_holiday_and_dst():
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    NYZ = ZoneInfo("America/New_York")
+    class Clk:
+        def __init__(self, nxt=None, hol=()):
+            self.nxt, self.cal = nxt, Cal(hol)
+        def clock(self):
+            return {"is_open": False, **({"next_open": self.nxt} if self.nxt else {})}
+        def _req(self, *a, **k):
+            return self.cal._req(*a, **k)
+    sat = datetime(2026, 10, 24, 9, 0, tzinfo=timezone.utc)                       # суббота
+    # время от Alpaca (next_open) пересчитывается в Минск: 09:30 EDT = 16:30
+    assert earnings.open_text(Clk("2026-10-26T09:30:00-04:00"), sat) == "в понедельник 26.10 в 16:30 по Минску"
+    # после перевода часов в США (EST) то же 09:30 ET = 17:30 по Минску — «16:30» жёстко не пишем
+    assert earnings.open_text(Clk("2026-11-02T09:30:00-05:00"), datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc)) == "в понедельник 02.11 в 17:30 по Минску"
+    # запасной расчёт без next_open: суббота → понедельник; праздник (пн) → вторник
+    assert earnings.open_text(Clk(), sat) == "в понедельник 26.10 в 16:30 по Минску"
+    earnings._CAL.clear()                                                         # календарь кэшируется по датам
+    r = earnings.open_text(Clk(hol=[D(2026, 10, 26)]), sat)
+    assert r == "во вторник 27.10 в 16:30 по Минску"
+    # пятница вечером → понедельник; будний день до открытия → сегодня
+    fri = datetime(2026, 10, 23, 21, 0, tzinfo=timezone.utc)
+    assert "26.10" in earnings.open_text(Clk(), fri) and "понедельник" in earnings.open_text(Clk(), fri)
+    thu_morning = datetime(2026, 10, 22, 8, 0, tzinfo=timezone.utc)               # 04:00 по Нью-Йорку
+    assert earnings.open_text(Clk(), thu_morning) == "сегодня, четверг 22.10 в 16:30 по Минску"
+    assert NYZ                                                                    # импорт используется

@@ -67,7 +67,7 @@ def test_stray_market_order_moves_close_to_market_open(o):
     o.protection_guard()
     q = o.j.kv_get(newsguard.KEY + "ISRG")
     assert q and "при открытии" in q["why"]
-    assert "закрою при открытии биржи (16:30 по Минску)" in o.sent[0] and "висел рыночный приказ" in o.sent[0]
+    assert "закрою при открытии биржи: " in o.sent[0] and "по Минску" in o.sent[0] and "висел рыночный приказ" in o.sent[0]
     o.stock_open = True                                                                   # открытие: очередь исполняется как обычно
     o.broker.sell = lambda name, price, ts, reason: {"pnl": -50.0}
     assert newsguard.run_queue(o) == ["ISRG"]

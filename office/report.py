@@ -233,7 +233,7 @@ def chain_text(board, cycle_id: str, asset: str) -> str:
     return "\n".join(out)
 
 
-def protection_message(asset: str, res: dict) -> str:
+def protection_message(asset: str, res: dict, when: str = "") -> str:
     """Сообщение проверки защитных заявок: что пропало и что сделано (res из AlpacaBroker.verify_protection)."""
     n = name(asset)
     parts = []
@@ -250,6 +250,6 @@ def protection_message(asset: str, res: dict) -> str:
     if res.get("fixed"):
         tail = f"\nВосстановил по сохранённым уровням: {lv}."
         if res.get("stray_market") and "/" not in asset:
-            tail += "\nРешение о закрытии не потеряно: закрою при открытии биржи (16:30 по Минску)."
+            tail += "\nРешение о закрытии не потеряно: закрою при открытии биржи" + (f": {when}." if when else ".")
         return head + tail
     return head

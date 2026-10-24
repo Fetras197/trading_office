@@ -268,9 +268,9 @@ class Office:
                 if res["stray_market"] and "/" not in name and not self.j.kv_get(newsguard.KEY + name):
                     self.j.kv_set(newsguard.KEY + name, {"why": "решение совета о закрытии: рыночный приказ остался в очереди биржи, закрою при открытии", "head": f"🛡 Отложенное закрытие {report.name(name)}", "ts": utcnow()})
                 if res["error"]:
-                    self.notify_limited(f"protect:{name}", report.protection_message(name, res), hours=2)       # не удалось восстановить: не чаще раза в 2 часа
+                    self.notify_limited(f"protect:{name}", report.protection_message(name, res, earnings.open_text(self.client) if res.get("stray_market") and "/" not in name else ""), hours=2)       # не удалось восстановить: не чаще раза в 2 часа
                 else:
-                    self.notify(report.protection_message(name, res))
+                    self.notify(report.protection_message(name, res, earnings.open_text(self.client) if res.get("stray_market") and "/" not in name else ""))
                 out.append(res)
             except Exception as e:  # noqa: BLE001 — сбой по одной позиции не мешает остальным
                 print(f"{utcnow()} защитные заявки {name}: {type(e).__name__}: {str(e)[:150]}", flush=True)
