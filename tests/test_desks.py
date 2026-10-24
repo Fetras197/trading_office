@@ -8,6 +8,8 @@ from office.board import Board
 from office.config import COSTS
 from office.journal import Journal
 
+REAL_DIRECTIVES = dict(desks.OWNER_DIRECTIVES)       # настоящие решения владельца (conftest на время тестов их обнуляет)
+
 NOW = "2026-10-18T10:00:00+00:00"
 
 
@@ -234,3 +236,42 @@ def test_legacy_global_limit_rows_are_purged_from_why_not_report():
     j.add_nogo("2026-10-19T03:00:00+00:00", "XRP/USD", "desk", "нет свободного отдела — «Тренд»: лимит 3 позиций отдела", 0.8)
     desks.seed(j, NOW)
     assert [r["asset"] for r in j.nogo_top("2026-10-18T00:00:00+00:00", 5)] == ["BTC/USD", "XRP/USD"]
+
+
+# ── решение владельца по бюджету: «Крупная крипта» → 10%, разница «Тренду» (воскресный совет) ──
+def test_owner_directive_majors_to_10pct_goes_to_trend_once(monkeypatch):
+    monkeypatch.setattr(desks, "OWNER_DIRECTIVES", REAL_DIRECTIVES)
+    j = Journal()
+    desks.seed(j, "2026-10-19T00:00:00+00:00")
+    b = Board()
+    out = desks.council(j, b, 100_000.0, "2026-10-25T17:00:00+00:00", "2026-10-18T00:00:00+00:00")
+    sh = {d["id"]: d["share"] for d in desks.active(j)}
+    assert sh["majors"] == pytest.approx(0.10) and sh["trend"] == pytest.approx(0.30) and sh["stocks"] == pytest.approx(0.20) and sh["reversal"] == pytest.approx(0.20)
+    text = "\n".join(out)
+    assert "Решение владельца" in text and "«Крупная крипта» 20% → 10%" in text and "«Тренд» (20% → 30%)" in text and "1 сделка из 8" in text
+    assert "Автоматическое перераспределение на этой неделе не применялось" in text
+    hist = j.q("SELECT desk, share, note FROM desk_hist WHERE event='share' ORDER BY id")
+    assert [(h["desk"], round(h["share"], 2)) for h in hist] == [("majors", 0.10), ("trend", 0.30)]
+    out2 = desks.council(j, b, 100_000.0, "2026-11-01T17:00:00+00:00", "2026-10-25T00:00:00+00:00")        # директива одноразовая
+    assert not any("Решение владельца" in l for l in out2)
+    assert {d["id"]: d["share"] for d in desks.active(j)}["majors"] == pytest.approx(0.10)
+
+
+def test_owner_directive_respects_cap_and_missing_desk(monkeypatch):
+    monkeypatch.setattr(desks, "OWNER_DIRECTIVES", REAL_DIRECTIVES)
+    j = Journal()
+    desks.seed(j, "2026-10-19T00:00:00+00:00")
+    j._x("UPDATE desks SET share=0.38 WHERE id='trend'")                       # у «Тренда» почти потолок 40%
+    out = desks.apply_directives(j, "2026-10-25T17:00:00+00:00")
+    sh = {d["id"]: d["share"] for d in desks.active(j)}
+    assert sh["trend"] == pytest.approx(0.40) and sh["majors"] == pytest.approx(0.10) and "ушёл в резерв" in out[0]
+    j2 = Journal()
+    desks.seed(j2, "2026-10-19T00:00:00+00:00")
+    j2._x("UPDATE desks SET status='closed' WHERE id='trend'")
+    assert "не применено" in desks.apply_directives(j2, "t")[0]
+
+
+def test_owner_directive_is_not_part_of_the_entry_rules_fingerprint(monkeypatch):
+    from office import rules
+    monkeypatch.setattr(desks, "OWNER_DIRECTIVES", REAL_DIRECTIVES)
+    assert "OWNER_DIRECTIVES" not in str(rules.snapshot()) and "2026-10-24-majors-10" not in str(rules.snapshot())

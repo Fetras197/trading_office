@@ -42,3 +42,10 @@ def _no_yf_industry(monkeypatch):
     """Отрасль незнакомых акций (правило «отчёт конкурента») в тестах — только по таблице, без сети."""
     from office import earnings
     monkeypatch.setattr(earnings, "YF_INDUSTRY", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_owner_directives(monkeypatch):
+    """Решения владельца по бюджетам (desks.OWNER_DIRECTIVES) применяются на реальном совете; тесты совета проверяют обычную логику, а директивы подставляют сами."""
+    from office import desks
+    monkeypatch.setattr(desks, "OWNER_DIRECTIVES", {})

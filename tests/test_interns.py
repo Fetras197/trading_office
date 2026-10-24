@@ -122,7 +122,7 @@ def test_no_double_processing_same_bar():
     n = b.q("SELECT COUNT(*) n FROM intern_eq")[0]["n"]
     assert "daily" not in it.step()
     assert b.q("SELECT COUNT(*) n FROM intern_pos")[0]["n"] == sum(len(it.positions(k)) for k in interns.NAMES)
-    assert b.q("SELECT COUNT(*) n FROM intern_eq")[0]["n"] == n + 1                      # только снимок «Аналитиков с вето»
+    assert b.q("SELECT COUNT(*) n FROM intern_eq")[0]["n"] == n + 4                      # почасовые снимки: три дневных стажёра и «Аналитики с вето»; позиций не прибавилось
 
 
 def test_sector_rotation_weekly():
@@ -246,7 +246,8 @@ def test_rows_lines_and_russian():
     assert t.startswith("🎓 Стажёры") and all(n in t for n in interns.NAMES.values())
     import re
     assert not re.search(r"[A-Za-z]", re.sub(r"\$|S&P", "", t))
-    assert it.rows(since="2099-01-01") == []
+    far = it.rows(since="2099-01-01")                                              # окно без снимков: стажёры остаются в отчёте с последним значением
+    assert len(far) == 4 and all(r["ret"] == 0 for r in far)
     assert "ещё не начали" in world()[0].lines()
 
 
@@ -329,3 +330,36 @@ def test_job_registered_hourly(monkeypatch, tmp_path):
     o, _ = _office(monkeypatch, tmp_path)
     j = {x.name: x for x in o.sched.jobs}
     assert j["interns"].every == 3600 and j["interns"].fn == o.interns.step
+
+
+# ── вечерний отчёт: дневные стажёры не пропадают без нового дневного бара ─────────
+def test_daily_interns_are_marked_every_hour_even_without_new_bar():
+    it, b, j, data, px = world()
+    fill(data)
+    it.step()
+    n0 = {n: b.q("SELECT COUNT(*) c FROM intern_eq WHERE name=?", (n,))[0]["c"] for n in ("mom", "sect", "def")}
+    px["ACN"] = 1.0                                                              # цена позиции сдвинулась — переоценка видна
+    it.now = lambda: T0 + dt.timedelta(hours=26)                                 # следующие сутки, дневной бар тот же (выходной)
+    assert "daily" not in it.step()
+    for n in ("mom", "sect", "def"):
+        assert b.q("SELECT COUNT(*) c FROM intern_eq WHERE name=?", (n,))[0]["c"] == n0[n] + 1
+
+
+def test_evening_lines_list_all_four_even_on_a_weekend():
+    it, b, j, data, px = world()
+    fill(data)
+    it.step()
+    it.now = lambda: T0 + dt.timedelta(days=1, hours=2)
+    it.step()
+    t = it.lines(since=(T0 + dt.timedelta(hours=20)).isoformat(timespec="seconds"))
+    for name in interns.NAMES.values():
+        assert name in t, name
+    assert "за период" in t and "с начала" in t
+
+
+def test_intern_without_snapshots_in_window_still_shown():
+    it, b, j, data, px = world()
+    fill(data)
+    it.step()
+    t = it.lines(since="2099-01-01T00:00:00+00:00")                              # окно, в котором снимков нет совсем
+    assert all(n in t for n in interns.NAMES.values()) and "0,00% за период" in t.replace("+", "").replace("−", "")

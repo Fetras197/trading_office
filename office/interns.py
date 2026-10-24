@@ -350,8 +350,8 @@ class Interns:
             self.run_def(bars, ts)
             self.j.kv_set("interns_bar_day", bar_day)
             out["daily"] = bar_day
-        elif not self.b.q("SELECT 1 FROM intern_eq LIMIT 1"):
-            for n in ("mom", "sect", "def"):                            # нет данных: фиксируем стартовый капитал, чтобы отчёты не были пустыми
+        else:
+            for n in ("mom", "sect", "def"):                            # нового дневного бара нет (выходные, биржа закрыта): переоцениваем позиции по текущим ценам — иначе в отчёте за день дневных стажёров нет
                 self.snapshot(n, self.cash(n), ts)
         out["vet"] = self.run_vet(ts)
         return out
@@ -362,6 +362,8 @@ class Interns:
         for name, title in NAMES.items():
             q = "SELECT ts, equity FROM intern_eq WHERE name=?" + (" AND ts>=?" if since else "") + " ORDER BY ts, rowid"
             ser = self.b.q(q, (name, since) if since else (name,))
+            if not ser and since:        # за период снимков нет (нет нового дневного бара): показываем последнее известное значение, а не пропускаем стажёра
+                ser = self.b.q("SELECT ts, equity FROM intern_eq WHERE name=? ORDER BY ts DESC, rowid DESC LIMIT 1", (name,))
             if not ser:
                 continue
             eqs = [r["equity"] for r in ser]
@@ -383,7 +385,9 @@ class Interns:
             return title + "\nСтажёры ещё не начали считаться."
         out = [title]
         for r in rows:
-            out.append(f"• {r['title']}: {pct(r['ret'], 2)} ({usd(r['last'])}), просадка {num(abs(r['max_dd']) * 100, 1)}%, открыто позиций {r['open']}, закрыто сделок {r['trades']}")
+            total = r["last"] / START - 1
+            res = f"{pct(r['ret'], 2)} за период, с начала {pct(total, 2)}" if since else pct(r["ret"], 2)
+            out.append(f"• {r['title']}: {res} ({usd(r['last'])}), просадка {num(abs(r['max_dd']) * 100, 1)}%, открыто позиций {r['open']}, закрыто сделок {r['trades']}")
         return "\n".join(out)
 
     # ---- воскресный совет: сравнение и предложения ----

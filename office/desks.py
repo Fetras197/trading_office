@@ -19,6 +19,12 @@ BUILTIN = {
     "reversal": {"name": "Отскок и возврат к средней", "patterns": ("support", "revert"), "assets": "any"},
 }
 ORDER = ("stocks", "majors", "trend", "reversal")
+# Решения владельца по бюджетам отделов: применяются ОДИН раз на ближайшем воскресном совете (id запоминается в журнале); в эту неделю автоматическое перераспределение пропускается.
+# Это решение по бюджету, не правило входа: словарь в отпечаток правил не входит (rules._consts берёт только числа и кортежи простых значений).
+OWNER_DIRECTIVES = {
+    "2026-10-24-majors-10": {"set": {"majors": 0.10}, "to": "trend",
+                             "note": "по данным владельца 24.10: «Крупная крипта» — 1 сделка из 8 в плюс, итог −1 135 $"},
+}
 
 
 def seed(j, now_iso: str) -> None:
@@ -161,10 +167,38 @@ def lifetime(j, desk_id: str) -> dict:
 
 
 # ---------- совет директоров ----------
+def apply_directives(j, now_iso: str) -> list[str]:
+    """Решения владельца по бюджетам (OWNER_DIRECTIVES), ещё не применённые: бюджет отдела снижается до заданного, освободившаяся доля идёт указанному отделу (в пределах потолка MAX_SHARE;
+    остаток уходит в резерв). Применяется один раз. Возвращает строки решений по-русски."""
+    out = []
+    by = {d["id"]: d for d in active(j)}
+    for did, dr in OWNER_DIRECTIVES.items():
+        if j.kv_get(f"directive:{did}"):
+            continue
+        for desk_id, new in dr["set"].items():
+            d, to = by.get(desk_id), by.get(dr["to"])
+            if not d or not to:
+                out.append(f"Решение владельца «{did}» не применено: отдела {desk_id if not d else dr['to']} нет среди действующих.")
+                continue
+            new = min(max(new, MIN_SHARE), d["share"])
+            freed = d["share"] - new
+            gain = min(freed, MAX_SHARE - to["share"])
+            j._x("UPDATE desks SET share=? WHERE id=?", (new, d["id"]))
+            j._x("INSERT INTO desk_hist(ts,desk,event,share,note) VALUES(?,?,?,?,?)", (now_iso, d["id"], "share", new, f"решение владельца: {dr['note']}"))
+            j._x("UPDATE desks SET share=? WHERE id=?", (to["share"] + gain, to["id"]))
+            j._x("INSERT INTO desk_hist(ts,desk,event,share,note) VALUES(?,?,?,?,?)", (now_iso, to["id"], "share", to["share"] + gain, f"решение владельца: получил долю отдела «{d['name']}»"))
+            out.append(f"Решение владельца: бюджет «{d['name']}» {d['share'] * 100:.0f}% → {new * 100:.0f}% ({dr['note']}); освободившиеся {gain * 100:.0f}% переданы отделу «{to['name']}» "
+                       f"({to['share'] * 100:.0f}% → {(to['share'] + gain) * 100:.0f}%)" + (f", остаток {(freed - gain) * 100:.0f}% ушёл в резерв" if freed - gain > 1e-9 else "")
+                       + ". Автоматическое перераспределение на этой неделе не применялось.")
+        j.kv_set(f"directive:{did}", now_iso)
+    return out
+
+
 def council(j, board, equity: float, now_iso: str, week_since: str) -> list[str]:
     """Воскресное заседание. 1) закрыть отдел с ≥20 сделками и суммарным минусом; 2) перераспределить бюджеты по результатам недели (шаг ≤5 п.п., пол 5%, потолок 40%,
     резерв ≥20% не трогаем); 3) открыть новый отдел ТОЛЬКО под стратегию лаборатории со статусом live. Возвращает строки решений по-русски."""
-    out = []
+    out = apply_directives(j, now_iso)
+    directed = bool(out)
     for d in active(j):
         lt = lifetime(j, d["id"])
         if lt["trades"] >= CLOSE_AFTER_TRADES and lt["pnl"] < 0:
@@ -178,7 +212,7 @@ def council(j, board, equity: float, now_iso: str, week_since: str) -> list[str]
         if st["trades"]:
             scored.append((st["pnl"] / max(d["share"] * equity, 1.0), d, st))
     scored.sort(key=lambda x: x[0])
-    if len(scored) >= 2 and scored[-1][0] > scored[0][0]:
+    if not directed and len(scored) >= 2 and scored[-1][0] > scored[0][0]:
         (r_lo, lo, _), (r_hi, hi, _) = scored[0], scored[-1]
         if lo["share"] - STEP >= MIN_SHARE - 1e-9 and hi["share"] + STEP <= MAX_SHARE + 1e-9:
             for d, new in ((lo, lo["share"] - STEP), (hi, hi["share"] + STEP)):
