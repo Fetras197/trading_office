@@ -291,3 +291,22 @@ def test_openrouter_line_shows_spend_and_balance(or_env):
             return R()
     line = llm.or_line(S())
     assert "0.012 $" in line and "6.03 $" in line and line.startswith("OpenRouter: потрачено за день")
+
+
+def test_openrouter_free_timeouts_and_5xx_still_reach_paid_model(monkeypatch):
+    import requests
+
+    class TimeoutThenOk(FbSess):
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.calls.append((url, dict(json)))
+            m = json["model"]
+            if m.endswith(":free") and len(self.calls) == 1:
+                raise requests.ReadTimeout("slow")
+            if m.endswith(":free"):
+                return FbResp(502, text="bad gateway")
+            return FbResp(200, GOOD)
+    s = {n: FbSess() for n in ("groq", "cerebras", "mistral")} | {"openrouter": TimeoutThenOk()}
+    llm.OpenAICompatBackend._model_pause.clear()
+    r = RoleRouter(gemini=_gem_down(), fallbacks=_chain(monkeypatch, s, keys=("openrouter",)))
+    assert r.ask("market", {"z": 1}, system="x")["stance"] == "hold"
+    assert s["openrouter"].calls[-1][1]["model"] == "meta-llama/llama-3.3-70b-instruct"

@@ -312,13 +312,28 @@ class OpenAICompatBackend:
                 try:
                     r = self.s.post(self.url, headers={"Authorization": f"Bearer {self.key}"}, json=body, timeout=self.timeout)
                 except requests.RequestException as ex:
+                    if self.name == "openrouter":    # зависла/упала одна модель (бесплатные часто тянут >60 с) — остальные, в т.ч. платную, всё равно пробуем
+                        self._model_pause[model] = time.time() + 300
+                        mark(self.name, False)
+                        bad = f"{self.name}/{model} сеть {type(ex).__name__}"
+                        last = f"{last}; {bad}" if last else bad
+                        r = None
+                        break
                     self._pause[self.name] = time.time() + 120
                     raise LLMUnavailable(f"{self.name}: сеть {type(ex).__name__}") from ex
                 if r.status_code == 400 and attempt == 0 and "response_format" in body:   # модель не умеет JSON-режим — повтор без него
                     body.pop("response_format")
                     continue
                 break
-            if r.status_code == 429 and self.name == "openrouter" and not paid:   # лимит бесплатной модели — идём к следующей, платной
+            if r is None:
+                continue
+            if self.name == "openrouter" and not paid and (r.status_code == 429 or r.status_code >= 500):   # лимит/сбой бесплатной модели — идём к следующей, платной
+                if r.status_code != 429:
+                    mark(self.name, False)
+                    self._model_pause[model] = time.time() + 300
+                    bad = f"{self.name}/{model} {r.status_code}"
+                    last = f"{last}; {bad}" if last else bad
+                    continue   # лимит бесплатной модели — идём к следующей, платной
                 try:
                     ra = float(r.headers.get("retry-after", 0))
                 except (TypeError, ValueError, AttributeError):
@@ -343,7 +358,7 @@ class OpenAICompatBackend:
             try:
                 text = r.json()["choices"][0]["message"]["content"]
                 out = parse_json(text)
-            except (KeyError, IndexError, ValueError, LLMError) as ex:
+            except (KeyError, IndexError, ValueError, TypeError, AttributeError, LLMError) as ex:   # content=None у reasoning-моделей и т.п.
                 bad = f"{self.name}/{model}: странный ответ ({type(ex).__name__}: {str(locals().get('text', r.text))[:60]!r})"
                 last = f"{last}; {bad}" if last else bad
                 continue

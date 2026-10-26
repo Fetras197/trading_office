@@ -175,3 +175,14 @@ def test_tech_only_message_says_position_halved_because_analysts_disapproved(mon
                                                                                  "half": True, "mode": "tech_only", "gaps": ["аналитики не одобрили"]})
     m = norm(report.trade_message(b, res))
     assert "• Размер позиции уменьшен вдвое: аналитики не одобрили" in m and "Объём вдвое" not in m
+
+
+def test_trade_message_marks_abstained_analyst(monkeypatch):
+    b = Board()
+    b.publish("c", "market", "CCI", "buy: x", 0.7, data={"stance": "buy"})
+    b.publish("c", "news", "CCI", "abstain: x", 0.0, data={"stance": "abstain", "unavailable": True})
+    b.publish("c", "quant", "CCI", "abstain: x", 0.0, data={"stance": "abstain"})
+    monkeypatch.setattr(report, "phrases", lambda items: {k: "тренд растёт" for k in items})
+    res = SimpleNamespace(status="opened", asset="CCI", cycle_id="c", order={"price": 20.0, "qty": 100, "stop": 19.0, "take": 22.0, "equity": 100000, "tech": "support"})
+    m = report.trade_message(b, res)
+    assert "Технический анализ: тренд растёт (за)" in m and "Новости: воздержался (лимит моделей)" in m and "Квант-аналитик: воздержался (нет данных)" in m

@@ -13,7 +13,7 @@ from .risk import RiskGate
 ROLE_RU = {"market": "Технический анализ", "news": "Новости", "fundamentals": "Фундаментальный анализ", "quant": "Квант-аналитик",
            "buffett": "Баффетт", "munger": "Мангер", "druckenmiller": "Друкенмиллер", "lab": "Лаборатория стратегий", "smartmoney": "Умные деньги"}
 ACC_RU = {**ROLE_RU, "bull": "Бык", "bear": "Медведь", "trader": "Трейдер"}
-STANCE_RU = {"buy": "за", "sell": "против", "hold": "сомневается"}
+STANCE_RU = {"buy": "за", "sell": "против", "hold": "сомневается", "abstain": "воздержался"}
 FAMILY_RU = {"sma_cross": "пересечение средних", "rsi_revert": "возврат после перепроданности", "donchian": "пробой диапазона", "macd": "смена импульса",
              "bb_revert": "возврат от нижней границы", "bb_breakout": "выход за верхнюю границу", "adx_trend": "сильный тренд",
              "stoch_revert": "возврат после падения", "atr_breakout": "выход из канала волатильности", "roc_momentum": "устойчивый рост",
@@ -114,11 +114,13 @@ def trade_message(board, res) -> str:
     for role in ROLE_RU:
         r = last.get(role)
         if r and (r["data"].get("stance") in STANCE_RU):
-            items[role] = r["verdict"]
+            if r["data"]["stance"] != "abstain":      # воздержавшемуся пересказывать нечего — строка с пометкой без запроса к моделям
+                items[role] = r["verdict"]
             order.append(role)
     ph = phrases(items)
     dec = last.get("decision", {}).get("data", {})
-    why = [f"• {ROLE_RU[r]}: {ph[r]} ({STANCE_RU[last[r]['data']['stance']]})" if r in ph else
+    why = [f"• {ROLE_RU[r]}: {STANCE_RU['abstain']} ({last[r]['data'].get('unavailable') and 'лимит моделей' or 'нет данных'})" if last[r]["data"]["stance"] == "abstain" else
+           f"• {ROLE_RU[r]}: {ph[r]} ({STANCE_RU[last[r]['data']['stance']]})" if r in ph else
            f"• {ROLE_RU[r]}: {STANCE_RU[last[r]['data']['stance']]} (уверенность {num(last[r]['confidence'] * 100)}%) — краткий пересказ недоступен: лимит моделей" for r in order]
     why.insert(0, "• Технический сигнал: " + TECH_PHRASE.get(o.get("tech"), "растущий тренд, импульс подтверждает"))
     if o.get("mode") == "tech_only":

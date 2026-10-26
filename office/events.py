@@ -9,6 +9,26 @@ import re
 from . import sources
 
 PRE_MIN, POST_MIN = 60, 60   # новые входы запрещены за 60 минут до и 60 минут после важного события (инфляция, ставка ФРС, занятость)
+FULL_RU = [  # точные названия показателей (Faireconomy) -> полностью по-русски; проверяются раньше общих шаблонов
+    (r"^CB Consumer Confidence", "Индекс доверия потребителей (Conference Board)"), (r"^CB Leading Index", "Опережающий индекс (Conference Board)"),
+    (r"Michigan Consumer Sentiment|UoM Consumer Sentiment", "Настроения потребителей (Мичиганский университет)"), (r"Michigan Inflation Expectations|UoM Inflation Expectations", "Инфляционные ожидания (Мичиганский университет)"),
+    (r"ADP Weekly Employment", "недельная занятость по данным ADP"), (r"ADP Non-Farm", "занятость в частном секторе по данным ADP"), (r"API Weekly Statistical", "недельный отчёт API по запасам нефти"),
+    (r"Core Durable Goods", "заказы на товары длительного пользования без транспорта"), (r"Durable Goods", "заказы на товары длительного пользования"), (r"Advance GDP Price Index", "дефлятор ВВП (первая оценка)"),
+    (r"Advance GDP", "ВВП (первая оценка)"), (r"Prelim GDP|Flash GDP", "ВВП (предварительная оценка)"), (r"Chicago PMI", "деловая активность в Чикаго"), (r"Crude Oil Inventories", "запасы нефти в США"),
+    (r"Natural Gas Storage", "запасы природного газа в США"), (r"Employment Cost Index", "индекс стоимости рабочей силы"), (r"Goods Trade Balance", "торговый баланс товаров"),
+    (r"S&P/CS Composite-20 HPI", "цены на жильё в 20 городах (Кейс-Шиллер)"), (r"\bHPI\b", "цены на жильё"), (r"New Home Sales", "продажи новых домов"), (r"Existing Home Sales", "продажи домов на вторичном рынке"),
+    (r"Pending Home Sales", "отложенные продажи домов"), (r"Housing Starts", "начатое строительство жилья"), (r"Building Permits", "разрешения на строительство"), (r"Personal Income", "личные доходы"), (r"Personal Spending", "личные расходы"),
+    (r"Wholesale Inventories", "запасы оптовых торговцев"), (r"Richmond Manufacturing", "промышленный индекс ФРБ Ричмонда"), (r"Philly Fed|Philadelphia Fed", "промышленный индекс ФРБ Филадельфии"),
+    (r"Empire State", "промышленный индекс Нью-Йорка"), (r"JOLTS", "число вакансий (JOLTS)"), (r"Import Prices", "цены на импорт"), (r"Industrial Production", "промышленное производство"),
+    (r"Mortgage Approvals", "одобренные ипотечные кредиты"), (r"Net Lending to Individuals", "чистое кредитование населения"), (r"Nationwide HPI", "цены на жильё (Nationwide)"), (r"BRC Shop Price", "цены в магазинах (BRC)"),
+    (r"CBI Realized Sales", "фактические продажи (CBI)"), (r"M[34] Money Supply", "денежная масса"), (r"Annual Budget Release", "годовой бюджет"), (r"Autumn Forecast Statement", "осенний прогноз бюджета"),
+    (r"Private Sector Credit", "кредит частному сектору"), (r"Private Loans", "кредиты частному сектору"), (r"Overnight Rate|Main Refinancing Rate|Official Cash Rate|Policy Rate|Cash Rate", "решение по ключевой ставке"),
+    (r"Monetary Policy Statement|Rate Statement", "заявление по денежной политике"), (r"Monetary Policy Report", "доклад по денежной политике"), (r"Press Conference", "пресс-конференция центробанка"),
+    (r"Outlook Report", "доклад центробанка о перспективах"), (r"Speaks$|Speech$|Testifies$", "выступление представителя центробанка"), (r"Bond Auction", "аукцион облигаций"), (r"Bank Holiday", "выходной день банков"), (r"KOF Economic Barometer", "экономический барометр KOF"),
+    (r"UBS Economic Expectations", "экономические ожидания (UBS)"), (r"GfK Consumer Climate", "потребительский климат (GfK)"), (r"ifo Business Climate", "деловой климат (ifo)"), (r"Consumer Spending", "потребительские расходы"),
+    (r"Private Payrolls", "занятость в частном секторе"), (r"Unemployment Change", "изменение числа безработных"), (r"ANZ Business Confidence", "деловая уверенность (ANZ)"), (r"Business Confidence", "деловая уверенность"),
+    (r"Consumer Confidence", "доверие потребителей"), (r"SPPI", "цены производителей услуг"), (r"Manufacturing PMI", "деловая активность в промышленности (PMI)"), (r"Non-Manufacturing PMI|Services PMI", "деловая активность в услугах (PMI)")]
+
 TITLES_RU = [  # порядок важен: более длинные шаблоны раньше
     (r"FOMC Press Conference", "пресс-конференция ФРС"), (r"FOMC Statement", "решение ФРС по ставке"), (r"Federal Funds Rate", "решение ФРС по ставке"),
     (r"FOMC Meeting Minutes", "протокол заседания ФРС"), (r"Core CPI", "базовая инфляция (цены для потребителей)"), (r"\bCPI\b", "инфляция (цены для потребителей)"), (r"Core PPI", "базовые цены производителей"),
@@ -18,6 +38,7 @@ TITLES_RU = [  # порядок важен: более длинные шабло
     (r"Fed Chair", "выступление главы ФРС"), (r"Treasury Currency Report", "отчёт Минфина США")]
 
 
+BANKS_RU = [(r"BOE|Bailey|MPC", "Банк Англии"), (r"ECB|Lagarde", "ЕЦБ"), (r"BOJ|Ueda", "Банк Японии"), (r"BOC", "Банк Канады"), (r"RBNZ", "Резервный банк Новой Зеландии"), (r"RBA", "Резервный банк Австралии"), (r"SNB", "Нацбанк Швейцарии")]
 EXTRA_RU = [(r"BOE|Bailey|MPC", "Банк Англии"), (r"ECB|Lagarde", "ЕЦБ"), (r"BOJ|Ueda", "Банк Японии"), (r"\bPMI\b", "деловая активность (PMI)"), (r"Retail Sales", "розничные продажи"),
             (r"Employment|Earnings|Claimant", "рынок труда"), (r"GDP", "ВВП"), (r"CPI|Inflation", "инфляция"), (r"Consumer Sentiment|Confidence", "настроения потребителей"), (r"Trade Balance", "торговый баланс")]
 
@@ -31,6 +52,10 @@ def title_ru(ev: dict) -> str:
     for pat, ru in TITLES_RU:
         if re.search(pat, ev["title"], re.I):
             return ru + tail
+    for pat, ru in FULL_RU:
+        if re.search(pat, ev["title"], re.I):
+            bank = next((b for p2, b in BANKS_RU if re.search(p2, ev["title"])), "")   # «ECB Press Conference» -> «ЕЦБ: пресс-конференция центробанка»
+            return (f"{bank}: {ru}" if bank else ru) + tail
     for pat, ru in EXTRA_RU:
         if re.search(pat, ev["title"], re.I):
             return f"{ru}: {ev['title']}{tail}"

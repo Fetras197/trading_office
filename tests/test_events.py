@@ -72,7 +72,15 @@ def test_key_us_events_are_always_high_and_block_all_assets():
 
 def test_foreign_events_keep_their_name_and_currency():
     t = lambda title, ccy: events.title_ru({"kind": "macro", "title": title, "ccy": ccy})  # noqa: E731
-    assert t("BOE Gov Bailey Speaks", "GBP") == "Банк Англии: BOE Gov Bailey Speaks (GBP)"
-    assert t("Flash Services PMI", "GBP") == "деловая активность (PMI): Flash Services PMI (GBP)"
+    assert t("BOE Gov Bailey Speaks", "GBP") == "Банк Англии: выступление представителя центробанка (GBP)"
+    assert t("Flash Services PMI", "GBP") == "деловая активность в услугах (PMI) (GBP)"
     assert t("CPI y/y", "GBP") == "инфляция (цены для потребителей) (GBP)" and t("Core CPI m/m", "USD") == "базовая инфляция (цены для потребителей)"
     assert t("Something odd", "GBP") == "Something odd (GBP)" and "событие (" not in t("Something odd", "GBP")
+
+
+def test_calendar_titles_fully_russian():
+    t = lambda title, ccy="USD": events.title_ru({"kind": "macro", "title": title, "ccy": ccy})  # noqa: E731
+    assert t("CB Consumer Confidence") == "Индекс доверия потребителей (Conference Board)"
+    assert t("ECB Press Conference", "EUR") == "ЕЦБ: пресс-конференция центробанка (EUR)"
+    for title in ("Crude Oil Inventories", "Natural Gas Storage", "Advance GDP q/q", "Chicago PMI", "New Home Sales", "Durable Goods Orders m/m", "Personal Spending m/m", "Richmond Manufacturing Index"):
+        assert not __import__("re").search("[A-Za-z]{3}", t(title)), t(title)
